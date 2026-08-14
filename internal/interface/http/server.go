@@ -1,0 +1,308 @@
+package http
+
+import (
+	"context"
+	"encoding/json"
+	"io/fs"
+	"net/http"
+	"strings"
+
+	"github.com/streammux/streammux/internal/application/ffmpeg"
+	"github.com/streammux/streammux/internal/application/muxer"
+	"github.com/streammux/streammux/internal/domain/constants"
+	"github.com/streammux/streammux/internal/domain/model"
+	"github.com/streammux/streammux/internal/domain/ports"
+)
+
+type Server struct {
+	users   ports.UserRepository
+	store   ports.MuxStore
+	muxer   *muxer.Muxer
+	ffmpeg  *ffmpeg.Muxer
+	baseURL string
+	web     fs.FS
+	mux     *http.ServeMux
+}
+
+type Options struct {
+	BaseURL string
+	WebFS   fs.FS
+}
+
+func New(users ports.UserRepository, store ports.MuxStore, mux *muxer.Muxer, ff *ffmpeg.Muxer, opts Options) *Server {
+	s := &Server{
+		users:   users,
+		store:   store,
+		muxer:   mux,
+		ffmpeg:  ff,
+		baseURL: opts.BaseURL,
+		web:     opts.WebFS,
+		mux:     http.NewServeMux(),
+	}
+	s.routes()
+	return s
+}
+
+func (s *Server) routes() {
+	// Stremio protocol — public manifest (redirects to configure).
+	s.mux.HandleFunc("GET /manifest.json", s.handlePublicManifest)
+	s.mux.HandleFunc("GET /stream/{type}/{id...}", s.handleConfigureRedirect)
+
+	// Stremio protocol — authenticated routes (credenciais no path, como o AIOStreams).
+	s.mux.HandleFunc("GET /stremio/{uuid}/{password}/manifest.json", s.handleManifest)
+	s.mux.HandleFunc("GET /stremio/{uuid}/{password}/stream/{type}/{id...}", s.handleStream)
+
+	// Mux endpoint
+	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMux)
+
+	// API
+	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+	s.mux.HandleFunc("POST /api/v1/user", s.handleCreateUser)
+	s.mux.HandleFunc("GET /api/v1/user", s.handleGetUser)
+	s.mux.HandleFunc("PUT /api/v1/user", s.handleUpdateUser)
+	s.mux.HandleFunc("DELETE /api/v1/user", s.handleDeleteUser)
+
+	// Static / SPA
+	s.mux.Handle("/", s.spaHandler())
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
+
+func (s *Server) handlePublicManifest(w http.ResponseWriter, r *http.Request) {
+	// Public manifest points at the configure page so the user can set up.
+	manifest := model.Manifest{
+		ID:          "com.streammux.viren070",
+		Version:     "1.0.0",
+		Name:        "StreamMux",
+		Description: "Combina a melhor qualidade de vídeo com o áudio no seu idioma.",
+		Types:       []string{"movie", "series"},
+		Resources:   []string{constants.StreamResource},
+		BehaviorHints: map[string]any{
+			"configurable":          true,
+			"configurationRequired": true,
+		},
+	}
+	writeJSON(w, manifest)
+}
+
+func (s *Server) handleConfigureRedirect(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
+	uuid := r.PathValue("uuid")
+	password := r.PathValue("password")
+	if _, err := s.users.Get(r.Context(), uuid, password); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	base := s.baseURL + "/stremio/" + uuid + "/" + password
+	manifest := model.Manifest{
+		ID:          "com.streammux.viren070",
+		Version:     "1.0.0",
+		Name:        "StreamMux",
+		Description: "Combina a melhor qualidade de vídeo com o áudio no seu idioma.",
+		Types:       []string{"movie", "series"},
+		Resources:   []string{constants.StreamResource},
+	}
+	_ = base
+	writeJSON(w, manifest)
+}
+
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	contentType := r.PathValue("type")
+	contentID := strings.TrimSuffix(r.PathValue("id"), ".json")
+
+	cfg := s.resolvePathConfig(w, r)
+	if cfg == nil {
+		return
+	}
+
+	ctx := r.Context()
+	result, err := s.muxer.Process(ctx, cfg, contentType, contentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var streams []model.StremioStream
+	if result.Dubbed != nil {
+		streams = append(streams, *result.Dubbed)
+	}
+	if result.Subtitled != nil {
+		streams = append(streams, *result.Subtitled)
+	}
+
+	writeJSON(w, map[string]any{"streams": streams})
+}
+
+func (s *Server) handleMux(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	w.Header().Set("Content-Type", "video/x-matroska")
+	w.Header().Set("Content-Disposition", "inline; filename=\"streammux.mkv\"")
+	w.Header().Set("Cache-Control", "no-store")
+
+	err := s.ffmpeg.Remux(ctx, job.VideoURL, job.AudioURL, job.AudioTrackIndex, w)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{
+		"success": true,
+		"version": "1.0.0",
+		"channel": "stable",
+	})
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Config   model.Config `json:"config"`
+		Password string       `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if body.Password == "" {
+		writeError(w, http.StatusBadRequest, "password is required")
+		return
+	}
+	if body.Config.Language == "" {
+		writeError(w, http.StatusBadRequest, "language is required")
+		return
+	}
+
+	uuid, encryptedPassword, err := s.users.Create(r.Context(), &body.Config, body.Password)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, map[string]string{"uuid": uuid, "encryptedPassword": encryptedPassword})
+}
+
+func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
+	uuid, password, ok := s.parseBasicAuth(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing credentials")
+		return
+	}
+	cfg, err := s.users.Get(r.Context(), uuid, password)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	writeJSON(w, map[string]any{"config": cfg})
+}
+
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	uuid, password, ok := s.parseBasicAuth(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing credentials")
+		return
+	}
+	var body struct {
+		Config model.Config `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := s.users.Update(r.Context(), uuid, password, &body.Config); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	writeJSON(w, map[string]string{"uuid": uuid})
+}
+
+func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
+	uuid, password, ok := s.parseBasicAuth(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing credentials")
+		return
+	}
+	if err := s.users.Delete(r.Context(), uuid, password); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	writeJSON(w, map[string]bool{"success": true})
+}
+
+func (s *Server) resolvePathConfig(w http.ResponseWriter, r *http.Request) *model.Config {
+	uuid := r.PathValue("uuid")
+	password := r.PathValue("password")
+	if uuid == "" || password == "" {
+		writeError(w, http.StatusUnauthorized, "missing credentials")
+		return nil
+	}
+	cfg, err := s.users.Get(r.Context(), uuid, password)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return nil
+	}
+	return cfg
+}
+
+func (s *Server) parseBasicAuth(r *http.Request) (string, string, bool) {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return "", "", false
+	}
+	token := strings.TrimPrefix(auth, "Bearer ")
+	parts := strings.SplitN(token, ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func (s *Server) spaHandler() http.Handler {
+	if s.web == nil {
+		return http.NotFoundHandler()
+	}
+	index, err := fs.ReadFile(s.web, "index.html")
+	if err != nil {
+		return http.NotFoundHandler()
+	}
+	fileServer := http.FileServer(http.FS(s.web))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+		if _, err := fs.Stat(s.web, path); err == nil {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Write(index)
+	})
+}
+
+func writeJSON(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"success": false,
+		"error":   map[string]string{"message": message},
+	})
+}

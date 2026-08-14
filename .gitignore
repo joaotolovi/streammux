@@ -1,0 +1,25 @@
+# Binary
+/bin/
+/streammux
+
+# Data / runtime
+/data/
+*.db
+*.db-journal
+
+# Frontend
+/web/node_modules/
+/web/dist/
+/web/.vite/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.env
+.env.local
+
+# Go
+*.test
+*.out

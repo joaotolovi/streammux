@@ -1,0 +1,17 @@
+services:
+  streammux:
+    build: .
+    container_name: streammux
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - SECRET_KEY=${SECRET_KEY:-change-me-to-a-long-random-string}
+      - DATABASE_URI=sqlite:///data/streammux.db
+      - BASE_URL=${BASE_URL:-http://localhost:3001}
+    volumes:
+      - streammux-data:/data
+
+volumes:
+  streammux-data:
