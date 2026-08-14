@@ -28,6 +28,7 @@ import {
 } from '@untitledui/icons';
 import {
   Addon,
+  ADDON_LANGUAGE_OPTIONS,
   AddonRole,
   Config,
   DEFAULT_CONFIG,
@@ -111,7 +112,6 @@ export default function App() {
 
           <AddonsSection
             addons={config.addons}
-            language={config.language}
             onChange={(addons) => set({ addons })}
           />
 
@@ -256,11 +256,9 @@ function ServicesSection({
 
 function AddonsSection({
   addons,
-  language,
   onChange,
 }: {
   addons: Addon[];
-  language: string;
   onChange: (a: Addon[]) => void;
 }) {
   const addAddon = () => {
@@ -271,7 +269,7 @@ function AddonsSection({
         name: '',
         manifestUrl: '',
         role: 'both',
-        language,
+        language: '',
         enabled: true,
         timeout: 7000,
       },
@@ -373,12 +371,13 @@ function AddonCard({
             </Select>
             <Select
               label="Idioma"
+              tooltip="Força o idioma dos streams deste addon. Deixe 'Indefinido' para detectar automaticamente pelo nome do arquivo (bandeiras, 'Dublado', etc.)."
               selectedKey={addon.language}
               onSelectionChange={(k) => onChange({ language: String(k) })}
             >
-              {LANGUAGES.map((lang) => (
-                <Select.Item key={lang} id={lang}>
-                  {lang}
+              {ADDON_LANGUAGE_OPTIONS.map((opt) => (
+                <Select.Item key={opt.value || 'unset'} id={opt.value}>
+                  {opt.label}
                 </Select.Item>
               ))}
             </Select>

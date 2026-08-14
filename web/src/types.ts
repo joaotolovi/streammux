@@ -48,6 +48,15 @@ export const LANGUAGES = [
   'Hindi',
 ];
 
+// Sentinel value for an addon with no explicit language (detection falls back
+// to filename parsing). An empty string is used on the wire.
+export const ADDON_LANGUAGE_UNSET = '';
+
+export const ADDON_LANGUAGE_OPTIONS: { label: string; value: string }[] = [
+  { label: 'Indefinido (Multilíngua)', value: ADDON_LANGUAGE_UNSET },
+  ...LANGUAGES.map((lang) => ({ label: lang, value: lang })),
+];
+
 export const ROLE_LABELS: Record<AddonRole, { label: string; description: string }> = {
   video: {
     label: 'Vídeo',
