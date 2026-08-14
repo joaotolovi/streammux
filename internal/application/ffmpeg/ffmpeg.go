@@ -1,12 +1,15 @@
 package ffmpeg
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -51,6 +54,153 @@ func (m *Muxer) Remux(ctx context.Context, videoURL, audioURL string, audioTrack
 		return fmt.Errorf("ffmpeg wait: %w", err)
 	}
 	return nil
+}
+
+// RemuxToHLS runs FFmpeg to produce HLS segments (.ts) and a playlist (.m3u8)
+// in the given output directory. It uses stream copy (no re-encoding) and
+// writes segments as they are processed, so the player can start playback
+// before FFmpeg finishes. The returned channel closes when FFmpeg exits.
+//
+// Instead of probing the audio source separately (which causes a second HTTP
+// request that can hit rate limits), FFmpeg itself selects the audio track
+// by language metadata: -map 1:a:m:language:<lang>. If no track matches, the
+// first audio track is used as fallback.
+func (m *Muxer) RemuxToHLS(ctx context.Context, videoURL, audioURL, audioLang string, outDir string) (<-chan error, error) {
+	playlistPath := filepath.Join(outDir, "playlist.m3u8")
+	segPattern := filepath.Join(outDir, "seg_%05d.ts")
+
+	langCode := iso6391(audioLang)
+
+	var args []string
+	if videoURL == audioURL {
+		// Single source: video and audio come from the same file. This avoids
+		// a second HTTP request that would hit debrid proxy rate limits.
+		args = []string{
+			"-i", videoURL,
+			"-map", "0:v:0",
+			"-map", fmt.Sprintf("0:a:m:language:%s", langCode),
+			"-c", "copy",
+			"-f", "hls",
+			"-hls_time", "4",
+			"-hls_list_size", "0",
+			"-hls_segment_filename", segPattern,
+			playlistPath,
+		}
+	} else {
+		// Two sources: video from input 0, audio from input 1.
+		args = []string{
+			"-i", videoURL,
+			"-i", audioURL,
+			"-map", "0:v:0",
+			"-map", fmt.Sprintf("1:a:m:language:%s", langCode),
+			"-c", "copy",
+			"-f", "hls",
+			"-hls_time", "4",
+			"-hls_list_size", "0",
+			"-hls_segment_filename", segPattern,
+			playlistPath,
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, m.binaryPath, args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("ffmpeg start: %w", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			err = fmt.Errorf("ffmpeg: %w: %s", err, stderrBuf.String())
+		}
+		errCh <- err
+		close(errCh)
+	}()
+	return errCh, nil
+}
+
+// iso6391 converts a human language name (e.g. "Portuguese (Brazil)") to an
+// ISO 639-1 code (e.g. "por") suitable for FFmpeg's -map language filter.
+func iso6391(lang string) string {
+	switch {
+	case strings.Contains(lang, "Portuguese"):
+		return "por"
+	case strings.Contains(lang, "English"):
+		return "eng"
+	case strings.Contains(lang, "Spanish"):
+		return "spa"
+	case strings.Contains(lang, "French"):
+		return "fra"
+	case strings.Contains(lang, "German"):
+		return "deu"
+	case strings.Contains(lang, "Italian"):
+		return "ita"
+	case strings.Contains(lang, "Japanese"):
+		return "jpn"
+	case strings.Contains(lang, "Korean"):
+		return "kor"
+	case strings.Contains(lang, "Hindi"):
+		return "hin"
+	default:
+		return "eng"
+	}
+}
+
+// RemuxToHLSFirstAudio is a fallback that maps the first audio track (no
+// language selection). Used when the language-specific map fails.
+func (m *Muxer) RemuxToHLSFirstAudio(ctx context.Context, videoURL, audioURL, outDir string) (<-chan error, error) {
+	playlistPath := filepath.Join(outDir, "playlist.m3u8")
+	segPattern := filepath.Join(outDir, "seg_%05d.ts")
+
+	var args []string
+	if videoURL == audioURL {
+		args = []string{
+			"-i", videoURL,
+			"-map", "0:v:0",
+			"-map", "0:a:0",
+			"-c", "copy",
+			"-f", "hls",
+			"-hls_time", "4",
+			"-hls_list_size", "0",
+			"-hls_segment_filename", segPattern,
+			playlistPath,
+		}
+	} else {
+		args = []string{
+			"-i", videoURL,
+			"-i", audioURL,
+			"-map", "0:v:0",
+			"-map", "1:a:0",
+			"-c", "copy",
+			"-f", "hls",
+			"-hls_time", "4",
+			"-hls_list_size", "0",
+			"-hls_segment_filename", segPattern,
+			playlistPath,
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, m.binaryPath, args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("ffmpeg start: %w", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			err = fmt.Errorf("ffmpeg: %w: %s", err, stderrBuf.String())
+		}
+		errCh <- err
+		close(errCh)
+	}()
+	return errCh, nil
 }
 
 // ProbeResult holds everything ffprobe learns about a stream in one call.

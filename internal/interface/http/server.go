@@ -6,7 +6,10 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/streammux/streammux/internal/application/muxer"
 	"github.com/streammux/streammux/internal/domain/constants"
@@ -50,8 +53,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /stremio/{uuid}/{password}/manifest.json", s.handleManifest)
 	s.mux.HandleFunc("GET /stremio/{uuid}/{password}/stream/{type}/{id...}", s.handleStream)
 
-	// Mux endpoint
-	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMux)
+	// HLS endpoints — playlist and segments
+	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMuxRedirect)
+	s.mux.HandleFunc("GET /mux/{jobId}/playlist.m3u8", s.handleHLSPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/{segment}", s.handleHLSSegment)
 
 	// API
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
@@ -136,28 +141,95 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"streams": streams})
 }
 
-func (s *Server) handleMux(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMuxRedirect(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	http.Redirect(w, r, "/mux/"+jobID+"/playlist.m3u8", http.StatusFound)
+}
+
+func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	job, ok := s.store.Get(jobID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "mux job not found")
 		return
 	}
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
 
-	w.Header().Set("Content-Type", "video/x-matroska")
-	w.Header().Set("Content-Disposition", "inline; filename=\"streammux.mkv\"")
-	w.Header().Set("Cache-Control", "no-store")
-
-	// All the heavy work (probe audio track, verify durations, remux) happens
-	// here, at playback time — never during the /stream listing.
-	if err := s.muxer.ResolveMuxJob(ctx, job, w); err != nil {
-		if ctx.Err() != nil {
+	// If HLS hasn't been started yet, start it now (probe + ffmpeg).
+	if job.HLSDir == "" {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		if err := s.muxer.ResolveMuxJob(ctx, job); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("mux: %v", err)
+			writeError(w, http.StatusInternalServerError, "mux failed")
 			return
 		}
-		log.Printf("mux: %v", err)
 	}
+
+	playlistPath := filepath.Join(job.HLSDir, "playlist.m3u8")
+
+	// Wait for FFmpeg to write the playlist (it may take a few seconds).
+	waitCtx, waitCancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer waitCancel()
+	for {
+		if _, err := os.Stat(playlistPath); err == nil {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			writeError(w, http.StatusGatewayTimeout, "mux playlist not ready")
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, playlistPath)
+}
+
+func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	segment := r.PathValue("segment")
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	if job.HLSDir == "" {
+		writeError(w, http.StatusNotFound, "mux not started")
+		return
+	}
+
+	// Prevent path traversal: only allow filenames, no slashes.
+	segment = filepath.Base(segment)
+	segPath := filepath.Join(job.HLSDir, segment)
+
+	// Verify the file is inside the job's HLS dir.
+	if !strings.HasPrefix(filepath.Clean(segPath), filepath.Clean(job.HLSDir)+string(os.PathSeparator)) {
+		writeError(w, http.StatusBadRequest, "invalid segment")
+		return
+	}
+
+	// Wait for the segment to be written by FFmpeg.
+	waitCtx, waitCancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer waitCancel()
+	for {
+		if _, err := os.Stat(segPath); err == nil {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			writeError(w, http.StatusNotFound, "segment not ready")
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, segPath)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

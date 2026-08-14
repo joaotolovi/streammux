@@ -10,10 +10,11 @@ import (
 )
 
 type MemoryStore struct {
-	mu    sync.RWMutex
-	jobs  map[string]*model.MuxJob
-	times map[string]time.Time
-	ttl   time.Duration
+	mu        sync.RWMutex
+	jobs      map[string]*model.MuxJob
+	times     map[string]time.Time
+	ttl       time.Duration
+	onDelete  func(*model.MuxJob)
 }
 
 func NewMemoryStore(ttl time.Duration) *MemoryStore {
@@ -24,6 +25,14 @@ func NewMemoryStore(ttl time.Duration) *MemoryStore {
 	}
 	go s.cleanupLoop()
 	return s
+}
+
+// SetOnDelete registers a callback called when a job is deleted (by TTL or
+// explicit Delete). Used to clean up HLS temp directories.
+func (s *MemoryStore) SetOnDelete(fn func(*model.MuxJob)) {
+	s.mu.Lock()
+	s.onDelete = fn
+	s.mu.Unlock()
 }
 
 func (s *MemoryStore) Save(job *model.MuxJob) string {
@@ -51,8 +60,13 @@ func (s *MemoryStore) Get(id string) (*model.MuxJob, bool) {
 
 func (s *MemoryStore) Delete(id string) {
 	s.mu.Lock()
-	delete(s.jobs, id)
-	delete(s.times, id)
+	if job, ok := s.jobs[id]; ok {
+		if s.onDelete != nil {
+			s.onDelete(job)
+		}
+		delete(s.jobs, id)
+		delete(s.times, id)
+	}
 	s.mu.Unlock()
 }
 
@@ -61,6 +75,9 @@ func (s *MemoryStore) Cleanup() {
 	now := time.Now()
 	for id, t := range s.times {
 		if now.Sub(t) > s.ttl {
+			if job, ok := s.jobs[id]; ok && s.onDelete != nil {
+				s.onDelete(job)
+			}
 			delete(s.jobs, id)
 			delete(s.times, id)
 		}

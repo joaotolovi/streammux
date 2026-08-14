@@ -79,6 +79,10 @@ type MuxJob struct {
 	AudioURL       string `json:"audioUrl"`
 	TargetLanguage string `json:"targetLanguage"`
 	Title          string `json:"title"`
+
+	// HLSDir is the temp directory where HLS segments and the playlist are
+	// written by FFmpeg. Set when StartHLS is called.
+	HLSDir string `json:"-"`
 }
 
 type Manifest struct {

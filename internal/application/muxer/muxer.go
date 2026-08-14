@@ -3,7 +3,8 @@ package muxer
 import (
 	"context"
 	"fmt"
-	"io"
+	"log"
+	"os"
 	"strings"
 
 	"github.com/streammux/streammux/internal/application/analyzer"
@@ -82,12 +83,28 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 
 		switch {
 		case audioURL != "" && videoURL == audioURL:
-			// Same stream: audio and video already together, no remux needed.
-			result.Dubbed = directStream(
-				fmt.Sprintf("🔊 Dublado — %s %s", bestAudioDubbed.Parsed.Resolution, bestAudioDubbed.Parsed.Quality),
-				fmt.Sprintf("Fonte: %s | Sem remux (já dublado)", bestAudioDubbed.AddonName),
-				bestAudioDubbed.Stream,
-			)
+			// Same URL: the file is multilingual. Schedule a single-source
+			// remux that picks the target-language audio track via metadata,
+			// avoiding a second HTTP request (which would hit rate limits).
+			job := &model.MuxJob{
+				VideoURL:       videoURL,
+				AudioURL:       audioURL,
+				TargetLanguage: cfg.Language,
+				Title:          bestVideo.AddonName,
+			}
+			jobID := m.store.Save(job)
+			muxURL := "/mux/" + jobID + "/playlist.m3u8"
+			if m.baseURL != "" {
+				muxURL = m.baseURL + "/mux/" + jobID + "/playlist.m3u8"
+			}
+			result.Dubbed = &model.StremioStream{
+				Name:        fmt.Sprintf("🎬 Dublado — %s %s + Áudio %s", bestVideo.Parsed.Resolution, bestVideo.Parsed.Quality, cfg.Language),
+				Description: fmt.Sprintf("Fonte: %s | Remux (faixa %s)", bestVideo.AddonName, cfg.Language),
+				URL:         muxURL,
+				BehaviorHints: map[string]any{
+					"notWebReady": true,
+				},
+			}
 		case audioURL != "" && videoURL != "":
 			// Different streams: schedule a remux. The job carries the target
 			// language so the mux endpoint can pick the correct audio track
@@ -99,9 +116,9 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 				Title:          fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
 			}
 			jobID := m.store.Save(job)
-			muxURL := "/mux/" + jobID
+			muxURL := "/mux/" + jobID + "/playlist.m3u8"
 			if m.baseURL != "" {
-				muxURL = m.baseURL + muxURL
+				muxURL = m.baseURL + "/mux/" + jobID + "/playlist.m3u8"
 			}
 			result.Dubbed = &model.StremioStream{
 				Name:        fmt.Sprintf("🎬 Dublado — Vídeo %s %s + Áudio %s", bestVideo.Parsed.Resolution, bestVideo.Parsed.Quality, cfg.Language),
@@ -186,19 +203,67 @@ func (m *Muxer) selectAudioTrack(ctx context.Context, audioURL, targetLanguage s
 	return -1, nil
 }
 
+// CleanupJob removes the temp HLS directory for a job, if any.
+func (m *Muxer) CleanupJob(job *model.MuxJob) {
+	if job.HLSDir != "" {
+		os.RemoveAll(job.HLSDir)
+	}
+}
+
 // ResolveMuxJob performs the heavy work at playback time: it probes the audio
-// source to find the target-language track, then streams the remuxed MKV.
-func (m *Muxer) ResolveMuxJob(ctx context.Context, job *model.MuxJob, out io.Writer) error {
-	track, err := m.selectAudioTrack(ctx, job.AudioURL, job.TargetLanguage)
+// source to find the target-language track, then starts an HLS remux into a
+// temp directory. The playlist path is written to job.HLSDir so the HTTP
+// handler can serve it.
+func (m *Muxer) ResolveMuxJob(ctx context.Context, job *model.MuxJob) error {
+	tmpDir, err := os.MkdirTemp("", "streammux-*")
 	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	job.HLSDir = tmpDir
+
+	// Use a background context for FFmpeg so it keeps running after the
+	// HTTP request that triggered it returns. The FFmpeg process is tied
+	// to the job's lifetime (cleaned up when the job expires), not to any
+	// single request.
+	//
+	// No separate probe: FFmpeg selects the audio track by language metadata
+	// directly (-map 1:a:m:language:<lang>), avoiding a second HTTP request
+	// to the source URL (which would hit rate limits on debrid proxies).
+	errCh, err := m.ffmpeg.RemuxToHLS(context.Background(), job.VideoURL, job.AudioURL, job.TargetLanguage, tmpDir)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		job.HLSDir = ""
 		return err
 	}
-	if track < 0 {
-		// No matching track found; fall back to the first audio track so the
-		// user still gets something to play.
-		track = 0
-	}
-	return m.ffmpeg.Remux(ctx, job.VideoURL, job.AudioURL, track, out)
+
+	// Log FFmpeg errors when it finishes (background, non-blocking).
+	// If the language-based map fails, retry with the first audio track.
+	go func() {
+		err := <-errCh
+		if err != nil {
+			log.Printf("mux ffmpeg (lang map) error for job %s: %v — retrying with first audio track", job.ID, err)
+			// Retry: clear the dir, use first audio track as fallback.
+			os.RemoveAll(tmpDir)
+			tmpDir2, e2 := os.MkdirTemp("", "streammux-*")
+			if e2 != nil {
+				log.Printf("mux retry: create temp dir: %v", e2)
+				return
+			}
+			job.HLSDir = tmpDir2
+			retryCh, e3 := m.ffmpeg.RemuxToHLSFirstAudio(context.Background(), job.VideoURL, job.AudioURL, tmpDir2)
+			if e3 != nil {
+				log.Printf("mux retry: ffmpeg start: %v", e3)
+				os.RemoveAll(tmpDir2)
+				job.HLSDir = ""
+				return
+			}
+			if err := <-retryCh; err != nil {
+				log.Printf("mux retry: ffmpeg error for job %s: %v", job.ID, err)
+			}
+		}
+	}()
+
+	return nil
 }
 
 // directStream builds a StremioStream pointing at the source stream. When the
