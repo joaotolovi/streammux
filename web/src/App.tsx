@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Button } from '@/components/base/buttons/button';
 import { Input } from '@/components/base/input/input';
+import { InputNumber } from '@/components/base/input/input-number';
 import { Select } from '@/components/base/select/select';
 import { Toggle } from '@/components/base/toggle/toggle';
 import { Badge } from '@/components/base/badges/badges';
@@ -271,7 +272,7 @@ function AddonsSection({
         role: 'both',
         language: '',
         enabled: true,
-        timeout: 7000,
+        timeout: 20000,
       },
     ]);
   };
@@ -381,6 +382,14 @@ function AddonCard({
                 </Select.Item>
               ))}
             </Select>
+            <InputNumber
+              label="Timeout (s)"
+              value={(addon.timeout ?? 20000) / 1000}
+              minValue={1}
+              maxValue={120}
+              step={1}
+              onChange={(v) => onChange({ timeout: Math.round((v ?? 20) * 1000) })}
+            />
           </div>
         </div>
         <Tooltip title="Remover addon">
