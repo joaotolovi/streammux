@@ -46,26 +46,34 @@ export default function App() {
   const [uuid, setUuid] = useState('');
   const [encryptedPassword, setEncryptedPassword] = useState('');
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState('');
 
   const set = (patch: Partial<Config>) => {
     setConfig((prev) => ({ ...prev, ...patch }));
     setSaved(false);
+    setError('');
   };
 
   const save = async () => {
     if (!password) return;
-    const body: any = { config, password };
-    const res = await fetch('/api/v1/user', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const json = await res.json();
-    if (res.ok) {
-      setUuid(json.data.uuid);
-      setEncryptedPassword(json.data.encryptedPassword);
+    setError('');
+    try {
+      const res = await fetch('/api/v1/user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config, password }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        setError(json.error?.message || `Request failed (${res.status})`);
+        return;
+      }
+      setUuid(json.uuid);
+      setEncryptedPassword(json.encryptedPassword);
       setSaved(true);
       localStorage.setItem('streammux-config', JSON.stringify(config));
+    } catch (e) {
+      setError((e as Error).message);
     }
   };
 
@@ -112,6 +120,7 @@ export default function App() {
             setPassword={setPassword}
             onSave={save}
             saved={saved}
+            error={error}
             installUrl={installUrl}
           />
         </div>
@@ -403,12 +412,14 @@ function SaveSection({
   setPassword,
   onSave,
   saved,
+  error,
   installUrl,
 }: {
   password: string;
   setPassword: (v: string) => void;
   onSave: () => void;
   saved: boolean;
+  error: string;
   installUrl: string;
 }) {
   return (
@@ -429,19 +440,32 @@ function SaveSection({
           Salvar configuração
         </Button>
       </div>
+      {error && (
+        <p className="text-sm text-[var(--color-text-error-primary)]">{error}</p>
+      )}
       {saved && installUrl && (
         <div className="rounded-xl border border-[var(--color-border-secondary)] bg-[var(--color-bg-secondary)] p-4">
           <p className="mb-3 font-medium">Instale no Stremio</p>
-          <div className="flex gap-2">
-            <Input value={installUrl} isReadOnly className="flex-1" />
-            <Button
-              color="secondary"
-              size="md"
-              onPress={() => navigator.clipboard.writeText(installUrl)}
-            >
-              <Copy04 className="size-4" />
-              Copiar
-            </Button>
+          <div className="flex flex-col gap-2">
+            <Input value={installUrl} isReadOnly />
+            <div className="flex flex-wrap gap-2">
+              <Button
+                color="secondary"
+                size="md"
+                onPress={() => navigator.clipboard.writeText(installUrl)}
+              >
+                <Copy04 className="size-4" />
+                Copiar URL
+              </Button>
+              <Button
+                color="primary"
+                size="md"
+                onPress={() => window.open(`stremio://${installUrl.replace(/^https?:\/\//, '')}`, '_self')}
+              >
+                <Download01 className="size-4" />
+                Instalar no Stremio
+              </Button>
+            </div>
           </div>
         </div>
       )}
