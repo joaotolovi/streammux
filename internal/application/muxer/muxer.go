@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/streammux/streammux/internal/application/analyzer"
@@ -23,9 +22,6 @@ type Muxer struct {
 	ffmpeg    *ffmpeg.Muxer
 	resolver  *resolver.Resolver
 	store     ports.MuxStore
-
-	probeMu    sync.Mutex
-	probeCache map[string]*ffmpeg.ProbeResult
 }
 
 type Result struct {
@@ -35,12 +31,11 @@ type Result struct {
 
 func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore) *Muxer {
 	return &Muxer{
-		collector:  col,
-		analyzer:   an,
-		ffmpeg:     ff,
-		resolver:   res,
-		store:      store,
-		probeCache: make(map[string]*ffmpeg.ProbeResult),
+		collector: col,
+		analyzer:  an,
+		ffmpeg:    ff,
+		resolver:  res,
+		store:     store,
 	}
 }
 
@@ -391,25 +386,16 @@ func durationsClose(a, b float64) bool {
 	return min/max >= durationTolerance
 }
 
-// probeURL returns a cached probe result for a URL, probing it once.
+// probeURL probes a URL (duration + audio tracks). No caching: debrid URLs
+// rotate on every request, so a cached result would be stale immediately.
 func (m *Muxer) probeURL(ctx context.Context, url string) *ffmpeg.ProbeResult {
 	if url == "" {
 		return nil
 	}
-	m.probeMu.Lock()
-	if res, ok := m.probeCache[url]; ok {
-		m.probeMu.Unlock()
-		return res
-	}
-	m.probeMu.Unlock()
-
 	res, err := m.ffmpeg.Probe(ctx, url)
 	if err != nil {
 		return nil
 	}
-	m.probeMu.Lock()
-	m.probeCache[url] = res
-	m.probeMu.Unlock()
 	return res
 }
 
