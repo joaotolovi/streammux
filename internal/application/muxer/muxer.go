@@ -22,6 +22,11 @@ type Muxer struct {
 	ffmpeg    *ffmpeg.Muxer
 	store     ports.MuxStore
 
+	// baseURL is the public origin (e.g. https://mystreamux.joaotolovi.com)
+	// used to build absolute URLs for muxed streams so players resolve them
+	// reliably. Empty falls back to a path-relative URL.
+	baseURL string
+
 	// probeFn is the underlying probe implementation, defaulting to
 	// ffmpeg.Probe but swappable in tests to avoid real network calls.
 	probeFn func(ctx context.Context, url string) (*ffmpeg.ProbeResult, error)
@@ -32,12 +37,13 @@ type Result struct {
 	Subtitled *model.StremioStream
 }
 
-func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *resolver.Resolver, store ports.MuxStore) *Muxer {
+func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
 	m := &Muxer{
 		collector: col,
 		analyzer:  an,
 		ffmpeg:    ff,
 		store:     store,
+		baseURL:   strings.TrimSuffix(baseURL, "/"),
 	}
 	m.probeFn = ff.Probe
 	return m
@@ -93,10 +99,14 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 				Title:          fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
 			}
 			jobID := m.store.Save(job)
+			muxURL := "/mux/" + jobID
+			if m.baseURL != "" {
+				muxURL = m.baseURL + muxURL
+			}
 			result.Dubbed = &model.StremioStream{
 				Name:        fmt.Sprintf("🎬 Dublado — Vídeo %s %s + Áudio %s", bestVideo.Parsed.Resolution, bestVideo.Parsed.Quality, cfg.Language),
 				Description: fmt.Sprintf("Vídeo: %s (%s) | Áudio: %s | Remux", bestVideo.AddonName, bestVideo.Parsed.Resolution, bestAudioDubbed.AddonName),
-				URL:         fmt.Sprintf("/mux/%s", jobID),
+				URL:         muxURL,
 				BehaviorHints: map[string]any{
 					"notWebReady": true,
 				},

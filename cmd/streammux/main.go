@@ -54,7 +54,7 @@ func main() {
 	analyzer := analyzer.New()
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
-	mux := muxer.New(collector, analyzer, ff, res, store)
+	mux := muxer.New(collector, analyzer, ff, res, store, baseURL)
 
 	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{
 		BaseURL: baseURL,
