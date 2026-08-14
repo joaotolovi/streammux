@@ -56,7 +56,7 @@ func main() {
 	res := resolver.New()
 	mux := muxer.New(collector, analyzer, ff, res, store)
 
-	srv := streammuxhttp.New(users, store, mux, ff, streammuxhttp.Options{
+	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{
 		BaseURL: baseURL,
 		WebFS:   mustWebFS(),
 	})

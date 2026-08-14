@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"io/fs"
+	"log"
 	"net/http"
 	"strings"
 
-	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/application/muxer"
 	"github.com/streammux/streammux/internal/domain/constants"
 	"github.com/streammux/streammux/internal/domain/model"
@@ -18,7 +18,6 @@ type Server struct {
 	users   ports.UserRepository
 	store   ports.MuxStore
 	muxer   *muxer.Muxer
-	ffmpeg  *ffmpeg.Muxer
 	baseURL string
 	web     fs.FS
 	mux     *http.ServeMux
@@ -29,12 +28,11 @@ type Options struct {
 	WebFS   fs.FS
 }
 
-func New(users ports.UserRepository, store ports.MuxStore, mux *muxer.Muxer, ff *ffmpeg.Muxer, opts Options) *Server {
+func New(users ports.UserRepository, store ports.MuxStore, mux *muxer.Muxer, opts Options) *Server {
 	s := &Server{
 		users:   users,
 		store:   store,
 		muxer:   mux,
-		ffmpeg:  ff,
 		baseURL: opts.BaseURL,
 		web:     opts.WebFS,
 		mux:     http.NewServeMux(),
@@ -152,11 +150,13 @@ func (s *Server) handleMux(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "inline; filename=\"streammux.mkv\"")
 	w.Header().Set("Cache-Control", "no-store")
 
-	err := s.ffmpeg.Remux(ctx, job.VideoURL, job.AudioURL, job.AudioTrackIndex, w)
-	if err != nil {
+	// All the heavy work (probe audio track, verify durations, remux) happens
+	// here, at playback time — never during the /stream listing.
+	if err := s.muxer.ResolveMuxJob(ctx, job, w); err != nil {
 		if ctx.Err() != nil {
 			return
 		}
+		log.Printf("mux: %v", err)
 	}
 }
 

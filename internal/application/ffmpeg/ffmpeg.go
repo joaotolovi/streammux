@@ -10,10 +10,10 @@ import (
 	"time"
 )
 
-// probeTimeout bounds each ffprobe call. Probing a remote URL can be slow
-// (HTTP headers for a multi-GB file), so we cap it to avoid stalling the
-// stream response.
-const probeTimeout = 8 * time.Second
+// probeTimeout bounds each ffprobe call. Probing a remote URL (especially a
+// debrid link) can take several seconds to connect and read metadata, so this
+// is generous — the probe now runs at playback time, not during stream listing.
+const probeTimeout = 25 * time.Second
 
 type Muxer struct {
 	binaryPath string

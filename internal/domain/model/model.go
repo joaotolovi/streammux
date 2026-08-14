@@ -74,11 +74,11 @@ type StremioStream struct {
 }
 
 type MuxJob struct {
-	ID              string `json:"id"`
-	VideoURL        string `json:"videoUrl"`
-	AudioURL        string `json:"audioUrl"`
-	AudioTrackIndex int    `json:"audioTrackIndex"`
-	Title           string `json:"title"`
+	ID             string `json:"id"`
+	VideoURL       string `json:"videoUrl"`
+	AudioURL       string `json:"audioUrl"`
+	TargetLanguage string `json:"targetLanguage"`
+	Title          string `json:"title"`
 }
 
 type Manifest struct {

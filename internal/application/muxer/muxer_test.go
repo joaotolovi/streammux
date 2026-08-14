@@ -1,58 +1,115 @@
 package muxer
 
-import "testing"
+import (
+	"context"
+	"testing"
 
-func TestFindMatchingPair(t *testing.T) {
-	// Scenario: best video (V0) is an extended cut (9000s), best audio (A0)
-	// is the theatrical cut (8160s) — they don't match. The second-best video
-	// (V1) is the theatrical cut and matches A0.
-	vi, ai := findMatchingPair([]float64{9000, 8160, 8000}, []float64{8160, 8100})
-	if vi != 1 || ai != 0 {
-		t.Errorf("expected (1, 0), got (%d, %d)", vi, ai)
+	"github.com/streammux/streammux/internal/application/analyzer"
+	"github.com/streammux/streammux/internal/application/ffmpeg"
+	"github.com/streammux/streammux/internal/domain/constants"
+	"github.com/streammux/streammux/internal/domain/model"
+)
+
+func streamWithURL(url, resolution, quality string) model.Stream {
+	return model.Stream{Name: resolution + " " + quality, URL: url}
+}
+
+func TestSelectPairPrefersBestVideoAndDubbedAudio(t *testing.T) {
+	streams := []model.CollectedStream{
+		{
+			AddonRole: constants.RoleVideo,
+			Stream:    streamWithURL("https://video.example.com/1080p", "1080p", "BluRay"),
+			Parsed:    model.ParsedFile{Resolution: "1080p", Quality: "BluRay"},
+			Language:  "English",
+		},
+		{
+			AddonRole: constants.RoleVideo,
+			Stream:    streamWithURL("https://video.example.com/2160p", "2160p", "BluRay REMUX"),
+			Parsed:    model.ParsedFile{Resolution: "2160p", Quality: "BluRay REMUX"},
+			Language:  "English",
+		},
+		{
+			AddonRole: constants.RoleAudio,
+			Stream:    streamWithURL("https://audio.example.com/dub", "1080p", "BluRay"),
+			Parsed:    model.ParsedFile{Resolution: "1080p", Quality: "BluRay", Languages: []string{"Portuguese (Brazil)"}},
+			Language:  "Portuguese (Brazil)",
+			IsDubbed:  true,
+		},
+	}
+
+	m := &Muxer{analyzer: analyzer.New()}
+	bestVideo, bestAudio := m.selectPair(streams, "Portuguese (Brazil)")
+
+	if bestVideo == nil || bestVideo.Stream.URL != "https://video.example.com/2160p" {
+		t.Errorf("expected 2160p video, got %v", bestVideo)
+	}
+	if bestAudio == nil || bestAudio.Stream.URL != "https://audio.example.com/dub" {
+		t.Errorf("expected dubbed audio, got %v", bestAudio)
 	}
 }
 
-func TestFindMatchingPairSecondAudio(t *testing.T) {
-	// V0=8160 vs A0=9000 don't match. Pull V1=9000: it matches A0=9000 first
-	// (per the algorithm, the next best video is tried before the next best
-	// audio). So the pair is (V1, A0) = (1, 0).
-	vi, ai := findMatchingPair([]float64{8160, 9000, 7800}, []float64{9000, 8160})
-	if vi != 1 || ai != 0 {
-		t.Errorf("expected (1, 0), got (%d, %d)", vi, ai)
+func TestSelectPairSkipsAudioWithoutTargetLanguage(t *testing.T) {
+	streams := []model.CollectedStream{
+		{
+			AddonRole: constants.RoleVideo,
+			Stream:    streamWithURL("https://video.example.com", "1080p", "BluRay"),
+			Parsed:    model.ParsedFile{Resolution: "1080p", Quality: "BluRay"},
+			Language:  "English",
+		},
+		{
+			AddonRole: constants.RoleAudio,
+			Stream:    streamWithURL("https://audio.example.com/english", "1080p", "BluRay"),
+			Parsed:    model.ParsedFile{Resolution: "1080p", Quality: "BluRay", Languages: []string{"English"}},
+			Language:  "English",
+		},
+	}
+
+	m := &Muxer{analyzer: analyzer.New()}
+	bestVideo, bestAudio := m.selectPair(streams, "Portuguese (Brazil)")
+
+	if bestVideo == nil {
+		t.Error("expected a video candidate")
+	}
+	if bestAudio != nil {
+		t.Errorf("expected no dubbed audio (only English available), got %v", bestAudio)
 	}
 }
 
-func TestFindMatchingPairCrossComparison(t *testing.T) {
-	// V0=9000, A0=9000, A1=7800. V0 and A0 match immediately.
-	vi, ai := findMatchingPair([]float64{9000, 8000}, []float64{9000, 7800})
-	if vi != 0 || ai != 0 {
-		t.Errorf("expected (0, 0), got (%d, %d)", vi, ai)
+func TestSelectAudioTrackFindsLanguage(t *testing.T) {
+	m := &Muxer{probeFn: func(ctx context.Context, url string) (*ffmpeg.ProbeResult, error) {
+		return &ffmpeg.ProbeResult{
+			AudioTracks: []ffmpeg.AudioTrack{
+				{Index: 0, Language: "eng"},
+				{Index: 1, Language: "por"},
+				{Index: 2, Language: "spa"},
+			},
+		}, nil
+	}}
+
+	idx, err := m.selectAudioTrack(context.Background(), "https://audio.example.com", "Portuguese (Brazil)")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if idx != 1 {
+		t.Errorf("expected audio track index 1 (por), got %d", idx)
 	}
 }
 
-func TestFindMatchingPairNoMatchFallsBack(t *testing.T) {
-	// No durations are close enough to each other within 95%.
-	vi, ai := findMatchingPair([]float64{9000, 8800}, []float64{7800, 8000})
-	if vi != -1 || ai != -1 {
-		t.Errorf("expected (-1, -1), got (%d, %d)", vi, ai)
-	}
-}
+func TestSelectAudioTrackFallsBackWhenMissing(t *testing.T) {
+	m := &Muxer{probeFn: func(ctx context.Context, url string) (*ffmpeg.ProbeResult, error) {
+		return &ffmpeg.ProbeResult{
+			AudioTracks: []ffmpeg.AudioTrack{
+				{Index: 0, Language: "eng"},
+				{Index: 1, Language: "jpn"},
+			},
+		}, nil
+	}}
 
-func TestFindMatchingPairSkipsUnknown(t *testing.T) {
-	// Unknown durations (-1) are skipped; V1 (8160) matches A0 (8160).
-	vi, ai := findMatchingPair([]float64{-1, 8160}, []float64{8160})
-	if vi != 1 || ai != 0 {
-		t.Errorf("expected (1, 0), got (%d, %d)", vi, ai)
+	idx, err := m.selectAudioTrack(context.Background(), "https://audio.example.com", "Portuguese (Brazil)")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-}
-
-func TestFindMatchingPairEmpty(t *testing.T) {
-	vi, ai := findMatchingPair(nil, []float64{8160})
-	if vi != -1 {
-		t.Errorf("expected no match for empty videos, got (%d, %d)", vi, ai)
-	}
-	vi, ai = findMatchingPair([]float64{8160}, nil)
-	if vi != -1 {
-		t.Errorf("expected no match for empty audios, got (%d, %d)", vi, ai)
+	if idx != -1 {
+		t.Errorf("expected -1 (no Portuguese track), got %d", idx)
 	}
 }
