@@ -92,6 +92,12 @@ type MuxJob struct {
 	// supports HTTP Range and answers in milliseconds.
 	VideoResolved string `json:"-"`
 	AudioResolved string `json:"-"`
+
+	// AudioCandidates (not serialized) is the ordered list of audio source URLs
+	// to try, best first. Debrid sources sometimes return a short error video
+	// (no audio track) instead of the real file; we fall back through this
+	// list until one yields a usable audio track.
+	AudioCandidates []string `json:"-"`
 }
 
 type Manifest struct {

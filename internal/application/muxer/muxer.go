@@ -110,10 +110,11 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 			// is usually English). Single-source when video and audio come
 			// from the same URL (one HTTP connection), two-source otherwise.
 			job := &model.MuxJob{
-				VideoURL:       videoURL,
-				AudioURL:       audioURL,
-				TargetLanguage: cfg.Language,
-				Title:          fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
+				VideoURL:         videoURL,
+				AudioURL:         audioURL,
+				TargetLanguage:   cfg.Language,
+				Title:            fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
+				AudioCandidates:  m.audioCandidates(streams, cfg.Language),
 			}
 			jobID := m.store.Save(job)
 			result.Dubbed = &model.StremioStream{
@@ -143,6 +144,34 @@ func (m *Muxer) muxURL(jobID string) string {
 		u = m.baseURL + u
 	}
 	return u
+}
+
+// audioCandidates returns the ordered list of audio source URLs (best first)
+// that match the target language, excluding the primary choice. Used as a
+// fallback when a debrid source returns a broken/error video with no audio.
+func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage string) []string {
+	ranked := m.analyzer.RankAudio(streams, targetLanguage)
+	var out []string
+	for i := range ranked {
+		u := ranked[i].Stream.Stream.URL
+		if u == "" {
+			continue
+		}
+		log.Printf("mux: audio candidate %d: %s (size=%d)", i, truncate(u), ranked[i].Stream.Size)
+		// Skip the primary (first) candidate — it's already job.AudioURL.
+		if i == 0 {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+func truncate(s string) string {
+	if len(s) > 70 {
+		return s[:70] + "..."
+	}
+	return s
 }
 
 // selectPair picks the best video and best dubbed audio using filename parsing
@@ -268,22 +297,52 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 	}
 
 	videoURL := m.resolvedURL(ctx, job, "video")
-	audioURL := m.resolvedURL(ctx, job, "audio")
 
-	err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, lang, offset, out)
-	if err != nil && lang != "" {
-		// Language map may have failed (no matching track). Retry with the
-		// first audio track and remember it.
-		log.Printf("mux: lang map failed for seg %d, retrying with first track: %v", segIndex, err)
+	// Try the primary audio source first, then fall back through the ordered
+	// candidates. Debrid sources sometimes return a short error video with no
+	// audio track; we skip to the next candidate until one yields audio.
+	audioURLs := append([]string{m.resolvedURL(ctx, job, "audio")}, job.AudioCandidates...)
+
+	var lastErr error
+	for i, audioURL := range audioURLs {
+		if audioURL == "" {
+			continue
+		}
+		err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, lang, offset, out)
+		if err == nil {
+			// Success. If we had to fall back, remember the working source so
+			// subsequent segments don't re-try the broken one.
+			if i > 0 {
+				job.AudioURL = audioURL
+				job.AudioResolved = audioURL
+				job.AudioCandidates = nil
+				log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, i)
+			}
+			return nil
+		}
+		lastErr = err
+		log.Printf("mux: audio source %d failed for seg %d: %v", i, segIndex, err)
 		if truncErr := resetFile(out); truncErr != nil {
 			return fmt.Errorf("reset output: %w", truncErr)
 		}
-		err = m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, "", offset, out)
+	}
+
+	// All audio sources failed. If we were using a language map, retry the
+	// primary with the first audio track as a last resort.
+	if lang != "" {
+		log.Printf("mux: all audio sources failed for seg %d, retrying first track: %v", segIndex, lastErr)
+		if truncErr := resetFile(out); truncErr != nil {
+			return fmt.Errorf("reset output: %w", truncErr)
+		}
+		err := m.ffmpeg.GenerateSegment(ctx, videoURL, m.resolvedURL(ctx, job, "audio"), "", offset, out)
 		if err == nil {
 			job.LangOK = false
+			return nil
 		}
+		lastErr = err
 	}
-	return err
+
+	return lastErr
 }
 
 // resolvedURL returns the final CDN URL for a job source, resolving the addon's
