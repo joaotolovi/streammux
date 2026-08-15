@@ -473,15 +473,20 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 func (m *Muxer) probeValidDuration(ctx context.Context, primary string, candidates []string) (float64, string) {
 	const minDuration = 600 // 10 minutes; a real movie/series is far longer
 
+	// primary is already resolved to its CDN URL by the caller; only fallback
+	// candidates still need resolving.
 	urls := append([]string{primary}, candidates...)
 	for i, u := range urls {
 		if u == "" {
 			continue
 		}
-		resolved := m.resolveOne(ctx, u)
-		if resolved == "" {
-			log.Printf("mux: video source %d failed to resolve, skipping", i)
-			continue
+		resolved := u
+		if i > 0 {
+			resolved = m.resolveOne(ctx, u)
+			if resolved == "" {
+				log.Printf("mux: video source %d failed to resolve, skipping", i)
+				continue
+			}
 		}
 		res, err := m.ffmpeg.Probe(ctx, resolved)
 		if err != nil {

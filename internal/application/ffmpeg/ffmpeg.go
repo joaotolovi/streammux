@@ -15,6 +15,12 @@ import (
 
 const probeTimeout = 40 * time.Second
 
+// segmentTimeout bounds each ffmpeg segment generation. A 4s segment from a
+// fast CDN should finish in a few seconds; this cap releases the per-segment
+// singleflight lock even if a source stalls, so concurrent requests never
+// block forever waiting on a stuck generator.
+const segmentTimeout = 30 * time.Second
+
 // segDuration is the length of each HLS segment in seconds.
 const segDuration = 4.0
 
@@ -77,7 +83,13 @@ func (m *Muxer) GenerateSegment(ctx context.Context, videoURL, audioURL string, 
 		"pipe:1",
 	)
 
-	cmd := exec.CommandContext(ctx, m.binaryPath, args...)
+	// Cap the whole ffmpeg run: a stalled source must not hold the segment
+	// singleflight lock indefinitely (that would block every retry of the same
+	// segment). On timeout the caller fails fast and the next attempt retries.
+	segCtx, cancel := context.WithTimeout(ctx, segmentTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(segCtx, m.binaryPath, args...)
 	cmd.Stdout = out
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
