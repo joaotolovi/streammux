@@ -3,13 +3,13 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/streammux/streammux/internal/application/muxer"
 	"github.com/streammux/streammux/internal/domain/constants"
@@ -154,35 +154,17 @@ func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If HLS hasn't been started yet, start it now (probe + ffmpeg).
-	if job.HLSDir == "" {
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
-		if err := s.muxer.ResolveMuxJob(ctx, job); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("mux: %v", err)
-			writeError(w, http.StatusInternalServerError, "mux failed")
-			return
-		}
+	// Generate the static playlist (probes duration once, cached on the job).
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		log.Printf("mux playlist: %v", err)
+		writeError(w, http.StatusInternalServerError, "playlist generation failed")
+		return
 	}
 
-	playlistPath := filepath.Join(job.HLSDir, "playlist.m3u8")
-
-	// Wait for FFmpeg to write the playlist (it may take a few seconds).
-	waitCtx, waitCancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer waitCancel()
-	for {
-		if _, err := os.Stat(playlistPath); err == nil {
-			break
-		}
-		select {
-		case <-waitCtx.Done():
-			writeError(w, http.StatusGatewayTimeout, "mux playlist not ready")
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
+	playlistPath := s.muxer.PlaylistPath(job)
+	if playlistPath == "" {
+		writeError(w, http.StatusInternalServerError, "playlist not ready")
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -192,40 +174,67 @@ func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
-	segment := r.PathValue("segment")
+	segment := filepath.Base(r.PathValue("segment"))
 	job, ok := s.store.Get(jobID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "mux job not found")
 		return
 	}
-	if job.HLSDir == "" {
-		writeError(w, http.StatusNotFound, "mux not started")
-		return
-	}
 
-	// Prevent path traversal: only allow filenames, no slashes.
-	segment = filepath.Base(segment)
-	segPath := filepath.Join(job.HLSDir, segment)
-
-	// Verify the file is inside the job's HLS dir.
-	if !strings.HasPrefix(filepath.Clean(segPath), filepath.Clean(job.HLSDir)+string(os.PathSeparator)) {
+	// Parse segment index from filename like "seg_00123.ts".
+	var segIndex int
+	if _, err := fmt.Sscanf(segment, "seg_%05d.ts", &segIndex); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid segment")
 		return
 	}
 
-	// Wait for the segment to be written by FFmpeg.
-	waitCtx, waitCancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer waitCancel()
-	for {
-		if _, err := os.Stat(segPath); err == nil {
-			break
-		}
-		select {
-		case <-waitCtx.Done():
-			writeError(w, http.StatusNotFound, "segment not ready")
+	// Serve from cache if already generated.
+	if cached := s.muxer.SegmentPath(job, segIndex); cached != "" {
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, cached)
+		return
+	}
+
+	// Ensure the cache dir exists (EnsurePlaylist creates it and probes
+	// duration once).
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		log.Printf("mux segment: %v", err)
+		writeError(w, http.StatusInternalServerError, "segment generation failed")
+		return
+	}
+
+	// Generate on-demand: ffmpeg -ss {offset} -t 4 seeks directly into the
+	// source via HTTP Range and produces just this segment.
+	segPath := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
+	tmpPath := segPath + ".tmp"
+
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "create segment file failed")
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	if err := s.muxer.GenerateSegment(ctx, job, segIndex, f); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		if ctx.Err() != nil {
 			return
-		case <-time.After(500 * time.Millisecond):
 		}
+		log.Printf("mux segment %d: %v", segIndex, err)
+		writeError(w, http.StatusInternalServerError, "segment generation failed")
+		return
+	}
+	f.Close()
+
+	// Atomic rename: .tmp → final so concurrent requests never read a partial
+	// segment.
+	if err := os.Rename(tmpPath, segPath); err != nil {
+		os.Remove(tmpPath)
+		writeError(w, http.StatusInternalServerError, "segment rename failed")
+		return
 	}
 
 	w.Header().Set("Cache-Control", "no-store")

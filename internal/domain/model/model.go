@@ -80,9 +80,18 @@ type MuxJob struct {
 	TargetLanguage string `json:"targetLanguage"`
 	Title          string `json:"title"`
 
-	// HLSDir is the temp directory where HLS segments and the playlist are
-	// written by FFmpeg. Set when StartHLS is called.
-	HLSDir string `json:"-"`
+	// Runtime fields (not serialized):
+	Duration      float64 `json:"-"` // probed once, cached
+	LangOK        bool    `json:"-"` // false = language map failed, use first track
+	CacheDir      string  `json:"-"` // temp dir for cached segments
+	PlaylistReady bool    `json:"-"` // playlist has been written
+
+	// Resolved URLs (not serialized). Addon URLs redirect through a debrid
+	// proxy (e.g. torrentio → torbox API → CDN) that is slow to re-resolve on
+	// every request. We resolve once and use the final CDN URL directly, which
+	// supports HTTP Range and answers in milliseconds.
+	VideoResolved string `json:"-"`
+	AudioResolved string `json:"-"`
 }
 
 type Manifest struct {

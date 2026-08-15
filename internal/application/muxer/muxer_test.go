@@ -1,11 +1,9 @@
 package muxer
 
 import (
-	"context"
 	"testing"
 
 	"github.com/streammux/streammux/internal/application/analyzer"
-	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/domain/constants"
 	"github.com/streammux/streammux/internal/domain/model"
 )
@@ -72,44 +70,5 @@ func TestSelectPairSkipsAudioWithoutTargetLanguage(t *testing.T) {
 	}
 	if bestAudio != nil {
 		t.Errorf("expected no dubbed audio (only English available), got %v", bestAudio)
-	}
-}
-
-func TestSelectAudioTrackFindsLanguage(t *testing.T) {
-	m := &Muxer{probeFn: func(ctx context.Context, url string) (*ffmpeg.ProbeResult, error) {
-		return &ffmpeg.ProbeResult{
-			AudioTracks: []ffmpeg.AudioTrack{
-				{Index: 0, Language: "eng"},
-				{Index: 1, Language: "por"},
-				{Index: 2, Language: "spa"},
-			},
-		}, nil
-	}}
-
-	idx, err := m.selectAudioTrack(context.Background(), "https://audio.example.com", "Portuguese (Brazil)")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if idx != 1 {
-		t.Errorf("expected audio track index 1 (por), got %d", idx)
-	}
-}
-
-func TestSelectAudioTrackFallsBackWhenMissing(t *testing.T) {
-	m := &Muxer{probeFn: func(ctx context.Context, url string) (*ffmpeg.ProbeResult, error) {
-		return &ffmpeg.ProbeResult{
-			AudioTracks: []ffmpeg.AudioTrack{
-				{Index: 0, Language: "eng"},
-				{Index: 1, Language: "jpn"},
-			},
-		}, nil
-	}}
-
-	idx, err := m.selectAudioTrack(context.Background(), "https://audio.example.com", "Portuguese (Brazil)")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if idx != -1 {
-		t.Errorf("expected -1 (no Portuguese track), got %d", idx)
 	}
 }
