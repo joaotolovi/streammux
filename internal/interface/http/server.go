@@ -195,6 +195,22 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Singleflight: only one request generates a given segment at a time.
+	// Concurrent requests (the player retrying after a timeout) block here,
+	// then serve the cached file once the generator finishes, instead of each
+	// spawning its own ffmpeg writing to the same .tmp file.
+	lock := s.muxer.SegmentLock(jobID, segIndex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Re-check the cache after acquiring the lock — the generator may have
+	// finished while we were waiting.
+	if cached := s.muxer.SegmentPath(job, segIndex); cached != "" {
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, cached)
+		return
+	}
+
 	// Ensure the cache dir exists (EnsurePlaylist creates it and probes
 	// duration once).
 	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {

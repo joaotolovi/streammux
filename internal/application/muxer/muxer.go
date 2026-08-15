@@ -44,6 +44,14 @@ type Muxer struct {
 	// resolveMu serializes URL resolution so a slow debrid redirect chain is
 	// only walked once, even under concurrent segment requests.
 	resolveMu sync.Mutex
+
+	// segMu guards segLocks.
+	segMu sync.Mutex
+
+	// segLocks are per-(job, segment) mutexes used as singleflight: concurrent
+	// requests for the same segment serialize on the same lock, so only one
+	// ffmpeg writes the .tmp file. The others wait, then serve the cached file.
+	segLocks map[string]*sync.Mutex
 }
 
 type Result struct {
@@ -61,7 +69,35 @@ func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *r
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		segLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// SegmentLock returns the singleflight mutex for a (job, segment) pair so that
+// concurrent requests for the same segment generate it only once.
+func (m *Muxer) SegmentLock(jobID string, segIndex int) *sync.Mutex {
+	key := fmt.Sprintf("%s:%05d", jobID, segIndex)
+	m.segMu.Lock()
+	defer m.segMu.Unlock()
+	l, ok := m.segLocks[key]
+	if !ok {
+		l = &sync.Mutex{}
+		m.segLocks[key] = l
+	}
+	return l
+}
+
+// ReleaseSegmentLocks drops the singleflight locks for a job (called on job
+// cleanup to avoid unbounded growth).
+func (m *Muxer) ReleaseSegmentLocks(jobID string) {
+	prefix := jobID + ":"
+	m.segMu.Lock()
+	for k := range m.segLocks {
+		if strings.HasPrefix(k, prefix) {
+			delete(m.segLocks, k)
+		}
+	}
+	m.segMu.Unlock()
 }
 
 func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, contentID string) (*Result, error) {
@@ -579,6 +615,7 @@ func resetFile(f *os.File) error {
 
 // CleanupJob removes the temp cache directory for a job.
 func (m *Muxer) CleanupJob(job *model.MuxJob) {
+	m.ReleaseSegmentLocks(job.ID)
 	if job.CacheDir != "" {
 		os.RemoveAll(job.CacheDir)
 	}
