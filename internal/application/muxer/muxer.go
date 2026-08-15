@@ -290,13 +290,17 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	// probed duration is implausibly short for a movie/series (or probing
 	// fails), fall back through the ordered video candidates. Each candidate is
 	// resolved to its CDN URL before probing.
+	//
+	// We also check whether the source's sustained throughput can keep up with
+	// the chosen video's bitrate. If not, we walk down the quality list to the
+	// best source that the connection can actually sustain — a 4K REMUX that a
+	// slow CDN can't deliver in real time would otherwise freeze playback.
 	if job.Duration == 0 {
-		videoURL := m.resolvedURL(ctx, job, "video")
-		dur, chosen := m.probeValidDuration(ctx, videoURL, job.VideoCandidates)
+		dur, chosen := m.pickVideoSource(ctx, job)
 		job.Duration = dur
 		if chosen != "" && chosen != job.VideoURL {
 			job.VideoURL = chosen
-			job.VideoResolved = chosen
+			job.VideoResolved = ""
 			log.Printf("mux: video switched to %s", truncate(chosen))
 		}
 	}
@@ -465,45 +469,107 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 	return lastErr
 }
 
-// probeValidDuration probes a video source for its duration, walking the
-// fallback candidates when the primary is implausibly short (a debrid proxy
-// sometimes returns a trailer/preview instead of the real file) or probing
-// fails. Each candidate is resolved to its CDN URL before probing. It returns
-// the duration and the URL that produced it ("" means the fallback was used).
-func (m *Muxer) probeValidDuration(ctx context.Context, primary string, candidates []string) (float64, string) {
+// pickVideoSource walks the video quality list (primary first, then candidates
+// in ranked order) and returns the duration and best source URL that is both a
+// real file (duration plausible) and sustainable by the source's throughput.
+//
+// Debrid proxies sometimes return a short trailer instead of the movie, and a
+// 4K REMUX may need more bandwidth than a slow CDN can deliver in real time —
+// both would freeze playback. So we skip broken/short sources and drop down the
+// quality ladder until the chosen stream fits the measured throughput. If no
+// source is sustainable we still return the best valid one (better to play than
+// nothing), falling back to 7200s duration when nothing probes.
+func (m *Muxer) pickVideoSource(ctx context.Context, job *model.MuxJob) (float64, string) {
 	const minDuration = 600 // 10 minutes; a real movie/series is far longer
 
-	// primary is already resolved to its CDN URL by the caller; only fallback
-	// candidates still need resolving.
-	urls := append([]string{primary}, candidates...)
-	for i, u := range urls {
+	// Real-time playback needs the source bitrate; require a comfortable margin
+	// (1.3x) so segment generation (which also reads) keeps ahead.
+	const sustainFactor = 1.3
+
+	sources := append([]string{job.VideoURL}, job.VideoCandidates...)
+
+	best := struct {
+		dur    float64
+		resolved string
+	}{}
+
+	for i, u := range sources {
 		if u == "" {
 			continue
 		}
-		resolved := u
-		if i > 0 {
+		var resolved string
+		if i == 0 {
+			resolved = m.resolvedURL(ctx, job, "video")
+		} else {
 			resolved = m.resolveOne(ctx, u)
-			if resolved == "" {
-				log.Printf("mux: video source %d failed to resolve, skipping", i)
-				continue
-			}
 		}
+		if resolved == "" {
+			log.Printf("mux: video source %d failed to resolve, skipping", i)
+			continue
+		}
+
 		res, err := m.ffmpeg.Probe(ctx, resolved)
 		if err != nil {
 			log.Printf("mux: video probe %d failed: %v", i, err)
 			continue
 		}
-		if res.Duration >= minDuration {
-			if i > 0 {
-				log.Printf("mux: video fell back to candidate %d (duration %.0fs)", i, res.Duration)
-			}
+		if res.Duration < minDuration {
+			log.Printf("mux: video candidate %d too short (%.0fs), skipping", i, res.Duration)
+			continue
+		}
+
+		// Remember the best valid source in case none is sustainable.
+		if best.resolved == "" {
+			best.dur = res.Duration
+			best.resolved = resolved
+		}
+
+		throughput := m.measureThroughput(ctx, resolved)
+		if res.VideoBitrate > 0 && throughput > 0 && throughput >= res.VideoBitrate*sustainFactor {
+			log.Printf("mux: video candidate %d sustainable (%.1f Mbps > %.1f Mbps)", i, throughput/1e6, res.VideoBitrate/1e6)
 			return res.Duration, resolved
 		}
-		log.Printf("mux: video candidate %d too short (%.0fs), skipping", i, res.Duration)
+		if throughput > 0 {
+			log.Printf("mux: video candidate %d too fast for source (%.1f Mbps needed, %.1f Mbps available), trying next", i, res.VideoBitrate/1e6, throughput/1e6)
+		}
+	}
+
+	if best.resolved != "" {
+		log.Printf("mux: no sustainable video, using best valid source")
+		return best.dur, best.resolved
 	}
 
 	log.Printf("mux: no valid video source, using 7200s fallback")
 	return 7200, ""
+}
+
+// measureThroughput downloads a small sample from the source and returns the
+// sustained rate in bytes/second, or 0 on failure.
+func (m *Muxer) measureThroughput(ctx context.Context, url string) float64 {
+	if url == "" {
+		return 0
+	}
+	const sampleBytes = 2 * 1024 * 1024
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", sampleBytes-1))
+
+	start := time.Now()
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, sampleBytes))
+	elapsed := time.Since(start).Seconds()
+	if elapsed <= 0 || n == 0 {
+		return 0
+	}
+	return float64(n) / elapsed
 }
 
 // resolveOne follows the redirect chain of a single URL and returns the final

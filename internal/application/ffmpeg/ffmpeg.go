@@ -132,13 +132,14 @@ type AudioTrack struct {
 // ProbeResult holds what ffprobe learns about a stream in one call.
 type ProbeResult struct {
 	Duration    float64
+	VideoBitrate float64 // bits/s of the video stream (0 if unknown)
 	AudioTracks []AudioTrack
 }
 
-// Probe inspects a stream's duration and audio tracks in a single ffprobe call.
-// analyzeduration/probesize are kept small so probing a large remote file does
-// not read far ahead (defaults read up to 5MB/5s, which at high bitrates is
-// tens of megabytes over the network).
+// Probe inspects a stream's duration, video bitrate and audio tracks in a single
+// ffprobe call. analyzeduration/probesize are kept small so probing a large
+// remote file does not read far ahead (defaults read up to 5MB/5s, which at
+// high bitrates is tens of megabytes over the network).
 func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 	args := []string{
 		"-v", "quiet",
@@ -162,12 +163,15 @@ func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 	var p struct {
 		Streams []struct {
 			CodecType string `json:"codec_type"`
+			BitRate   string `json:"bit_rate"`
 			Tags      struct {
 				Language string `json:"language"`
+				BPS      string `json:"BPS"`
 			} `json:"tags"`
 		} `json:"streams"`
 		Format struct {
 			Duration string `json:"duration"`
+			BitRate  string `json:"bit_rate"`
 		} `json:"format"`
 	}
 	if err := json.Unmarshal(output, &p); err != nil {
@@ -177,6 +181,17 @@ func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 	res := &ProbeResult{}
 	audioRel := 0
 	for _, s := range p.Streams {
+		if s.CodecType == "video" {
+			// MKV often omits stream.bit_rate; fall back to the format-level
+			// bitrate or the mkvmerge BPS tag.
+			switch {
+			case s.BitRate != "":
+				res.VideoBitrate = parseFloat(s.BitRate)
+			case s.Tags.BPS != "":
+				res.VideoBitrate = parseFloat(s.Tags.BPS)
+			}
+			continue
+		}
 		if s.CodecType != "audio" {
 			continue
 		}
@@ -191,7 +206,20 @@ func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 			res.Duration = d
 		}
 	}
+	// MKV often omits per-stream bit_rate; the format-level bitrate is the
+	// fallback for the video bitrate.
+	if res.VideoBitrate <= 0 && p.Format.BitRate != "" {
+		res.VideoBitrate = parseFloat(p.Format.BitRate)
+	}
 	return res, nil
+}
+
+func parseFloat(s string) float64 {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 // AudioTrackIndexByLanguage returns the relative index of the first audio track
