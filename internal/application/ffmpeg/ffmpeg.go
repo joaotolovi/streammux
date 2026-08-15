@@ -48,7 +48,6 @@ func (m *Muxer) GenerateSegment(ctx context.Context, videoURL, audioURL string, 
 		// HTTP connection is opened.
 		args = []string{
 			"-ss", fmtDuration(offset),
-			"-t", fmtDuration(segDuration),
 			"-i", videoURL,
 			"-map", "0:v:0",
 		}
@@ -65,6 +64,11 @@ func (m *Muxer) GenerateSegment(ctx context.Context, videoURL, audioURL string, 
 		args = append(args, audioMapByIndex(audioTrackIndex, 1)...)
 	}
 	args = append(args,
+		// -t after the inputs is an output duration limit: it caps the muxed
+		// output at segDuration regardless of whether there are one or two
+		// sources. Without it, a two-source remux would run until the end of
+		// the film instead of producing a single 4s segment.
+		"-t", fmtDuration(segDuration),
 		"-analyzeduration", "1000000",
 		"-probesize", "2000000",
 		"-c", "copy",
