@@ -41,17 +41,39 @@ func New(binaryPath string) *Muxer {
 // the start — so seeking to minute 5 or minute 100 costs the same.
 //
 // audioTrackIndex selects the audio track by numeric index (e.g. 0 = first
-// GenerateVideoSegment produces a single HLS .ts segment containing only the
-// video stream of the source at [offset, offset+segDuration). It uses -ss
-// before -i (input seek via HTTP Range), so seeking costs the same anywhere.
+// audio track). It is resolved once per job by probing the source, so each
+// segment avoids scanning language metadata — this keeps the time to the first
+// byte low (the MKV header is read once, not re-scanned for languages).
 //
 // analyzeduration/probesize are kept small so FFmpeg starts emitting output
 // almost immediately instead of reading far ahead into the remote file.
-func (m *Muxer) GenerateVideoSegment(ctx context.Context, videoURL string, offset float64, out io.Writer) error {
-	args := []string{
-		"-ss", fmtDuration(offset),
-		"-i", videoURL,
-		"-map", "0:v:0",
+func (m *Muxer) GenerateSegment(ctx context.Context, videoURL, audioURL string, audioTrackIndex int, offset float64, out io.Writer) error {
+	var args []string
+	if videoURL == audioURL {
+		// Single source: video and audio come from the same file, so only one
+		// HTTP connection is opened.
+		args = []string{
+			"-ss", fmtDuration(offset),
+			"-i", videoURL,
+			"-map", "0:v:0",
+		}
+		args = append(args, audioMapByIndex(audioTrackIndex, 0)...)
+	} else {
+		// Two sources: seek both to the same offset, in parallel.
+		args = []string{
+			"-ss", fmtDuration(offset),
+			"-i", videoURL,
+			"-ss", fmtDuration(offset),
+			"-i", audioURL,
+			"-map", "0:v:0",
+		}
+		args = append(args, audioMapByIndex(audioTrackIndex, 1)...)
+	}
+	args = append(args,
+		// -t after the inputs is an output duration limit: it caps the muxed
+		// output at segDuration regardless of whether there are one or two
+		// sources. Without it, a two-source remux would run until the end of
+		// the film instead of producing a single 4s segment.
 		"-t", fmtDuration(segDuration),
 		"-analyzeduration", "1000000",
 		"-probesize", "2000000",
@@ -59,37 +81,8 @@ func (m *Muxer) GenerateVideoSegment(ctx context.Context, videoURL string, offse
 		"-avoid_negative_ts", "make_zero",
 		"-f", "mpegts",
 		"pipe:1",
-	}
-	return m.runFFmpeg(ctx, args, out)
-}
+	)
 
-// GenerateAudioSegment produces a single HLS .ts segment containing only the
-// audio track at audioTrackIndex of the source at [offset, offset+segDuration).
-// The track index is resolved once per job by probing, so each segment avoids
-// scanning language metadata. A negative index falls back to the first track.
-func (m *Muxer) GenerateAudioSegment(ctx context.Context, audioURL string, audioTrackIndex int, offset float64, out io.Writer) error {
-	idx := audioTrackIndex
-	if idx < 0 {
-		idx = 0
-	}
-	args := []string{
-		"-ss", fmtDuration(offset),
-		"-i", audioURL,
-		"-map", fmt.Sprintf("0:a:%d", idx),
-		"-t", fmtDuration(segDuration),
-		"-analyzeduration", "1000000",
-		"-probesize", "2000000",
-		"-c", "copy",
-		"-avoid_negative_ts", "make_zero",
-		"-f", "mpegts",
-		"pipe:1",
-	}
-	return m.runFFmpeg(ctx, args, out)
-}
-
-// runFFmpeg executes an ffmpeg command with a dedicated timeout, streaming its
-// stdout to out and capturing a bounded tail of stderr for errors.
-func (m *Muxer) runFFmpeg(ctx context.Context, args []string, out io.Writer) error {
 	// Cap the whole ffmpeg run: a stalled source must not hold the segment
 	// singleflight lock indefinitely (that would block every retry of the same
 	// segment). On timeout the caller fails fast and the next attempt retries.
@@ -118,6 +111,16 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// audioMapByIndex returns the -map args for the audio track of input srcIndex.
+// A negative index falls back to the first audio track.
+func audioMapByIndex(audioTrackIndex, srcIndex int) []string {
+	idx := audioTrackIndex
+	if idx < 0 {
+		idx = 0
+	}
+	return []string{"-map", fmt.Sprintf("%d:a:%d", srcIndex, idx)}
 }
 
 // AudioTrack is a detected audio stream.

@@ -73,9 +73,10 @@ func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *r
 	}
 }
 
-// SegmentLock returns the singleflight mutex for a (job, kind, segment) key so
-// that concurrent requests for the same segment generate it only once.
-func (m *Muxer) SegmentLock(key string) *sync.Mutex {
+// SegmentLock returns the singleflight mutex for a (job, segment) pair so that
+// concurrent requests for the same segment generate it only once.
+func (m *Muxer) SegmentLock(jobID string, segIndex int) *sync.Mutex {
+	key := fmt.Sprintf("%s:%05d", jobID, segIndex)
 	m.segMu.Lock()
 	defer m.segMu.Unlock()
 	l, ok := m.segLocks[key]
@@ -174,9 +175,9 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	return result, nil
 }
 
-// muxURL builds the absolute URL of the master HLS playlist for a job.
+// muxURL builds the absolute URL of the HLS playlist for a job.
 func (m *Muxer) muxURL(jobID string) string {
-	u := "/mux/" + jobID + "/master.m3u8"
+	u := "/mux/" + jobID + "/playlist.m3u8"
 	if m.baseURL != "" {
 		u = m.baseURL + u
 	}
@@ -326,129 +327,58 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		count++
 	}
 
-	// Generate three static playlists by code:
-	//   master.m3u8 — references video.m3u8 and audio.m3u8 via #EXT-X-MEDIA so
-	//                 the player muxes them itself (no server-side remux)
-	//   video.m3u8  — the best-quality video segments (v_00000.ts …)
-	//   audio.m3u8  — the target-language audio segments (a_00000.ts …)
-	media := func(prefix string) string {
-		var b strings.Builder
-		b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
-		b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(segDur)))
-		b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
-		for i := 0; i < count; i++ {
-			end := float64(i+1) * segDur
-			d := segDur
-			if end > job.Duration {
-				d = job.Duration - float64(i)*segDur
-			}
-			b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n%s_%05d.ts\n", d, prefix, i))
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(segDur)))
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	for i := 0; i < count; i++ {
+		end := float64(i+1) * segDur
+		d := segDur
+		if end > job.Duration {
+			d = job.Duration - float64(i)*segDur
 		}
-		b.WriteString("#EXT-X-ENDLIST\n")
-		return b.String()
+		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\nseg_%05d.ts\n", d, i))
 	}
+	b.WriteString("#EXT-X-ENDLIST\n")
 
-	videoPlaylist := media("v")
-	audioPlaylist := media("a")
-
-	var master strings.Builder
-	master.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
-	master.WriteString("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Dublado\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n")
-	master.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=20000000,CODECS=\"avc1,mp4a\",AUDIO=\"aud\"\n"))
-	master.WriteString("video.m3u8\n")
-
-	files := map[string]string{
-		"master.m3u8": master.String(),
-		"video.m3u8":  videoPlaylist,
-		"audio.m3u8":  audioPlaylist,
-	}
-	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(job.CacheDir, name), []byte(content), 0644); err != nil {
-			return fmt.Errorf("write %s: %w", name, err)
-		}
+	if err := os.WriteFile(filepath.Join(job.CacheDir, "playlist.m3u8"), []byte(b.String()), 0644); err != nil {
+		return fmt.Errorf("write playlist: %w", err)
 	}
 
 	job.PlaylistReady = true
 	return nil
 }
 
-// PlaylistPath returns the filesystem path to the master playlist, or empty if
-// not ready.
+// PlaylistPath returns the filesystem path to the playlist, or empty if not ready.
 func (m *Muxer) PlaylistPath(job *model.MuxJob) string {
 	if job.CacheDir == "" || !job.PlaylistReady {
 		return ""
 	}
-	return filepath.Join(job.CacheDir, "master.m3u8")
+	return filepath.Join(job.CacheDir, "playlist.m3u8")
 }
 
-// VideoSegmentPath returns the filesystem path for a cached video segment.
-func (m *Muxer) VideoSegmentPath(job *model.MuxJob, segIndex int) string {
+// SegmentPath returns the filesystem path for a cached segment, or empty if
+// not yet generated.
+func (m *Muxer) SegmentPath(job *model.MuxJob, segIndex int) string {
 	if job.CacheDir == "" {
 		return ""
 	}
-	p := filepath.Join(job.CacheDir, fmt.Sprintf("v_%05d.ts", segIndex))
+	p := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
 	if _, err := os.Stat(p); err != nil {
 		return ""
 	}
 	return p
 }
 
-// AudioSegmentPath returns the filesystem path for a cached audio segment.
-func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segIndex int) string {
-	if job.CacheDir == "" {
-		return ""
-	}
-	p := filepath.Join(job.CacheDir, fmt.Sprintf("a_%05d.ts", segIndex))
-	if _, err := os.Stat(p); err != nil {
-		return ""
-	}
-	return p
-}
-
-// GenerateVideoSegment generates a single video HLS segment on-demand by
-// seeking directly into the video source with ffmpeg -ss (HTTP Range). It only
-// produces ~4s of content regardless of where the user seeks.
-func (m *Muxer) GenerateVideoSegment(ctx context.Context, job *model.MuxJob, segIndex int, out *os.File) error {
-	offset := float64(segIndex) * ffmpeg.SegDuration()
-
-	videoURL := m.resolvedURL(ctx, job, "video")
-	if videoURL == "" {
-		return fmt.Errorf("no resolvable video source")
-	}
-
-	err := m.ffmpeg.GenerateVideoSegment(ctx, videoURL, offset, out)
-	if err == nil {
-		return nil
-	}
-
-	// Try fallback video candidates.
-	for i, src := range job.VideoCandidates {
-		if src == "" {
-			continue
-		}
-		resolved := m.resolveOne(ctx, src)
-		if resolved == "" {
-			continue
-		}
-		if truncErr := resetFile(out); truncErr != nil {
-			return fmt.Errorf("reset output: %w", truncErr)
-		}
-		err = m.ffmpeg.GenerateVideoSegment(ctx, resolved, offset, out)
-		if err == nil {
-			job.VideoURL = src
-			job.VideoResolved = ""
-			job.VideoCandidates = nil
-			log.Printf("mux: video candidate %d ok for seg %d", i, segIndex)
-			return nil
-		}
-	}
-	return err
-}
-
-// GenerateAudioSegment generates a single audio HLS segment (target-language
-// track) on-demand by seeking into the audio source. It falls back through the
-// audio candidates if the primary is a broken debrid response.
-func (m *Muxer) GenerateAudioSegment(ctx context.Context, job *model.MuxJob, segIndex int, out *os.File) error {
+// GenerateSegment generates a single HLS segment on-demand by seeking directly
+// into the source(s) with ffmpeg -ss (HTTP Range). It only produces ~4s of
+// content regardless of where the user seeks, so seek cost is constant.
+//
+// The audio track index is resolved once at playlist time; segments map it by
+// numeric index, which avoids scanning language metadata and keeps the time to
+// first byte low. If the primary audio source is a broken debrid response (no
+// audio track), the segment falls back through the ordered candidates.
+func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex int, out *os.File) error {
 	offset := float64(segIndex) * ffmpeg.SegDuration()
 
 	audioTrack := job.AudioTrackIndex
@@ -456,37 +386,83 @@ func (m *Muxer) GenerateAudioSegment(ctx context.Context, job *model.MuxJob, seg
 		audioTrack = 0
 	}
 
-	audioURL := m.resolvedURL(ctx, job, "audio")
-	if audioURL == "" {
-		return fmt.Errorf("no resolvable audio source")
-	}
-
-	err := m.ffmpeg.GenerateAudioSegment(ctx, audioURL, audioTrack, offset, out)
-	if err == nil {
-		return nil
-	}
-
-	for i, src := range job.AudioCandidates {
+	// Build the list of video sources to try: the primary plus fallback
+	// candidates, each resolved to its CDN URL.
+	videoSources := append([]string{job.VideoURL}, job.VideoCandidates...)
+	var videoURLs []string
+	for i, src := range videoSources {
 		if src == "" {
 			continue
 		}
-		resolved := m.resolveOne(ctx, src)
-		if resolved == "" {
-			continue
+		var resolved string
+		if i == 0 {
+			resolved = m.resolvedURL(ctx, job, "video")
+		} else {
+			resolved = m.resolveOne(ctx, src)
 		}
-		if truncErr := resetFile(out); truncErr != nil {
-			return fmt.Errorf("reset output: %w", truncErr)
-		}
-		err = m.ffmpeg.GenerateAudioSegment(ctx, resolved, audioTrack, offset, out)
-		if err == nil {
-			job.AudioURL = src
-			job.AudioResolved = ""
-			job.AudioCandidates = nil
-			log.Printf("mux: audio candidate %d ok for seg %d", i, segIndex)
-			return nil
+		if resolved != "" {
+			videoURLs = append(videoURLs, resolved)
 		}
 	}
-	return err
+
+	// Build the list of audio sources to try: the primary plus fallback
+	// candidates. Each is resolved to its CDN URL before ffmpeg sees it — a raw
+	// addon URL would make ffmpeg walk the slow redirect chain itself.
+	audioSources := append([]string{job.AudioURL}, job.AudioCandidates...)
+	var audioURLs []string
+	for i, src := range audioSources {
+		if src == "" {
+			continue
+		}
+		var resolved string
+		if i == 0 {
+			resolved = m.resolvedURL(ctx, job, "audio")
+		} else {
+			resolved = m.resolveOne(ctx, src)
+		}
+		if resolved != "" {
+			audioURLs = append(audioURLs, resolved)
+		}
+	}
+
+	if len(videoURLs) == 0 || len(audioURLs) == 0 {
+		return fmt.Errorf("no resolvable video (%d) or audio (%d) sources", len(videoURLs), len(audioURLs))
+	}
+
+	log.Printf("mux: seg %d video=%s audioTrack=%d audioSrc=%d", segIndex, truncate(videoURLs[0]), audioTrack, len(audioURLs))
+
+	var lastErr error
+	// Try each video source against each audio source (best first).
+	for vi, videoURL := range videoURLs {
+		for ai, audioURL := range audioURLs {
+			err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
+			if err == nil {
+				// Success. Remember the working sources so subsequent segments
+				// don't re-try the broken ones. Store the raw URLs (resolved
+				// ones may rotate) and clear caches to re-resolve once.
+				if vi > 0 {
+					job.VideoURL = videoSources[vi]
+					job.VideoResolved = ""
+					job.VideoCandidates = nil
+					log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
+				}
+				if ai > 0 {
+					job.AudioURL = audioSources[ai]
+					job.AudioResolved = ""
+					job.AudioCandidates = nil
+					log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, ai)
+				}
+				return nil
+			}
+			lastErr = err
+			log.Printf("mux: (v%d,a%d) failed for seg %d: %v", vi, ai, segIndex, err)
+			if truncErr := resetFile(out); truncErr != nil {
+				return fmt.Errorf("reset output: %w", truncErr)
+			}
+		}
+	}
+
+	return lastErr
 }
 
 // probeValidDuration probes a video source for its duration, walking the

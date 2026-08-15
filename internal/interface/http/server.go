@@ -53,12 +53,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /stremio/{uuid}/{password}/manifest.json", s.handleManifest)
 	s.mux.HandleFunc("GET /stremio/{uuid}/{password}/stream/{type}/{id...}", s.handleStream)
 
-	// HLS endpoints — master/video/audio playlists and on-demand segments
+	// HLS endpoints — playlist and segments
 	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMuxRedirect)
-	s.mux.HandleFunc("GET /mux/{jobId}/master.m3u8", s.handleHLSPlaylist)
 	s.mux.HandleFunc("GET /mux/{jobId}/playlist.m3u8", s.handleHLSPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/video.m3u8", s.handleHLSMediaPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/audio.m3u8", s.handleHLSMediaPlaylist)
 	s.mux.HandleFunc("GET /mux/{jobId}/{segment}", s.handleHLSSegment)
 
 	// API
@@ -146,7 +143,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMuxRedirect(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
-	http.Redirect(w, r, "/mux/"+jobID+"/master.m3u8", http.StatusFound)
+	http.Redirect(w, r, "/mux/"+jobID+"/playlist.m3u8", http.StatusFound)
 }
 
 func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
@@ -175,88 +172,40 @@ func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, playlistPath)
 }
 
-func (s *Server) handleHLSMediaPlaylist(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobId")
-	job, ok := s.store.Get(jobID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "mux job not found")
-		return
-	}
-	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
-		log.Printf("mux playlist: %v", err)
-		writeError(w, http.StatusInternalServerError, "playlist generation failed")
-		return
-	}
-	name := filepath.Base(r.URL.Path)
-	path := filepath.Join(job.CacheDir, name)
-	if _, err := os.Stat(path); err != nil {
-		writeError(w, http.StatusNotFound, "playlist not found")
-		return
-	}
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "no-store")
-	http.ServeFile(w, r, path)
-}
-
 func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	segment := filepath.Base(r.PathValue("segment"))
-
 	job, ok := s.store.Get(jobID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "mux job not found")
 		return
 	}
 
+	// Parse segment index from filename like "seg_00123.ts".
 	var segIndex int
-	var kind string
-	var finalName string
-	if _, err := fmt.Sscanf(segment, "v_%05d.ts", &segIndex); err == nil {
-		kind = "v"
-		finalName = fmt.Sprintf("v_%05d.ts", segIndex)
-	} else if _, err := fmt.Sscanf(segment, "a_%05d.ts", &segIndex); err == nil {
-		kind = "a"
-		finalName = fmt.Sprintf("a_%05d.ts", segIndex)
-	} else {
+	if _, err := fmt.Sscanf(segment, "seg_%05d.ts", &segIndex); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid segment")
 		return
 	}
 
-	cached := func() string {
-		if kind == "v" {
-			return s.muxer.VideoSegmentPath(job, segIndex)
-		}
-		return s.muxer.AudioSegmentPath(job, segIndex)
-	}
-	gen := func(ctx context.Context, f *os.File) error {
-		if kind == "v" {
-			return s.muxer.GenerateVideoSegment(ctx, job, segIndex, f)
-		}
-		return s.muxer.GenerateAudioSegment(ctx, job, segIndex, f)
-	}
-	lockKey := fmt.Sprintf("%s:%s:%05d", jobID, kind, segIndex)
-
-	s.generateSegment(w, r, job, segIndex, cached, finalName, lockKey, gen)
-}
-
-// generateSegment serves an on-demand HLS segment. gen produces it, cachedPath
-// resolves the cache, and lockKey is the singleflight key (per job+segment).
-func (s *Server) generateSegment(w http.ResponseWriter, r *http.Request, job *model.MuxJob, segIndex int, cachedPath func() string, finalName, lockKey string, gen func(ctx context.Context, f *os.File) error) {
 	// Serve from cache if already generated.
-	if cached := cachedPath(); cached != "" {
+	if cached := s.muxer.SegmentPath(job, segIndex); cached != "" {
 		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, cached)
 		return
 	}
 
 	// Singleflight: only one request generates a given segment at a time.
-	lock := s.muxer.SegmentLock(lockKey)
+	// Concurrent requests (the player retrying after a timeout) block here,
+	// then serve the cached file once the generator finishes, instead of each
+	// spawning its own ffmpeg writing to the same .tmp file.
+	lock := s.muxer.SegmentLock(jobID, segIndex)
 	lock.Lock()
 	defer lock.Unlock()
 
 	// Re-check the cache after acquiring the lock — the generator may have
 	// finished while we were waiting.
-	if cached := cachedPath(); cached != "" {
+	if cached := s.muxer.SegmentPath(job, segIndex); cached != "" {
 		w.Header().Set("Cache-Control", "no-store")
 		http.ServeFile(w, r, cached)
 		return
@@ -270,7 +219,14 @@ func (s *Server) generateSegment(w http.ResponseWriter, r *http.Request, job *mo
 		return
 	}
 
-	tmpPath := filepath.Join(job.CacheDir, finalName+".tmp")
+	// Generate on-demand: ffmpeg -ss {offset} -t 4 seeks directly into the
+	// source via HTTP Range and produces just this segment. The generation is
+	// bounded by the request context — if the player disconnects, ffmpeg is
+	// cancelled rather than wasting bandwidth generating a segment nobody is
+	// waiting for.
+	segPath := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
+	tmpPath := segPath + ".tmp"
+
 	f, err := os.Create(tmpPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "create segment file failed")
@@ -280,7 +236,7 @@ func (s *Server) generateSegment(w http.ResponseWriter, r *http.Request, job *mo
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	if err := gen(ctx, f); err != nil {
+	if err := s.muxer.GenerateSegment(ctx, job, segIndex, f); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
 		if ctx.Err() != nil {
@@ -294,15 +250,14 @@ func (s *Server) generateSegment(w http.ResponseWriter, r *http.Request, job *mo
 
 	// Atomic rename: .tmp → final so concurrent requests never read a partial
 	// segment.
-	finalPath := filepath.Join(job.CacheDir, finalName)
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := os.Rename(tmpPath, segPath); err != nil {
 		os.Remove(tmpPath)
 		writeError(w, http.StatusInternalServerError, "segment rename failed")
 		return
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeFile(w, r, finalPath)
+	http.ServeFile(w, r, segPath)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
