@@ -114,6 +114,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 				AudioURL:         audioURL,
 				TargetLanguage:   cfg.Language,
 				Title:            fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
+				VideoCandidates:  m.videoCandidates(streams, videoURL),
 				AudioCandidates:  m.audioCandidates(streams, cfg.Language),
 				AudioTrackIndex:  -1,
 			}
@@ -163,6 +164,27 @@ func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage 
 		log.Printf("mux: audio candidate %d: %s (size=%d)", i, truncate(u), ranked[i].Stream.Size)
 		// Skip the primary (first) candidate — it's already job.AudioURL.
 		if i == 0 {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+// videoCandidates returns the ordered list of video source URLs (best first),
+// excluding the primary choice. Used as a fallback when the primary video is a
+// broken debrid response (e.g. a short trailer instead of the movie).
+func (m *Muxer) videoCandidates(streams []model.CollectedStream, primaryURL string) []string {
+	ranked := m.analyzer.RankVideo(streams)
+	var out []string
+	seen := map[string]bool{}
+	for i := range ranked {
+		u := ranked[i].Stream.Stream.URL
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		if u == primaryURL {
 			continue
 		}
 		out = append(out, u)
@@ -227,16 +249,19 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		job.CacheDir = dir
 	}
 
+	// Pick a valid video source and probe its duration once. Debrid proxies
+	// sometimes return a short trailer/preview instead of the real file; if the
+	// probed duration is implausibly short for a movie/series (or probing
+	// fails), fall back through the ordered video candidates. Each candidate is
+	// resolved to its CDN URL before probing.
 	if job.Duration == 0 {
 		videoURL := m.resolvedURL(ctx, job, "video")
-		res, err := m.ffmpeg.Probe(ctx, videoURL)
-		if err != nil {
-			log.Printf("mux: probe duration failed, using 7200s: %v", err)
-			job.Duration = 7200
-		} else if res.Duration > 0 {
-			job.Duration = res.Duration
-		} else {
-			job.Duration = 7200
+		dur, chosen := m.probeValidDuration(ctx, videoURL, job.VideoCandidates)
+		job.Duration = dur
+		if chosen != "" && chosen != job.VideoURL {
+			job.VideoURL = chosen
+			job.VideoResolved = chosen
+			log.Printf("mux: video switched to %s", truncate(chosen))
 		}
 	}
 
@@ -325,38 +350,128 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 		audioTrack = 0
 	}
 
-	videoURL := m.resolvedURL(ctx, job, "video")
-
-	// Try the primary audio source first, then fall back through the ordered
-	// candidates. Debrid sources sometimes return a short error video with no
-	// audio track; we skip to the next candidate until one yields audio.
-	audioURLs := append([]string{m.resolvedURL(ctx, job, "audio")}, job.AudioCandidates...)
-
-	var lastErr error
-	for i, audioURL := range audioURLs {
-		if audioURL == "" {
+	// Build the list of video sources to try: the primary plus fallback
+	// candidates, each resolved to its CDN URL.
+	videoSources := append([]string{job.VideoURL}, job.VideoCandidates...)
+	var videoURLs []string
+	for i, src := range videoSources {
+		if src == "" {
 			continue
 		}
-		err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
-		if err == nil {
-			// Success. If we had to fall back, remember the working source so
-			// subsequent segments don't re-try the broken one.
-			if i > 0 {
-				job.AudioURL = audioURL
-				job.AudioResolved = audioURL
-				job.AudioCandidates = nil
-				log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, i)
-			}
-			return nil
+		var resolved string
+		if i == 0 {
+			resolved = m.resolvedURL(ctx, job, "video")
+		} else {
+			resolved = m.resolveOne(ctx, src)
 		}
-		lastErr = err
-		log.Printf("mux: audio source %d failed for seg %d: %v", i, segIndex, err)
-		if truncErr := resetFile(out); truncErr != nil {
-			return fmt.Errorf("reset output: %w", truncErr)
+		if resolved != "" {
+			videoURLs = append(videoURLs, resolved)
+		}
+	}
+
+	// Build the list of audio sources to try: the primary plus fallback
+	// candidates. Each is resolved to its CDN URL before ffmpeg sees it — a raw
+	// addon URL would make ffmpeg walk the slow redirect chain itself.
+	audioSources := append([]string{job.AudioURL}, job.AudioCandidates...)
+	var audioURLs []string
+	for i, src := range audioSources {
+		if src == "" {
+			continue
+		}
+		var resolved string
+		if i == 0 {
+			resolved = m.resolvedURL(ctx, job, "audio")
+		} else {
+			resolved = m.resolveOne(ctx, src)
+		}
+		if resolved != "" {
+			audioURLs = append(audioURLs, resolved)
+		}
+	}
+
+	if len(videoURLs) == 0 || len(audioURLs) == 0 {
+		return fmt.Errorf("no resolvable video (%d) or audio (%d) sources", len(videoURLs), len(audioURLs))
+	}
+
+	log.Printf("mux: seg %d video=%s audioTrack=%d audioSrc=%d", segIndex, truncate(videoURLs[0]), audioTrack, len(audioURLs))
+
+	var lastErr error
+	// Try each video source against each audio source (best first).
+	for vi, videoURL := range videoURLs {
+		for ai, audioURL := range audioURLs {
+			err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
+			if err == nil {
+				// Success. Remember the working sources so subsequent segments
+				// don't re-try the broken ones. Store the raw URLs (resolved
+				// ones may rotate) and clear caches to re-resolve once.
+				if vi > 0 {
+					job.VideoURL = videoSources[vi]
+					job.VideoResolved = ""
+					job.VideoCandidates = nil
+					log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
+				}
+				if ai > 0 {
+					job.AudioURL = audioSources[ai]
+					job.AudioResolved = ""
+					job.AudioCandidates = nil
+					log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, ai)
+				}
+				return nil
+			}
+			lastErr = err
+			log.Printf("mux: (v%d,a%d) failed for seg %d: %v", vi, ai, segIndex, err)
+			if truncErr := resetFile(out); truncErr != nil {
+				return fmt.Errorf("reset output: %w", truncErr)
+			}
 		}
 	}
 
 	return lastErr
+}
+
+// probeValidDuration probes a video source for its duration, walking the
+// fallback candidates when the primary is implausibly short (a debrid proxy
+// sometimes returns a trailer/preview instead of the real file) or probing
+// fails. Each candidate is resolved to its CDN URL before probing. It returns
+// the duration and the URL that produced it ("" means the fallback was used).
+func (m *Muxer) probeValidDuration(ctx context.Context, primary string, candidates []string) (float64, string) {
+	const minDuration = 600 // 10 minutes; a real movie/series is far longer
+
+	urls := append([]string{primary}, candidates...)
+	for i, u := range urls {
+		if u == "" {
+			continue
+		}
+		resolved := m.resolveOne(ctx, u)
+		if resolved == "" {
+			log.Printf("mux: video source %d failed to resolve, skipping", i)
+			continue
+		}
+		res, err := m.ffmpeg.Probe(ctx, resolved)
+		if err != nil {
+			log.Printf("mux: video probe %d failed: %v", i, err)
+			continue
+		}
+		if res.Duration >= minDuration {
+			if i > 0 {
+				log.Printf("mux: video fell back to candidate %d (duration %.0fs)", i, res.Duration)
+			}
+			return res.Duration, resolved
+		}
+		log.Printf("mux: video candidate %d too short (%.0fs), skipping", i, res.Duration)
+	}
+
+	log.Printf("mux: no valid video source, using 7200s fallback")
+	return 7200, ""
+}
+
+// resolveOne follows the redirect chain of a single URL and returns the final
+// CDN URL, or "" on failure. No caching — callers decide whether to cache.
+func (m *Muxer) resolveOne(ctx context.Context, url string) string {
+	if url == "" {
+		return ""
+	}
+	return m.followRedirects(ctx, url)
 }
 
 // resolvedURL returns the final CDN URL for a job source, resolving the addon's
@@ -364,8 +479,9 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 // debrid proxy that re-resolves the torrent on every request (slow, rate-
 // limited); the final CDN URL supports HTTP Range and answers in milliseconds.
 //
-// If resolution fails, the original URL is returned so playback still works,
-// just slower.
+// On failure it returns "" (never the raw addon URL) so callers skip the source
+// or fail fast instead of handing ffmpeg a URL that will stall on the redirect
+// chain.
 func (m *Muxer) resolvedURL(ctx context.Context, job *model.MuxJob, which string) string {
 	var cached *string
 	var original string
@@ -392,32 +508,65 @@ func (m *Muxer) resolvedURL(ctx context.Context, job *model.MuxJob, which string
 
 	final := m.followRedirects(ctx, original)
 	if final == "" {
-		return original
+		return ""
 	}
 	*cached = final
 	return final
 }
 
 // followRedirects issues a range request and returns the final URL after
-// following redirects, or "" on failure.
+// following redirects, or "" on failure. Transient errors (429/5xx) are
+// retried a few times with a short backoff, since debrid proxies are flaky.
 func (m *Muxer) followRedirects(ctx context.Context, url string) string {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("Range", "bytes=0-0")
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return ""
+		}
+		req.Header.Set("Range", "bytes=0-0")
 
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			if i < attempts-1 {
+				if !sleepCtx(ctx, time.Duration(i+1)*time.Second) {
+					return ""
+				}
+				continue
+			}
+			return ""
+		}
 
-	if resp.Request == nil || resp.Request.URL == nil {
-		return ""
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if i < attempts-1 {
+				if !sleepCtx(ctx, time.Duration(i+1)*time.Second) {
+					return ""
+				}
+				continue
+			}
+			return ""
+		}
+
+		if resp.Request == nil || resp.Request.URL == nil {
+			return ""
+		}
+		return resp.Request.URL.String()
 	}
-	return resp.Request.URL.String()
+	return ""
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func resetFile(f *os.File) error {

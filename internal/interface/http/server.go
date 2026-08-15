@@ -204,7 +204,10 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate on-demand: ffmpeg -ss {offset} -t 4 seeks directly into the
-	// source via HTTP Range and produces just this segment.
+	// source via HTTP Range and produces just this segment. The generation is
+	// bounded by the request context — if the player disconnects, ffmpeg is
+	// cancelled rather than wasting bandwidth generating a segment nobody is
+	// waiting for.
 	segPath := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
 	tmpPath := segPath + ".tmp"
 

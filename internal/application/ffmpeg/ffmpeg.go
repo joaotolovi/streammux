@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -77,13 +78,23 @@ func (m *Muxer) GenerateSegment(ctx context.Context, videoURL, audioURL string, 
 	var stderrBuf bytes.Buffer
 	cmd.Stderr = &stderrBuf
 
+	log.Printf("ffmpeg segment: %s", strings.Join(args, " "))
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("ffmpeg start: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("ffmpeg: %w: %s", err, stderrBuf.String())
+		return fmt.Errorf("ffmpeg: %w: %s", err, tail(stderrBuf.String(), 800))
 	}
 	return nil
+}
+
+// tail returns the last n bytes of s.
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 // audioMapByIndex returns the -map args for the audio track of input srcIndex.
@@ -109,9 +120,14 @@ type ProbeResult struct {
 }
 
 // Probe inspects a stream's duration and audio tracks in a single ffprobe call.
+// analyzeduration/probesize are kept small so probing a large remote file does
+// not read far ahead (defaults read up to 5MB/5s, which at high bitrates is
+// tens of megabytes over the network).
 func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 	args := []string{
 		"-v", "quiet",
+		"-analyzeduration", "1000000",
+		"-probesize", "2000000",
 		"-print_format", "json",
 		"-show_streams",
 		"-show_format",

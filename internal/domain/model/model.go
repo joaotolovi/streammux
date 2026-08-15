@@ -101,6 +101,11 @@ type MuxJob struct {
 	// (no audio track) instead of the real file; we fall back through this
 	// list until one yields a usable audio track.
 	AudioCandidates []string `json:"-"`
+
+	// VideoCandidates (not serialized) is the ordered list of video source URLs
+	// to try, best first, excluding the primary. Used when the primary video is
+	// a broken debrid response (e.g. a short trailer instead of the movie).
+	VideoCandidates []string `json:"-"`
 }
 
 type Manifest struct {
