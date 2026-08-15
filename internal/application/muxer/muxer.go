@@ -305,22 +305,19 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		}
 	}
 
-	// Resolve the target-language audio track index once, by probing the audio
-	// source. This lets every segment map the audio by numeric index instead of
-	// scanning language metadata, which is what keeps the time to first byte low.
+	// Resolve the target-language audio source once, by probing each candidate
+	// and picking the best one that is a real file (not a broken debrid
+	// response like static/500.mp4) and yields an audio track. Validating here
+	// (not during every segment) avoids stalling generation on a broken source.
 	if job.AudioTrackIndex < 0 && job.AudioURL != "" {
-		audioURL := m.resolvedURL(ctx, job, "audio")
-		res, err := m.ffmpeg.Probe(ctx, audioURL)
-		if err == nil && res != nil {
-			code := ffmpeg.LanguageCode(job.TargetLanguage)
-			idx := ffmpeg.AudioTrackIndexByLanguage(res.AudioTracks, code)
-			if idx < 0 {
-				// No matching track; fall back to the first audio track.
-				idx = 0
-			}
-			job.AudioTrackIndex = idx
+		chosen, trackIdx := m.pickAudioSource(ctx, job)
+		if chosen != "" {
+			job.AudioURL = chosen
+			job.AudioResolved = ""
+			job.AudioTrackIndex = trackIdx
+			log.Printf("mux: audio source chosen for job %s", truncate(chosen))
 		} else {
-			log.Printf("mux: audio probe failed for job %s, using first track: %v", job.ID, err)
+			log.Printf("mux: no valid audio source for job %s, using primary", job.ID)
 			job.AudioTrackIndex = 0
 		}
 	}
@@ -409,64 +406,94 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 		}
 	}
 
-	// Build the list of audio sources to try: the primary plus fallback
-	// candidates. Each is resolved to its CDN URL before ffmpeg sees it — a raw
-	// addon URL would make ffmpeg walk the slow redirect chain itself.
-	audioSources := append([]string{job.AudioURL}, job.AudioCandidates...)
-	var audioURLs []string
-	for i, src := range audioSources {
+	// Audio source is pre-validated at playlist time (pickAudioSource), so only
+	// the single working URL is used here.
+	var audioURL string
+	for _, src := range append([]string{job.AudioURL}, job.AudioCandidates...) {
 		if src == "" {
+			continue
+		}
+		resolved := m.resolvedURL(ctx, job, "audio")
+		if resolved == "" {
+			continue
+		}
+		audioURL = resolved
+		break
+	}
+
+	if len(videoURLs) == 0 || audioURL == "" {
+		return fmt.Errorf("no resolvable video (%d) or audio sources", len(videoURLs))
+	}
+
+	log.Printf("mux: seg %d video=%s audioTrack=%d", segIndex, truncate(videoURLs[0]), audioTrack)
+
+	var lastErr error
+	// Try each video source (best first) with the validated audio source.
+	for vi, videoURL := range videoURLs {
+		err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
+		if err == nil {
+			if vi > 0 {
+				job.VideoURL = videoSources[vi]
+				job.VideoResolved = ""
+				job.VideoCandidates = nil
+				log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
+			}
+			return nil
+		}
+		lastErr = err
+		log.Printf("mux: (v%d) failed for seg %d: %v", vi, segIndex, err)
+		if truncErr := resetFile(out); truncErr != nil {
+			return fmt.Errorf("reset output: %w", truncErr)
+		}
+	}
+
+	return lastErr
+}
+
+// pickAudioSource walks the audio candidates and returns the first source that
+// is a real file (probe succeeds) and contains an audio track. It also returns
+// the numeric index of the target-language track (falling back to 0). Debrid
+// proxies sometimes return a broken response (e.g. static/500.mp4) that would
+// otherwise stall every segment's ffmpeg run until timeout.
+func (m *Muxer) pickAudioSource(ctx context.Context, job *model.MuxJob) (string, int) {
+	code := ffmpeg.LanguageCode(job.TargetLanguage)
+
+	sources := append([]string{job.AudioURL}, job.AudioCandidates...)
+	for i, u := range sources {
+		if u == "" {
 			continue
 		}
 		var resolved string
 		if i == 0 {
 			resolved = m.resolvedURL(ctx, job, "audio")
 		} else {
-			resolved = m.resolveOne(ctx, src)
+			resolved = m.resolveOne(ctx, u)
 		}
-		if resolved != "" {
-			audioURLs = append(audioURLs, resolved)
+		if resolved == "" {
+			log.Printf("mux: audio source %d failed to resolve, skipping", i)
+			continue
 		}
-	}
 
-	if len(videoURLs) == 0 || len(audioURLs) == 0 {
-		return fmt.Errorf("no resolvable video (%d) or audio (%d) sources", len(videoURLs), len(audioURLs))
-	}
-
-	log.Printf("mux: seg %d video=%s audioTrack=%d audioSrc=%d", segIndex, truncate(videoURLs[0]), audioTrack, len(audioURLs))
-
-	var lastErr error
-	// Try each video source against each audio source (best first).
-	for vi, videoURL := range videoURLs {
-		for ai, audioURL := range audioURLs {
-			err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
-			if err == nil {
-				// Success. Remember the working sources so subsequent segments
-				// don't re-try the broken ones. Store the raw URLs (resolved
-				// ones may rotate) and clear caches to re-resolve once.
-				if vi > 0 {
-					job.VideoURL = videoSources[vi]
-					job.VideoResolved = ""
-					job.VideoCandidates = nil
-					log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
-				}
-				if ai > 0 {
-					job.AudioURL = audioSources[ai]
-					job.AudioResolved = ""
-					job.AudioCandidates = nil
-					log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, ai)
-				}
-				return nil
-			}
-			lastErr = err
-			log.Printf("mux: (v%d,a%d) failed for seg %d: %v", vi, ai, segIndex, err)
-			if truncErr := resetFile(out); truncErr != nil {
-				return fmt.Errorf("reset output: %w", truncErr)
-			}
+		res, err := m.ffmpeg.Probe(ctx, resolved)
+		if err != nil {
+			log.Printf("mux: audio probe %d failed: %v", i, err)
+			continue
 		}
-	}
+		if len(res.AudioTracks) == 0 {
+			log.Printf("mux: audio source %d has no audio track, skipping", i)
+			continue
+		}
 
-	return lastErr
+		idx := ffmpeg.AudioTrackIndexByLanguage(res.AudioTracks, code)
+		if idx < 0 {
+			idx = 0
+		}
+		if i > 0 {
+			log.Printf("mux: audio fell back to candidate %d (track %d)", i, idx)
+		}
+		return u, idx
+	}
+	return "", -1
 }
 
 // pickVideoSource walks the video quality list (primary first, then candidates

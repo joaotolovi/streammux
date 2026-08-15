@@ -19,7 +19,7 @@ const probeTimeout = 40 * time.Second
 // fast CDN should finish in a few seconds; this cap releases the per-segment
 // singleflight lock even if a source stalls, so concurrent requests never
 // block forever waiting on a stuck generator.
-const segmentTimeout = 30 * time.Second
+const segmentTimeout = 45 * time.Second
 
 // segDuration is the length of each HLS segment in seconds.
 const segDuration = 4.0
