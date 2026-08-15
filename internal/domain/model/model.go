@@ -82,9 +82,12 @@ type MuxJob struct {
 
 	// Runtime fields (not serialized):
 	Duration      float64 `json:"-"` // probed once, cached
-	LangOK        bool    `json:"-"` // false = language map failed, use first track
 	CacheDir      string  `json:"-"` // temp dir for cached segments
 	PlaylistReady bool    `json:"-"` // playlist has been written
+
+	// AudioTrackIndex is the numeric index of the target-language audio track
+	// (resolved once by probing the audio source). -1 when unknown.
+	AudioTrackIndex int `json:"-"`
 
 	// Resolved URLs (not serialized). Addon URLs redirect through a debrid
 	// proxy (e.g. torrentio → torbox API → CDN) that is slow to re-resolve on

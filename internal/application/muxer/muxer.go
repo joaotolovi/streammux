@@ -115,6 +115,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 				TargetLanguage:   cfg.Language,
 				Title:            fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
 				AudioCandidates:  m.audioCandidates(streams, cfg.Language),
+				AudioTrackIndex:  -1,
 			}
 			jobID := m.store.Save(job)
 			result.Dubbed = &model.StremioStream{
@@ -152,11 +153,13 @@ func (m *Muxer) muxURL(jobID string) string {
 func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage string) []string {
 	ranked := m.analyzer.RankAudio(streams, targetLanguage)
 	var out []string
+	seen := map[string]bool{}
 	for i := range ranked {
 		u := ranked[i].Stream.Stream.URL
-		if u == "" {
+		if u == "" || seen[u] {
 			continue
 		}
+		seen[u] = true
 		log.Printf("mux: audio candidate %d: %s (size=%d)", i, truncate(u), ranked[i].Stream.Size)
 		// Skip the primary (first) candidate — it's already job.AudioURL.
 		if i == 0 {
@@ -225,12 +228,36 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	}
 
 	if job.Duration == 0 {
-		dur, err := m.ffmpeg.ProbeDuration(ctx, m.resolvedURL(ctx, job, "video"))
+		videoURL := m.resolvedURL(ctx, job, "video")
+		res, err := m.ffmpeg.Probe(ctx, videoURL)
 		if err != nil {
 			log.Printf("mux: probe duration failed, using 7200s: %v", err)
-			dur = 7200
+			job.Duration = 7200
+		} else if res.Duration > 0 {
+			job.Duration = res.Duration
+		} else {
+			job.Duration = 7200
 		}
-		job.Duration = dur
+	}
+
+	// Resolve the target-language audio track index once, by probing the audio
+	// source. This lets every segment map the audio by numeric index instead of
+	// scanning language metadata, which is what keeps the time to first byte low.
+	if job.AudioTrackIndex < 0 && job.AudioURL != "" {
+		audioURL := m.resolvedURL(ctx, job, "audio")
+		res, err := m.ffmpeg.Probe(ctx, audioURL)
+		if err == nil && res != nil {
+			code := ffmpeg.LanguageCode(job.TargetLanguage)
+			idx := ffmpeg.AudioTrackIndexByLanguage(res.AudioTracks, code)
+			if idx < 0 {
+				// No matching track; fall back to the first audio track.
+				idx = 0
+			}
+			job.AudioTrackIndex = idx
+		} else {
+			log.Printf("mux: audio probe failed for job %s, using first track: %v", job.ID, err)
+			job.AudioTrackIndex = 0
+		}
 	}
 
 	segDur := ffmpeg.SegDuration()
@@ -286,14 +313,16 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segIndex int) string {
 // into the source(s) with ffmpeg -ss (HTTP Range). It only produces ~4s of
 // content regardless of where the user seeks, so seek cost is constant.
 //
-// If the language-based audio map fails, it retries once with the first audio
-// track and remembers the outcome on the job.
+// The audio track index is resolved once at playlist time; segments map it by
+// numeric index, which avoids scanning language metadata and keeps the time to
+// first byte low. If the primary audio source is a broken debrid response (no
+// audio track), the segment falls back through the ordered candidates.
 func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex int, out *os.File) error {
 	offset := float64(segIndex) * ffmpeg.SegDuration()
 
-	lang := job.TargetLanguage
-	if job.PlaylistReady && !job.LangOK {
-		lang = ""
+	audioTrack := job.AudioTrackIndex
+	if audioTrack < 0 {
+		audioTrack = 0
 	}
 
 	videoURL := m.resolvedURL(ctx, job, "video")
@@ -308,7 +337,7 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 		if audioURL == "" {
 			continue
 		}
-		err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, lang, offset, out)
+		err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
 		if err == nil {
 			// Success. If we had to fall back, remember the working source so
 			// subsequent segments don't re-try the broken one.
@@ -325,21 +354,6 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 		if truncErr := resetFile(out); truncErr != nil {
 			return fmt.Errorf("reset output: %w", truncErr)
 		}
-	}
-
-	// All audio sources failed. If we were using a language map, retry the
-	// primary with the first audio track as a last resort.
-	if lang != "" {
-		log.Printf("mux: all audio sources failed for seg %d, retrying first track: %v", segIndex, lastErr)
-		if truncErr := resetFile(out); truncErr != nil {
-			return fmt.Errorf("reset output: %w", truncErr)
-		}
-		err := m.ffmpeg.GenerateSegment(ctx, videoURL, m.resolvedURL(ctx, job, "audio"), "", offset, out)
-		if err == nil {
-			job.LangOK = false
-			return nil
-		}
-		lastErr = err
 	}
 
 	return lastErr
