@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -15,14 +15,83 @@ import (
 
 const probeTimeout = 90 * time.Second
 
-// segmentTimeout bounds each ffmpeg segment generation. A 4s segment from a
-// fast CDN should finish in a few seconds; this cap releases the per-segment
-// singleflight lock even if a source stalls, so concurrent requests never
-// block forever waiting on a stuck generator.
-const segmentTimeout = 45 * time.Second
-
 // segDuration is the length of each HLS segment in seconds.
 const segDuration = 4.0
+
+// Session is a single continuous ffmpeg run that produces HLS segments
+// sequentially into an output directory. One -ss seek is performed up front;
+// after that ffmpeg reads both sources in lockstep, so video and audio stay
+// consistent and each segment's real duration is written by ffmpeg itself
+// (no drift, no per-segment reconnect cost).
+type Session struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	startN int // segment number the run starts at
+}
+
+// StartSession launches ffmpeg to remux video+audio into HLS segments written
+// to outDir as seg_%05d.ts starting at segment number startN. It uses the hls
+// muxer with event-type playlist and independent segments so each .ts is
+// self-contained and seekable. Returns the session; callers cancel it when
+// done (e.g. on seek or job cleanup).
+func (m *Muxer) StartSession(ctx context.Context, videoURL, audioURL string, audioTrackIndex, startN int, outDir string) (*Session, error) {
+	offset := float64(startN) * segDuration
+
+	args := []string{
+		"-ss", fmtDuration(offset),
+		"-i", videoURL,
+		"-ss", fmtDuration(offset),
+		"-i", audioURL,
+		"-map", "0:v:0",
+		"-map", fmt.Sprintf("1:a:%d", audioTrackIndex),
+		"-c", "copy",
+		"-avoid_negative_ts", "make_zero",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_playlist_type", "event",
+		"-hls_flags", "independent_segments",
+		"-hls_segment_filename", filepath.Join(outDir, "seg_%05d.ts"),
+		"-start_number", strconv.Itoa(startN),
+		filepath.Join(outDir, "live.m3u8"),
+	}
+
+	sessCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	log.Printf("ffmpeg session start: %s", strings.Join(args, " "))
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("ffmpeg start: %w", err)
+	}
+
+	s := &Session{cancel: cancel, done: make(chan struct{}), startN: startN}
+	go func() {
+		err := cmd.Wait()
+		if err != nil && sessCtx.Err() == nil {
+			log.Printf("ffmpeg session ended: %v: %s", err, tail(stderrBuf.String(), 2000))
+		}
+		close(s.done)
+	}()
+	return s, nil
+}
+
+// StartN returns the segment number this session starts generating at.
+func (s *Session) StartN() int {
+	if s == nil {
+		return 0
+	}
+	return s.startN
+}
+
+// Cancel terminates the session's ffmpeg process.
+func (s *Session) Cancel() {
+	if s != nil && s.cancel != nil {
+		s.cancel()
+	}
+}
 
 type Muxer struct {
 	binaryPath string
@@ -35,92 +104,12 @@ func New(binaryPath string) *Muxer {
 	return &Muxer{binaryPath: binaryPath}
 }
 
-// GenerateSegment produces a single HLS .ts segment covering [offset,
-// offset+segDuration). It uses -ss before each -i (input seek), which makes
-// FFmpeg issue an HTTP Range request to the source instead of downloading from
-// the start — so seeking to minute 5 or minute 100 costs the same.
-//
-// audioTrackIndex selects the audio track by numeric index (e.g. 0 = first
-// audio track). It is resolved once per job by probing the source, so each
-// segment avoids scanning language metadata — this keeps the time to the first
-// byte low (the MKV header is read once, not re-scanned for languages).
-//
-// analyzeduration/probesize are kept small so FFmpeg starts emitting output
-// almost immediately instead of reading far ahead into the remote file.
-func (m *Muxer) GenerateSegment(ctx context.Context, videoURL, audioURL string, audioTrackIndex int, offset float64, out io.Writer) error {
-	var args []string
-	if videoURL == audioURL {
-		// Single source: video and audio come from the same file, so only one
-		// HTTP connection is opened.
-		args = []string{
-			"-ss", fmtDuration(offset),
-			"-i", videoURL,
-			"-map", "0:v:0",
-		}
-		args = append(args, audioMapByIndex(audioTrackIndex, 0)...)
-	} else {
-		// Two sources: seek both to the same offset, in parallel.
-		args = []string{
-			"-ss", fmtDuration(offset),
-			"-i", videoURL,
-			"-ss", fmtDuration(offset),
-			"-i", audioURL,
-			"-map", "0:v:0",
-		}
-		args = append(args, audioMapByIndex(audioTrackIndex, 1)...)
-	}
-	args = append(args,
-		// -t after the inputs is an output duration limit: it caps the muxed
-		// output at segDuration regardless of whether there are one or two
-		// sources. Without it, a two-source remux would run until the end of
-		// the film instead of producing a single 4s segment.
-		"-t", fmtDuration(segDuration),
-		"-analyzeduration", "1000000",
-		"-probesize", "2000000",
-		"-c", "copy",
-		"-avoid_negative_ts", "make_zero",
-		"-f", "mpegts",
-		"pipe:1",
-	)
-
-	// Cap the whole ffmpeg run: a stalled source must not hold the segment
-	// singleflight lock indefinitely (that would block every retry of the same
-	// segment). On timeout the caller fails fast and the next attempt retries.
-	segCtx, cancel := context.WithTimeout(ctx, segmentTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(segCtx, m.binaryPath, args...)
-	cmd.Stdout = out
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
-
-	log.Printf("ffmpeg segment: %s", strings.Join(args, " "))
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("ffmpeg start: %w", err)
-	}
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("ffmpeg: %w: %s", err, tail(stderrBuf.String(), 800))
-	}
-	return nil
-}
-
 // tail returns the last n bytes of s.
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[len(s)-n:]
-}
-
-// audioMapByIndex returns the -map args for the audio track of input srcIndex.
-// A negative index falls back to the first audio track.
-func audioMapByIndex(audioTrackIndex, srcIndex int) []string {
-	idx := audioTrackIndex
-	if idx < 0 {
-		idx = 0
-	}
-	return []string{"-map", fmt.Sprintf("%d:a:%d", srcIndex, idx)}
 }
 
 // AudioTrack is a detected audio stream.

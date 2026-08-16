@@ -1,13 +1,11 @@
 package http
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -195,64 +193,19 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Singleflight: only one request generates a given segment at a time.
-	// Concurrent requests (the player retrying after a timeout) block here,
-	// then serve the cached file once the generator finishes, instead of each
-	// spawning its own ffmpeg writing to the same .tmp file.
-	lock := s.muxer.SegmentLock(jobID, segIndex)
-	lock.Lock()
-	defer lock.Unlock()
-
-	// Re-check the cache after acquiring the lock — the generator may have
-	// finished while we were waiting.
-	if cached := s.muxer.SegmentPath(job, segIndex); cached != "" {
-		w.Header().Set("Cache-Control", "no-store")
-		http.ServeFile(w, r, cached)
-		return
-	}
-
-	// Ensure the cache dir exists (EnsurePlaylist creates it and probes
-	// duration once).
+	// Ensure the cache dir / playlists exist (probes duration + picks sources
+	// once), then start (or reuse) the continuous ffmpeg session and wait for
+	// the segment to be written.
 	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
 		log.Printf("mux segment: %v", err)
 		writeError(w, http.StatusInternalServerError, "segment generation failed")
 		return
 	}
 
-	// Generate on-demand: ffmpeg -ss {offset} -t 4 seeks directly into the
-	// source via HTTP Range and produces just this segment. The generation is
-	// bounded by the request context — if the player disconnects, ffmpeg is
-	// cancelled rather than wasting bandwidth generating a segment nobody is
-	// waiting for.
-	segPath := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
-	tmpPath := segPath + ".tmp"
-
-	f, err := os.Create(tmpPath)
+	segPath, err := s.muxer.EnsureSegment(r.Context(), job, segIndex)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "create segment file failed")
-		return
-	}
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-
-	if err := s.muxer.GenerateSegment(ctx, job, segIndex, f); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		if ctx.Err() != nil {
-			return
-		}
 		log.Printf("mux segment %d: %v", segIndex, err)
 		writeError(w, http.StatusInternalServerError, "segment generation failed")
-		return
-	}
-	f.Close()
-
-	// Atomic rename: .tmp → final so concurrent requests never read a partial
-	// segment.
-	if err := os.Rename(tmpPath, segPath); err != nil {
-		os.Remove(tmpPath)
-		writeError(w, http.StatusInternalServerError, "segment rename failed")
 		return
 	}
 

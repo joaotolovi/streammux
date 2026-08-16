@@ -45,13 +45,18 @@ type Muxer struct {
 	// only walked once, even under concurrent segment requests.
 	resolveMu sync.Mutex
 
-	// segMu guards segLocks.
-	segMu sync.Mutex
+	// sessMu guards sessions and sessionAccess.
+	sessMu sync.Mutex
 
-	// segLocks are per-(job, segment) mutexes used as singleflight: concurrent
-	// requests for the same segment serialize on the same lock, so only one
-	// ffmpeg writes the .tmp file. The others wait, then serve the cached file.
-	segLocks map[string]*sync.Mutex
+	// sessions holds the active continuous ffmpeg session per job. There is at
+	// most one per job: it produces segments sequentially and is restarted only
+	// on seek outside its generated range.
+	sessions map[string]*ffmpeg.Session
+
+	// sessionAccess records the last segment request time per job, used to
+	// reap sessions when the player goes away (closing the app) instead of
+	// letting ffmpeg keep downloading the whole film for up to the job TTL.
+	sessionAccess map[string]time.Time
 }
 
 type Result struct {
@@ -60,7 +65,7 @@ type Result struct {
 }
 
 func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
-	return &Muxer{
+	m := &Muxer{
 		collector: col,
 		analyzer:  an,
 		ffmpeg:    ff,
@@ -69,40 +74,42 @@ func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *r
 		httpClient: &http.Client{
 			Timeout: 90 * time.Second,
 		},
-		segLocks: make(map[string]*sync.Mutex),
+		sessions:      make(map[string]*ffmpeg.Session),
+		sessionAccess: make(map[string]time.Time),
+	}
+	go m.reapIdleSessions()
+	return m
+}
+
+// sessionIdleTimeout is how long a continuous session is kept after its last
+// segment request. If the player closes, the session is cancelled so ffmpeg
+// stops downloading the film instead of running until the job TTL.
+const sessionIdleTimeout = 60 * time.Second
+
+// reapIdleSessions periodically cancels sessions that have had no segment
+// request for sessionIdleTimeout. Runs for the lifetime of the process.
+func (m *Muxer) reapIdleSessions() {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		m.sessMu.Lock()
+		now := time.Now()
+		for jobID, sess := range m.sessions {
+			last, ok := m.sessionAccess[jobID]
+			if ok && now.Sub(last) > sessionIdleTimeout {
+				sess.Cancel()
+				delete(m.sessions, jobID)
+				delete(m.sessionAccess, jobID)
+				log.Printf("mux: session for job %s idle, cancelled", jobID)
+			}
+		}
+		m.sessMu.Unlock()
 	}
 }
 
 // browserUA is the User-Agent sent on resolution/measurement requests. Debrid
 // proxies reject the Go default UA.
 const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-
-// SegmentLock returns the singleflight mutex for a (job, segment) pair so that
-// concurrent requests for the same segment generate it only once.
-func (m *Muxer) SegmentLock(jobID string, segIndex int) *sync.Mutex {
-	key := fmt.Sprintf("%s:%05d", jobID, segIndex)
-	m.segMu.Lock()
-	defer m.segMu.Unlock()
-	l, ok := m.segLocks[key]
-	if !ok {
-		l = &sync.Mutex{}
-		m.segLocks[key] = l
-	}
-	return l
-}
-
-// ReleaseSegmentLocks drops the singleflight locks for a job (called on job
-// cleanup to avoid unbounded growth).
-func (m *Muxer) ReleaseSegmentLocks(jobID string) {
-	prefix := jobID + ":"
-	m.segMu.Lock()
-	for k := range m.segLocks {
-		if strings.HasPrefix(k, prefix) {
-			delete(m.segLocks, k)
-		}
-	}
-	m.segMu.Unlock()
-}
 
 func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, contentID string) (*Result, error) {
 	videoAddons := cfg.AddonsByRole(constants.RoleVideo)
@@ -384,97 +391,94 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segIndex int) string {
 	return p
 }
 
-// GenerateSegment generates a single HLS segment on-demand by seeking directly
-// into the source(s) with ffmpeg -ss (HTTP Range). It only produces ~4s of
-// content regardless of where the user seeks, so seek cost is constant.
+// EnsureSegment returns the path of a generated segment, starting or restarting
+// the continuous ffmpeg session for the job as needed and waiting for the
+// segment to be written.
 //
-// The audio track index is resolved once at playlist time; segments map it by
-// numeric index, which avoids scanning language metadata and keeps the time to
-// first byte low. If the primary audio source is a broken debrid response (no
-// audio track), the segment falls back through the ordered candidates.
-func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex int, out *os.File) error {
-	offset := float64(segIndex) * ffmpeg.SegDuration()
+// Architecture: one ffmpeg session per playback produces segments sequentially
+// (single -ss up front; both sources read in lockstep). This avoids the
+// per-segment reconnect/seek cost and the A/V drift that came from running a
+// fresh ffmpeg per segment. The session is restarted only when the requested
+// segment is outside the range it has generated so far (a seek).
+func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segIndex int) (string, error) {
+	if job.CacheDir == "" {
+		if err := m.EnsurePlaylist(ctx, job); err != nil {
+			return "", err
+		}
+	}
 
+	// Track session activity so idle sessions are reaped when the player goes
+	// away (rather than letting ffmpeg download the whole film for the job TTL).
+	m.sessMu.Lock()
+	m.sessionAccess[job.ID] = time.Now()
+	m.sessMu.Unlock()
+
+	// If the segment already exists, serve it.
+	if p := m.SegmentPath(job, segIndex); p != "" {
+		return p, nil
+	}
+
+	// Determine whether to (re)start the session for this segment.
+	if err := m.ensureSession(ctx, job, segIndex); err != nil {
+		return "", err
+	}
+
+	// Wait for the segment to be produced.
+	segPath := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
+	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	for {
+		if _, err := os.Stat(segPath); err == nil {
+			return segPath, nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return "", fmt.Errorf("timeout waiting for segment %d", segIndex)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+// ensureSession starts a continuous ffmpeg session for the job, restarting the
+// existing one if the requested segment is behind where it started (seek back).
+// Forward seeks are served by waiting: the session generates sequentially, so
+// it will reach a forward segment in time.
+func (m *Muxer) ensureSession(ctx context.Context, job *model.MuxJob, segIndex int) error {
 	audioTrack := job.AudioTrackIndex
 	if audioTrack < 0 {
 		audioTrack = 0
 	}
 
-	// Build the list of video sources to try: the primary plus fallback
-	// candidates, each resolved to its CDN URL.
-	videoSources := append([]string{job.VideoURL}, job.VideoCandidates...)
-	var videoURLs []string
-	for i, src := range videoSources {
-		if src == "" {
-			continue
-		}
-		var resolved string
-		if i == 0 {
-			resolved = m.resolvedURL(ctx, job, "video")
-		} else {
-			resolved = m.resolveOne(ctx, src)
-		}
-		if resolved != "" {
-			videoURLs = append(videoURLs, resolved)
-		}
+	videoURL := m.resolvedURL(ctx, job, "video")
+	if videoURL == "" {
+		return fmt.Errorf("no resolvable video source")
+	}
+	audioURL := m.resolvedURL(ctx, job, "audio")
+	if audioURL == "" {
+		return fmt.Errorf("no resolvable audio source")
 	}
 
-	// Build the list of audio sources to try: the primary plus fallback
-	// candidates, each resolved to its CDN URL. The primary is pre-validated at
-	// playlist time, but it can still die mid-playback (token expiry, CDN drop),
-	// so we fall back through the candidates if needed.
-	audioSources := append([]string{job.AudioURL}, job.AudioCandidates...)
-	var audioURLs []string
-	for i, src := range audioSources {
-		if src == "" {
-			continue
+	m.sessMu.Lock()
+	defer m.sessMu.Unlock()
+
+	sess, ok := m.sessions[job.ID]
+	if ok && sess != nil {
+		// Session is running and this segment is at/after its start point: keep
+		// it (ffmpeg will produce it). Only restart for seek-back.
+		if segIndex >= sess.StartN() {
+			return nil
 		}
-		var resolved string
-		if i == 0 {
-			resolved = m.resolvedURL(ctx, job, "audio")
-		} else {
-			resolved = m.resolveOne(ctx, src)
-		}
-		if resolved != "" {
-			audioURLs = append(audioURLs, resolved)
-		}
+		// Seek back: kill and restart from the new position.
+		sess.Cancel()
+		delete(m.sessions, job.ID)
 	}
 
-	if len(videoURLs) == 0 || len(audioURLs) == 0 {
-		return fmt.Errorf("no resolvable video (%d) or audio (%d) sources", len(videoURLs), len(audioURLs))
+	newSess, err := m.ffmpeg.StartSession(context.Background(), videoURL, audioURL, audioTrack, segIndex, job.CacheDir)
+	if err != nil {
+		return err
 	}
-
-	log.Printf("mux: seg %d video=%s audioTrack=%d audioSrc=%d", segIndex, truncate(videoURLs[0]), audioTrack, len(audioURLs))
-
-	var lastErr error
-	// Try each video source against each audio source (best first).
-	for vi, videoURL := range videoURLs {
-		for ai, audioURL := range audioURLs {
-			err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
-			if err == nil {
-				if vi > 0 {
-					job.VideoURL = videoSources[vi]
-					job.VideoResolved = ""
-					job.VideoCandidates = nil
-					log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
-				}
-				if ai > 0 {
-					job.AudioURL = audioSources[ai]
-					job.AudioResolved = ""
-					job.AudioCandidates = nil
-					log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, ai)
-				}
-				return nil
-			}
-			lastErr = err
-			log.Printf("mux: (v%d,a%d) failed for seg %d: %v", vi, ai, segIndex, err)
-			if truncErr := resetFile(out); truncErr != nil {
-				return fmt.Errorf("reset output: %w", truncErr)
-			}
-		}
-	}
-
-	return lastErr
+	m.sessions[job.ID] = newSess
+	return nil
 }
 
 // pickAudioSource walks the audio candidates and returns the first source that
@@ -754,17 +758,15 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func resetFile(f *os.File) error {
-	if err := f.Truncate(0); err != nil {
-		return err
-	}
-	_, err := f.Seek(0, 0)
-	return err
-}
-
 // CleanupJob removes the temp cache directory for a job.
 func (m *Muxer) CleanupJob(job *model.MuxJob) {
-	m.ReleaseSegmentLocks(job.ID)
+	m.sessMu.Lock()
+	if sess, ok := m.sessions[job.ID]; ok {
+		sess.Cancel()
+		delete(m.sessions, job.ID)
+	}
+	delete(m.sessionAccess, job.ID)
+	m.sessMu.Unlock()
 	if job.CacheDir != "" {
 		os.RemoveAll(job.CacheDir)
 	}
