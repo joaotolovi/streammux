@@ -599,30 +599,46 @@ func (m *Muxer) pickVideoSource(ctx context.Context, job *model.MuxJob) (float64
 	return 7200, ""
 }
 
-// measureThroughput downloads a small sample from the source and returns the
-// sustained rate in bytes/second, or 0 on failure.
+// measureThroughput estimates the sustained download rate of a source.
+//
+// Debrid URLs start slowly: the proxy assembles the torrent / locates the file
+// before the first byte, which can take 5-20s with zero bytes flowing. Measuring
+// from the start of the request (including that TTFB) wildly under-reports the
+// real throughput, causing good sources to be rejected as "too slow".
+//
+// So we first discard a warm-up chunk (which absorbs the TTFB and the cold start
+// of the CDN/torrent), then measure the time to download a second chunk. That
+// second window reflects the sustained rate.
 func (m *Muxer) measureThroughput(ctx context.Context, url string) float64 {
 	if url == "" {
 		return 0
 	}
+
+	const warmupBytes = 512 * 1024
 	const sampleBytes = 2 * 1024 * 1024
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", sampleBytes-1))
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", warmupBytes+sampleBytes-1))
 
-	start := time.Now()
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return 0
 	}
 	defer resp.Body.Close()
 
-	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, sampleBytes))
+	// Discard the warm-up chunk: this absorbs the TTFB (torrent assembly, cold
+	// CDN edge) that otherwise poisons the measurement.
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, warmupBytes)); err != nil {
+		return 0
+	}
+
+	start := time.Now()
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, sampleBytes))
 	elapsed := time.Since(start).Seconds()
-	if elapsed <= 0 || n == 0 {
+	if err != nil || elapsed <= 0 || n == 0 {
 		return 0
 	}
 	return float64(n) / elapsed
