@@ -52,12 +52,6 @@ type generation struct {
 	startedAt    time.Time
 }
 
-type attemptResult struct {
-	generation *generation
-	planIndex  int
-	err        error
-}
-
 func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
@@ -184,6 +178,11 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	go m.monitorGeneration(job, state, winner)
 }
 
+// coordinateAttempts tries playback plans sequentially, one at a time, until
+// one produces its first segment. Sequential (not parallel) is deliberate:
+// each attempt opens two debrid connections (video + audio), and debrid
+// services cap concurrent slots (~2-3). Running multiple plans in parallel
+// could exceed that cap and trigger rate-limits on every attempt.
 func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, startPlan, startSegment int, timeout time.Duration) (*generation, error) {
 	if startPlan >= len(job.Plans) {
 		return nil, fmt.Errorf("no playback plans remain")
@@ -192,61 +191,25 @@ func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, star
 	ctx, cancel := context.WithTimeout(state.ctx, timeout)
 	defer cancel()
 
-	results := make(chan attemptResult, len(job.Plans)-startPlan)
-	nextPlan := startPlan
-	running := 0
 	var failures []error
-
-	launchNext := func() bool {
-		if nextPlan >= len(job.Plans) || running >= 2 {
-			return false
-		}
-		planIndex := nextPlan
-		nextPlan++
-		running++
-		go func() {
-			generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment)
-			results <- attemptResult{generation: generation, planIndex: planIndex, err: err}
-		}()
-		return true
-	}
-
-	launchNext()
-	fallbackTimer := time.NewTimer(m.policy.FallbackDelay)
-	defer fallbackTimer.Stop()
-
-	for {
-		if running == 0 && nextPlan >= len(job.Plans) {
-			return nil, errors.Join(failures...)
-		}
-
+	for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
 		select {
 		case <-ctx.Done():
 			failures = append(failures, ctx.Err())
 			return nil, errors.Join(failures...)
+		default:
+		}
 
-		case <-fallbackTimer.C:
-			launchNext()
-			if nextPlan < len(job.Plans) {
-				fallbackTimer.Reset(m.policy.FallbackDelay)
-			}
-
-		case result := <-results:
-			running--
-			if result.err == nil && result.generation != nil {
-				return result.generation, nil
-			}
-			if result.err != nil {
-				failures = append(failures, fmt.Errorf("plan %d: %w", result.planIndex, result.err))
-				log.Printf("mux: plan %d failed: %v", result.planIndex, result.err)
-			}
-			for running < 2 && nextPlan < len(job.Plans) {
-				if !launchNext() {
-					break
-				}
-			}
+		generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment)
+		if err == nil && generation != nil {
+			return generation, nil
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
+			log.Printf("mux: plan %d failed: %v", planIndex, err)
 		}
 	}
+	return nil, errors.Join(failures...)
 }
 
 func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int) (*generation, error) {

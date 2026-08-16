@@ -35,7 +35,6 @@ type mediaEngine interface {
 type Policy struct {
 	StartupTimeout    time.Duration
 	AttemptTimeout    time.Duration
-	FallbackDelay     time.Duration
 	SegmentTimeout    time.Duration
 	IdleTimeout       time.Duration
 	HealthWindow      time.Duration
@@ -49,7 +48,6 @@ func defaultPolicy() Policy {
 	return Policy{
 		StartupTimeout:    12 * time.Second,
 		AttemptTimeout:    7 * time.Second,
-		FallbackDelay:     1500 * time.Millisecond,
 		SegmentTimeout:    20 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		HealthWindow:      12 * time.Second,
