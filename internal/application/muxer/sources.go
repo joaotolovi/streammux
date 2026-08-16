@@ -381,13 +381,13 @@ func compatibleReleases(plan model.PlaybackPlan, video, audio *ffmpeg.ProbeResul
 	return nil
 }
 
+// compatibleAudioMode always copies the original audio stream. Re-encoding was
+// tried for codecs that are awkward in MPEG-TS (TrueHD, DTS, FLAC), but the
+// resulting AAC was rejected by the Android ExoPlayer decoder. Copying the
+// original track is what the source provides; if a particular codec is not
+// playable, the health monitor or the plan fallback selects another source.
 func compatibleAudioMode(codec string) ffmpeg.AudioMode {
-	switch strings.ToLower(strings.TrimSpace(codec)) {
-	case "aac", "ac3", "eac3", "mp2", "mp3":
-		return ffmpeg.AudioModeCopy
-	default:
-		return ffmpeg.AudioModeAAC
-	}
+	return ffmpeg.AudioModeCopy
 }
 
 func (m *Muxer) invalidatePlanSources(plan model.PlaybackPlan) {

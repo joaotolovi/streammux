@@ -83,13 +83,11 @@ func TestCompatibleReleasesRejectsDifferentEditionsAndDurations(t *testing.T) {
 	}
 }
 
-func TestCompatibleAudioModeUsesAACForRiskyHLSCodecs(t *testing.T) {
-	for _, codec := range []string{"dts", "truehd", "flac", "opus", "pcm_s24le"} {
-		if got := compatibleAudioMode(codec); got != ffmpeg.AudioModeAAC {
-			t.Errorf("compatibleAudioMode(%q) = %q, want AAC", codec, got)
-		}
-	}
-	for _, codec := range []string{"aac", "ac3", "eac3"} {
+func TestCompatibleAudioModeAlwaysCopiesOriginalAudio(t *testing.T) {
+	// The original audio is copied regardless of codec. Re-encoding to AAC
+	// caused the Android ExoPlayer decoder to reject the stream, so copy is
+	// preferred and codec-specific fallback is left to plan selection.
+	for _, codec := range []string{"aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "pcm_s24le"} {
 		if got := compatibleAudioMode(codec); got != ffmpeg.AudioModeCopy {
 			t.Errorf("compatibleAudioMode(%q) = %q, want copy", codec, got)
 		}
