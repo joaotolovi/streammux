@@ -183,32 +183,59 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 // each attempt opens two debrid connections (video + audio), and debrid
 // services cap concurrent slots (~2-3). Running multiple plans in parallel
 // could exceed that cap and trigger rate-limits on every attempt.
+//
+// Two phases, each with its own budget: strict first, then lenient. Strict
+// accepts a track only when its language is confirmed (tag, title, or a
+// single-track dubbed source). Lenient is the last resort — it also accepts an
+// und/untagged track from a dubbed multiaudio source. Giving lenient its own
+// window ensures a slow strict phase cannot starve the retry that matters most
+// when strict fails (probes are cached, so lenient re-runs are fast).
 func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, startPlan, startSegment int, timeout time.Duration) (*generation, error) {
 	if startPlan >= len(job.Plans) {
 		return nil, fmt.Errorf("no playback plans remain")
 	}
 
-	ctx, cancel := context.WithTimeout(state.ctx, timeout)
-	defer cancel()
+	// Lenient gets a fresh budget (cached probes make it quick), independent of
+	// how much the strict phase consumed.
+	lenientTimeout := m.policy.StartupTimeout / 2
+	if lenientTimeout < 5*time.Second {
+		lenientTimeout = 5 * time.Second
+	}
 
+	strictCtx, strictCancel := context.WithTimeout(state.ctx, timeout)
+	generation, strictErr := m.tryPlans(strictCtx, job, state, startPlan, startSegment, false)
+	strictCancel()
+	if generation != nil && strictErr == nil {
+		return generation, nil
+	}
+
+	lenientCtx, lenientCancel := context.WithTimeout(state.ctx, lenientTimeout)
+	generation, lenientErr := m.tryPlans(lenientCtx, job, state, startPlan, startSegment, true)
+	lenientCancel()
+	if generation != nil && lenientErr == nil {
+		return generation, nil
+	}
+
+	return nil, errors.Join(strictErr, lenientErr)
+}
+
+func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playbackState, startPlan, startSegment int, lenient bool) (*generation, error) {
 	var failures []error
-	for _, lenient := range []bool{false, true} {
-		for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
-			select {
-			case <-ctx.Done():
-				failures = append(failures, ctx.Err())
-				return nil, errors.Join(failures...)
-			default:
-			}
+	for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
+		select {
+		case <-ctx.Done():
+			failures = append(failures, ctx.Err())
+			return nil, errors.Join(failures...)
+		default:
+		}
 
-			generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment, lenient)
-			if err == nil && generation != nil {
-				return generation, nil
-			}
-			if err != nil {
-				failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
-				log.Printf("mux: plan %d failed: %v", planIndex, err)
-			}
+		generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment, lenient)
+		if err == nil && generation != nil {
+			return generation, nil
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
+			log.Printf("mux: plan %d failed: %v", planIndex, err)
 		}
 	}
 	return nil, errors.Join(failures...)
