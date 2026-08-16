@@ -27,6 +27,7 @@ export interface Config {
   language: string;
   services: ServiceConfig[];
   addons: Addon[];
+  audioDelayMs?: number;
 }
 
 export const DEFAULT_CONFIG: Config = {

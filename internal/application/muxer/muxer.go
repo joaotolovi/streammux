@@ -27,6 +27,7 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
+	EstimateAudioOffset(context.Context, string, string, int, int) (time.Duration, error)
 }
 
 // Policy groups the small number of operational deadlines used during startup
@@ -80,6 +81,9 @@ type Muxer struct {
 	resolveFlights map[string]*resolveFlight
 	probes         map[string]probeEntry
 	probeFlights   map[string]*probeFlight
+
+	offsetMu sync.Mutex
+	offsets  map[string]time.Duration
 }
 
 type Result struct {
@@ -102,6 +106,7 @@ func New(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *r
 		resolveFlights: make(map[string]*resolveFlight),
 		probes:         make(map[string]probeEntry),
 		probeFlights:   make(map[string]*probeFlight),
+		offsets:        make(map[string]time.Duration),
 	}
 	go m.reapIdleSessions()
 	return m

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -242,14 +243,44 @@ func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playback
 }
 
 func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int, lenient bool) (*generation, error) {
-	attemptCtx, cancel := context.WithTimeout(parent, m.policy.AttemptTimeout)
-	defer cancel()
-
 	plan := job.Plans[planIndex]
-	prepared, err := m.preparePlanMode(attemptCtx, job, plan, lenient)
+	prepared, err := m.preparePlanMode(parent, job, plan, lenient)
 	if err != nil {
 		return nil, err
 	}
+
+	// The A/V offset is either set manually in the user config (AudioDelayMs)
+	// or estimated by cross-correlating the first seconds of both audio tracks.
+	// The estimate is cached per source pair so it never consumes the attempt
+	// budget twice. EstimateAudioOffset returns how far the dubbed audio lags
+	// the video's audio (positive = audio starts later); the offset we apply is
+	// inverted because it must move the audio back into alignment (-itsoffset
+	// positive delays the audio).
+	var audioOffset time.Duration
+	dualSource := strings.TrimSpace(prepared.audioURL) != "" && prepared.audioURL != prepared.videoURL
+	if job.Config.AudioDelayMs != 0 {
+		audioOffset = time.Duration(job.Config.AudioDelayMs) * time.Millisecond
+		log.Printf("mux: using manual audio offset %s", audioOffset)
+	} else if dualSource {
+		if offset, ok := m.audioOffsetFor(plan); ok {
+			audioOffset = offset
+			if offset != 0 {
+				log.Printf("mux: using cached audio offset %s", offset)
+			}
+		} else {
+			offset, err := m.ffmpeg.EstimateAudioOffset(parent, prepared.videoURL, prepared.audioURL, prepared.videoTrackIndex, prepared.audioTrackIndex)
+			if err != nil {
+				log.Printf("mux: audio offset estimation failed (continuing without): %v", err)
+			} else {
+				audioOffset = -offset
+				m.cacheAudioOffset(plan, audioOffset)
+				log.Printf("mux: estimated audio offset %s (lag %s)", audioOffset, offset)
+			}
+		}
+	}
+
+	attemptCtx, cancel := context.WithTimeout(parent, m.policy.AttemptTimeout)
+	defer cancel()
 
 	state.mu.Lock()
 	state.nextGeneration++
@@ -261,14 +292,9 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 		return nil, fmt.Errorf("create generation directory: %w", err)
 	}
 
-	// When combining two different releases, the container start times can
-	// differ (different intros/logos). Shifting audio by (videoStart -
-	// audioStart) realigns the content. Only meaningful for dual-source.
-	var audioDelay time.Duration
-	if !plan.SingleSource() {
-		audioDelay = time.Duration((prepared.videoStartTime - prepared.audioStartTime) * float64(time.Second))
-	}
-
+	// The session must outlive the attempt: it is bound to the playback
+	// context, while attemptCtx only gates how long we wait for the first
+	// segment below.
 	session, err := m.ffmpeg.StartSession(state.ctx, ffmpeg.SessionSpec{
 		VideoURL:        prepared.videoURL,
 		AudioURL:        prepared.audioURL,
@@ -280,7 +306,7 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 		AudioLanguage:   job.TargetLanguage,
 		AudioTitle:      job.TargetLanguage,
 		UserAgent:       browserUA,
-		AudioDelay:      audioDelay,
+		AudioOffset:     audioOffset,
 	})
 	if err != nil {
 		_ = os.RemoveAll(dir)

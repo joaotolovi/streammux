@@ -53,12 +53,30 @@ type preparedPlan struct {
 	audioTrackIndex int
 	audioMode       ffmpeg.AudioMode
 	duration        float64
-	videoStartTime  float64
-	audioStartTime  float64
 }
 
 func (m *Muxer) preparePlan(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan) (*preparedPlan, error) {
 	return m.preparePlanMode(ctx, job, plan, false)
+}
+
+// audioOffsetKey identifies a source pair so the A/V offset estimate is reused
+// across attempts and recoveries.
+func audioOffsetKey(plan model.PlaybackPlan) string {
+	return plan.Video.SourceKey() + "\x00" + plan.Audio.SourceKey()
+}
+
+// audioOffsetFor returns the cached audio offset for the plan's source pair.
+func (m *Muxer) audioOffsetFor(plan model.PlaybackPlan) (time.Duration, bool) {
+	m.offsetMu.Lock()
+	defer m.offsetMu.Unlock()
+	offset, ok := m.offsets[audioOffsetKey(plan)]
+	return offset, ok
+}
+
+func (m *Muxer) cacheAudioOffset(plan model.PlaybackPlan, offset time.Duration) {
+	m.offsetMu.Lock()
+	defer m.offsetMu.Unlock()
+	m.offsets[audioOffsetKey(plan)] = offset
 }
 
 func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan, lenient bool) (*preparedPlan, error) {
@@ -104,8 +122,6 @@ func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan mod
 	prepared.videoTrackIndex = videoProbe.VideoStreams[0].Index
 	prepared.audioTrackIndex = trackIndex
 	prepared.duration = videoProbe.Duration
-	prepared.videoStartTime = videoProbe.StartTime
-	prepared.audioStartTime = audioProbe.StartTime
 	for _, track := range audioProbe.AudioTracks {
 		if track.Index == trackIndex {
 			prepared.audioMode = compatibleAudioMode(track.Codec)

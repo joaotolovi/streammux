@@ -116,6 +116,11 @@ export default function App() {
             onChange={(addons) => set({ addons })}
           />
 
+          <SyncSection
+            audioDelayMs={config.audioDelayMs ?? 0}
+            onChange={(audioDelayMs) => set({ audioDelayMs })}
+          />
+
           <SaveSection
             password={password}
             setPassword={setPassword}
@@ -174,6 +179,31 @@ function LanguageSection({ value, onChange }: { value: string; onChange: (v: str
           </Select.Item>
         ))}
       </Select>
+    </SectionCard>
+  );
+}
+
+function SyncSection({ audioDelayMs, onChange }: { audioDelayMs: number; onChange: (v: number) => void }) {
+  return (
+    <SectionCard
+      icon={<Settings01 className="size-5" />}
+      title="Sincronização de áudio"
+      description="Quando o vídeo e o áudio dublado vêm de versões diferentes do mesmo filme, o áudio pode sair do sincronismo. Ajuste manualmente se necessário."
+    >
+      <div className="max-w-xs">
+        <InputNumber
+          label="Atraso de áudio (ms)"
+          value={audioDelayMs}
+          minValue={-10000}
+          maxValue={10000}
+          step={50}
+          onChange={(v) => onChange(Math.round(v ?? 0))}
+        />
+        <p className="mt-2 text-xs text-[var(--color-text-tertiary)]">
+          Positivo atrasa o áudio; negativo adianta. Deixe em 0 para usar o ajuste
+          automático (correlação da forma de onda).
+        </p>
+      </div>
     </SectionCard>
   );
 }
