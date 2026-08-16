@@ -187,6 +187,8 @@ func (m *Muxer) muxURL(jobID string) string {
 // audioCandidates returns the ordered list of audio source URLs (best first)
 // that match the target language, excluding the primary choice. Used as a
 // fallback when a debrid source returns a broken/error video with no audio.
+// Limited to a few candidates to avoid hammering the debrid proxy with a probe
+// per stream (which is what triggered rate-limits).
 func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage string) []string {
 	ranked := m.analyzer.RankAudio(streams, targetLanguage)
 	var out []string
@@ -197,12 +199,14 @@ func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage 
 			continue
 		}
 		seen[u] = true
-		log.Printf("mux: audio candidate %d: %s (size=%d)", i, truncate(u), ranked[i].Stream.Size)
 		// Skip the primary (first) candidate — it's already job.AudioURL.
 		if i == 0 {
 			continue
 		}
 		out = append(out, u)
+		if len(out) >= 2 {
+			break
+		}
 	}
 	return out
 }
@@ -210,6 +214,8 @@ func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage 
 // videoCandidates returns the ordered list of video source URLs (best first),
 // excluding the primary choice. Used as a fallback when the primary video is a
 // broken debrid response (e.g. a short trailer instead of the movie).
+// Limited to a few candidates to avoid hammering the debrid proxy with a probe
+// per stream (which is what triggered rate-limits).
 func (m *Muxer) videoCandidates(streams []model.CollectedStream, primaryURL string) []string {
 	ranked := m.analyzer.RankVideo(streams)
 	var out []string
@@ -224,6 +230,9 @@ func (m *Muxer) videoCandidates(streams []model.CollectedStream, primaryURL stri
 			continue
 		}
 		out = append(out, u)
+		if len(out) >= 2 {
+			break
+		}
 	}
 	return out
 }
@@ -508,9 +517,6 @@ func (m *Muxer) pickAudioSource(ctx context.Context, job *model.MuxJob) (string,
 // nothing), falling back to 7200s duration when nothing probes.
 func (m *Muxer) pickVideoSource(ctx context.Context, job *model.MuxJob) (float64, string) {
 	const minDuration = 600 // 10 minutes; a real movie/series is far longer
-
-	// Real-time playback needs the source bitrate; require a comfortable margin
-	// (1.3x) so segment generation (which also reads) keeps ahead.
 	const sustainFactor = 1.3
 
 	sources := append([]string{job.VideoURL}, job.VideoCandidates...)
@@ -519,6 +525,11 @@ func (m *Muxer) pickVideoSource(ctx context.Context, job *model.MuxJob) (float64
 		dur    float64
 		resolved string
 	}{}
+
+	// Throughput is measured once (on the first resolvable source) and reused
+	// for every candidate — measuring it per candidate multiplied the number of
+	// debrid requests and triggered rate-limits.
+	throughput := 0.0
 
 	for i, u := range sources {
 		if u == "" {
@@ -551,7 +562,11 @@ func (m *Muxer) pickVideoSource(ctx context.Context, job *model.MuxJob) (float64
 			best.resolved = resolved
 		}
 
-		throughput := m.measureThroughput(ctx, resolved)
+		if throughput == 0 {
+			throughput = m.measureThroughput(ctx, resolved)
+			log.Printf("mux: source throughput %.1f Mbps", throughput/1e6)
+		}
+
 		if res.VideoBitrate > 0 && throughput > 0 && throughput >= res.VideoBitrate*sustainFactor {
 			log.Printf("mux: video candidate %d sustainable (%.1f Mbps > %.1f Mbps)", i, throughput/1e6, res.VideoBitrate/1e6)
 			return res.Duration, resolved
