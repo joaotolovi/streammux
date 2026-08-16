@@ -53,6 +53,8 @@ type preparedPlan struct {
 	audioTrackIndex int
 	audioMode       ffmpeg.AudioMode
 	duration        float64
+	videoStartTime  float64
+	audioStartTime  float64
 }
 
 func (m *Muxer) preparePlan(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan) (*preparedPlan, error) {
@@ -102,6 +104,8 @@ func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan mod
 	prepared.videoTrackIndex = videoProbe.VideoStreams[0].Index
 	prepared.audioTrackIndex = trackIndex
 	prepared.duration = videoProbe.Duration
+	prepared.videoStartTime = videoProbe.StartTime
+	prepared.audioStartTime = audioProbe.StartTime
 	for _, track := range audioProbe.AudioTracks {
 		if track.Index == trackIndex {
 			prepared.audioMode = compatibleAudioMode(track.Codec)

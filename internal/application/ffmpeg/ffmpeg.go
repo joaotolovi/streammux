@@ -29,6 +29,12 @@ const (
 // empty (or equal to VideoURL) to select both streams from a single input.
 // Stream indexes are relative to their media type, as used by FFmpeg maps such
 // as 0:v:1 and 0:a:2.
+//
+// VideoStartTime/AudioStartTime are the container start times probed from each
+// source. When combining two different releases they can differ (intros/logos
+// of different lengths), which shifts the audio relative to the video even
+// though both use the same -ss. AudioDelay is the manual/derived offset applied
+// to the audio input to re-align it.
 type SessionSpec struct {
 	VideoURL        string
 	AudioURL        string
@@ -40,6 +46,7 @@ type SessionSpec struct {
 	AudioLanguage   string
 	AudioTitle      string
 	UserAgent       string
+	AudioDelay      time.Duration
 }
 
 // Session is a single continuous FFmpeg run that produces HLS segments.
@@ -164,6 +171,12 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 
 	dualSource := strings.TrimSpace(spec.AudioURL) != "" && spec.AudioURL != spec.VideoURL
 	if dualSource {
+		// When combining two different releases, their container start times can
+		// differ (intros/logos of different lengths). Shifting the audio input
+		// by (videoStart - audioStart) realigns the actual content.
+		if spec.AudioDelay > 0 {
+			args = append(args, "-itsoffset", fmtDuration(spec.AudioDelay.Seconds()))
+		}
 		args = append(args, "-ss", fmtDuration(offset))
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)

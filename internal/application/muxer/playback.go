@@ -261,6 +261,14 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 		return nil, fmt.Errorf("create generation directory: %w", err)
 	}
 
+	// When combining two different releases, the container start times can
+	// differ (different intros/logos). Shifting audio by (videoStart -
+	// audioStart) realigns the content. Only meaningful for dual-source.
+	var audioDelay time.Duration
+	if !plan.SingleSource() {
+		audioDelay = time.Duration((prepared.videoStartTime - prepared.audioStartTime) * float64(time.Second))
+	}
+
 	session, err := m.ffmpeg.StartSession(state.ctx, ffmpeg.SessionSpec{
 		VideoURL:        prepared.videoURL,
 		AudioURL:        prepared.audioURL,
@@ -272,6 +280,7 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 		AudioLanguage:   job.TargetLanguage,
 		AudioTitle:      job.TargetLanguage,
 		UserAgent:       browserUA,
+		AudioDelay:      audioDelay,
 	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
