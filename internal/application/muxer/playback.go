@@ -287,8 +287,11 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 	state.mu.Unlock()
 
 	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("create generation directory: %w", err)
+	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+		return nil, fmt.Errorf("create generation video directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "audio"), 0755); err != nil {
+		return nil, fmt.Errorf("create generation audio directory: %w", err)
 	}
 
 	// The session must outlive the attempt: it is bound to the playback
