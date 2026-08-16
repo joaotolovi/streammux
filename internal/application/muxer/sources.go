@@ -56,6 +56,10 @@ type preparedPlan struct {
 }
 
 func (m *Muxer) preparePlan(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan) (*preparedPlan, error) {
+	return m.preparePlanMode(ctx, job, plan, false)
+}
+
+func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan, lenient bool) (*preparedPlan, error) {
 	videoURL, audioURL, err := m.resolvePlanSources(ctx, job, plan)
 	if err != nil {
 		return nil, err
@@ -84,7 +88,7 @@ func (m *Muxer) preparePlan(ctx context.Context, job *model.MuxJob, plan model.P
 		return nil, fmt.Errorf("source has no video stream")
 	}
 
-	trackIndex := targetAudioTrack(audioProbe.AudioTracks, job.TargetLanguage, plan.Audio)
+	trackIndex := targetAudioTrackStrict(audioProbe.AudioTracks, job.TargetLanguage, plan.Audio, lenient)
 	if trackIndex < 0 {
 		return nil, fmt.Errorf("source has no confirmed %s audio track", job.TargetLanguage)
 	}
@@ -316,6 +320,21 @@ func (m *Muxer) probeSource(ctx context.Context, url string) (*ffmpeg.ProbeResul
 }
 
 func targetAudioTrack(tracks []ffmpeg.AudioTrack, targetLanguage string, source model.CollectedStream) int {
+	return targetAudioTrackStrict(tracks, targetLanguage, source, false)
+}
+
+// targetAudioTrackStrict picks the audio track for a dubbed source.
+//
+// Strict mode (lenient=false) only accepts a track it can be confident about:
+// an explicit language tag, a title mentioning the language, or a source that
+// is identified as dubbed in the target language and carries exactly one audio
+// track (then the track is used as-is without further verification).
+//
+// Lenient mode (lenient=true) is the last resort: it also accepts an undefined
+// or untagged track from a dubbed multiaudio source, since many "DUAL" remuxes
+// tag the dubbed audio as `und` or leave it empty. It is only used after every
+// strict plan has failed.
+func targetAudioTrackStrict(tracks []ffmpeg.AudioTrack, targetLanguage string, source model.CollectedStream, lenient bool) int {
 	code := ffmpeg.LanguageCode(targetLanguage)
 	if index := ffmpeg.AudioTrackIndexByLanguage(tracks, code); index >= 0 {
 		return index
@@ -327,28 +346,21 @@ func targetAudioTrack(tracks []ffmpeg.AudioTrack, targetLanguage string, source 
 		}
 	}
 
-	// When the addon explicitly identifies this source as dubbed in the target
-	// language (AddonLanguage / IsDubbed / parsed flags), accept an undefined
-	// or untagged track. Many "DUAL" remuxes tag the dubbed audio as `und`
-	// (undefined) or leave it empty, so rejecting those rejects the dubbed
-	// track unfairly. Prefer an undefined/empty track before falling back to
-	// the first one.
-	if analyzer.MatchesLanguage(source, targetLanguage) {
+	// A source identified as dubbed with a single audio track is used as-is:
+	// with only one track there is nothing else to select, so the tag (or lack
+	// of one) is irrelevant.
+	if len(tracks) == 1 && analyzer.MatchesLanguage(source, targetLanguage) {
+		return tracks[0].Index
+	}
+
+	// Lenient: accept an undefined/empty track from a dubbed multiaudio source.
+	if lenient && analyzer.MatchesLanguage(source, targetLanguage) {
 		for _, track := range tracks {
 			lang := strings.TrimSpace(track.Language)
 			if lang == "" || lang == "und" {
 				return track.Index
 			}
 		}
-		if len(tracks) > 0 {
-			return tracks[0].Index
-		}
-	}
-
-	// A single untagged track from a source explicitly identified as dubbed is
-	// also a safe fallback. Multiaudio files never fall back further than this.
-	if len(tracks) == 1 && analyzer.MatchesLanguage(source, targetLanguage) {
-		return tracks[0].Index
 	}
 	return -1
 }

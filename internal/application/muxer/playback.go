@@ -192,32 +192,34 @@ func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, star
 	defer cancel()
 
 	var failures []error
-	for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
-		select {
-		case <-ctx.Done():
-			failures = append(failures, ctx.Err())
-			return nil, errors.Join(failures...)
-		default:
-		}
+	for _, lenient := range []bool{false, true} {
+		for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
+			select {
+			case <-ctx.Done():
+				failures = append(failures, ctx.Err())
+				return nil, errors.Join(failures...)
+			default:
+			}
 
-		generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment)
-		if err == nil && generation != nil {
-			return generation, nil
-		}
-		if err != nil {
-			failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
-			log.Printf("mux: plan %d failed: %v", planIndex, err)
+			generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment, lenient)
+			if err == nil && generation != nil {
+				return generation, nil
+			}
+			if err != nil {
+				failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
+				log.Printf("mux: plan %d failed: %v", planIndex, err)
+			}
 		}
 	}
 	return nil, errors.Join(failures...)
 }
 
-func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int) (*generation, error) {
+func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int, lenient bool) (*generation, error) {
 	attemptCtx, cancel := context.WithTimeout(parent, m.policy.AttemptTimeout)
 	defer cancel()
 
 	plan := job.Plans[planIndex]
-	prepared, err := m.preparePlan(attemptCtx, job, plan)
+	prepared, err := m.preparePlanMode(attemptCtx, job, plan, lenient)
 	if err != nil {
 		return nil, err
 	}
