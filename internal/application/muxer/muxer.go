@@ -54,7 +54,7 @@ func defaultPolicy() Policy {
 		RecoveryCooldown:  30 * time.Second,
 		MinRealtime:       0.95,
 		MinPublishedAhead: 12 * time.Second,
-		DurationTolerance: 0.001,
+		DurationTolerance: 0.002,
 	}
 }
 

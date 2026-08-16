@@ -382,8 +382,8 @@ func compatibleReleases(plan model.PlaybackPlan, video, audio *ffmpeg.ProbeResul
 	if tolerance < 1 {
 		tolerance = 1
 	}
-	if tolerance > 5 {
-		tolerance = 5
+	if tolerance > 15 {
+		tolerance = 15
 	}
 	if delta := math.Abs(video.Duration - audio.Duration); delta > tolerance {
 		return fmt.Errorf("duration mismatch: %.3fs exceeds %.3fs tolerance", delta, tolerance)

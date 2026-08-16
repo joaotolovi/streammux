@@ -130,8 +130,13 @@ func TestCompatibleReleasesRejectsDifferentEditionsAndDurations(t *testing.T) {
 
 	plan.Video.Parsed.Edition = ""
 	plan.Audio.Parsed.Edition = ""
-	if err := compatibleReleases(plan, &ffmpeg.ProbeResult{Duration: 7200}, &ffmpeg.ProbeResult{Duration: 7210}, 0.001); err == nil {
-		t.Fatal("expected duration mismatch")
+	// 7200s * 0.002 = 14.4s, below the 15s cap — a 10s difference must pass.
+	if err := compatibleReleases(plan, &ffmpeg.ProbeResult{Duration: 7200}, &ffmpeg.ProbeResult{Duration: 7210}, 0.002); err != nil {
+		t.Fatalf("expected 10s difference to pass, got: %v", err)
+	}
+	// A clearly different release (2 minutes off) still fails.
+	if err := compatibleReleases(plan, &ffmpeg.ProbeResult{Duration: 7200}, &ffmpeg.ProbeResult{Duration: 7320}, 0.002); err == nil {
+		t.Fatal("expected duration mismatch for 120s difference")
 	}
 }
 
