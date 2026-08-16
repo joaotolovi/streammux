@@ -6,8 +6,8 @@
 
 StreamMux is a [Stremio](https://www.stremio.com/) addon that combines the
 **highest-quality video** from one source with the **audio in your language**
-from another — remuxed on the fly (no re-encoding) and delivered as a single
-stream.
+from another — remuxed on the fly without re-encoding the video and delivered
+as a single stream.
 
 ![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=white)
@@ -33,23 +33,30 @@ language (usually dubbed), and remuxes them together with FFmpeg — so you get
 For each title it returns two options:
 
 - 🔊 **Dubbed** — the best video + the best audio in your language. If the
-  video and audio are already in the same stream, it's passed through directly;
-  otherwise it's remuxed via FFmpeg.
+  video and audio are already in the same stream, a lightweight single-input
+  remux selects the right track; otherwise both sources are combined by FFmpeg.
 - 🎞️ **Subtitled** — the best video (usually English), always a direct link.
 
 ## Features
 
 - **Smart source matching** — analyzes resolution, quality, encode, HDR/visual
   tags, audio tags and channels to rank every candidate.
-- **Duration verification** — audio and video are only combined when their
-  durations match (~95%), avoiding mixing an extended cut's video with a
-  theatrical cut's audio.
+- **Conservative release matching** — cross-source plans require matching
+  duration, frame rate and edition metadata, avoiding combinations such as an
+  extended cut's video with a theatrical cut's audio.
 - **Multiaudio support** — detects the correct audio track for your language
   inside multiaudio files via FFprobe (e.g. `por`, `pt-BR`, `dubbed`, flags 🇵🇹/🇧🇷).
 - **Debrid fallback** — when an addon returns an unresolved torrent, StreamMux
   resolves it through your debrid service (StremThru-backed: Real-Debrid,
   TorBox, AllDebrid, Premiumize, Debrid-Link and more).
-- **No re-encoding** — remuxing uses `-c copy`, so it's fast and lossless.
+- **Video is never re-encoded** — compatible audio is copied; codecs that are
+  unreliable in HLS are converted to AAC for broad player compatibility.
+- **Fast-start fallback race** — at most two plans are prepared concurrently;
+  the first one to publish a complete segment wins and the other is cancelled.
+- **Automatic recovery** — a dubbed source can supply both picture and audio,
+  and the best subtitled source is the final fallback when dubbed plans fail.
+- **Real session telemetry** — downgrade decisions use FFmpeg's actual media
+  production rate during playback, without a separate bandwidth-test download.
 - **Multi-user** — each config is stored per user (SQLite), protected with an
   encrypted password.
 - **Beautiful config UI** — a modern React interface (Vite + Tailwind v4 +
@@ -62,14 +69,15 @@ For each title it returns two options:
 2. When Stremio requests streams, StreamMux queries all configured addons.
 3. It ranks every result (resolution, quality, encode, visual/audio tags,
    channels, language).
-4. It picks the best video and the best audio in your language, verifies their
-   durations match, and:
-
-   - If they're the **same stream** → returns the direct URL.
-   - If they're **different streams** → creates a `/mux/{job}` URL that
-     FFmpeg remuxes on demand (video from source A, audio from source B).
-   - If no audio in your language is found → returns the best subtitled
-     stream directly.
+4. It builds an ordered list of playback plans: best cross-source pair,
+   high-quality single-source dubbed fallbacks, lower-quality combinations and
+   finally direct subtitled sources.
+5. Work stays lazy until play is pressed. The startup coordinator races at most
+   two plans, selects the first one that produces a complete HLS segment and
+   cancels wasted work.
+6. During playback, FFmpeg progress is measured over stable windows. If the
+   active source cannot sustain real time and the buffered lead is shrinking,
+   StreamMux prepares the next best plan and switches at a segment boundary.
 
 ## Getting started
 
@@ -155,7 +163,7 @@ In the web UI:
 ```
 cmd/streammux/        entrypoint
 internal/
-  application/        business logic (parser, collector, analyzer, muxer, ffmpeg, resolver)
+  application/        business logic (parser, collector, analyzer, planner, muxer, ffmpeg, resolver)
   domain/             models, constants, ports (hexagonal core)
   infrastructure/     SQLite, crypto, in-memory store
   interface/http/     HTTP server, routes, SPA serving
@@ -181,17 +189,20 @@ language) **and** be confirmed by FFprobe to have a matching audio track.
 ### Duration matching
 
 To avoid mixing audio and video from different releases (e.g. an extended cut
-with a theatrical cut), StreamMux probes the duration of candidates and only
-combines video and audio whose durations are within **95%** of each other.
-Candidates are tried in quality order — next best video, then next best audio —
-comparing each against all previously accepted candidates of the other kind.
+with a theatrical cut), StreamMux rejects conflicting edition tags and requires
+known durations within `0.1%` of each other, clamped to a tolerance between one
+and five seconds. Frame rates must also agree when both sources report them.
+
+Roles are preferences rather than hard exclusions during recovery. A source
+configured for dubbed audio can therefore become the video source when it also
+contains a better 4K picture than the remaining video addons.
 
 ## Roadmap
 
 - [ ] More debrid providers (Direct via provider APIs, not just StremThru)
 - [ ] Configurable duration tolerance
 - [ ] Per-title language overrides
-- [ ] Better caching of probe results across requests
+- [ ] Persistent probe cache across process restarts
 
 ## License
 

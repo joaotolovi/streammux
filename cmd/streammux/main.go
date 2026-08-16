@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/streammux/streammux/internal/application/analyzer"
 	"github.com/streammux/streammux/internal/application/collector"
 	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/application/muxer"
+	"github.com/streammux/streammux/internal/application/planner"
 	"github.com/streammux/streammux/internal/application/resolver"
 	"github.com/streammux/streammux/internal/infrastructure/crypto"
 	"github.com/streammux/streammux/internal/infrastructure/db"
@@ -51,10 +51,10 @@ func main() {
 
 	store := store.NewMemoryStore(30 * time.Minute)
 	collector := collector.New()
-	analyzer := analyzer.New()
+	planner := planner.New()
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
-	mux := muxer.New(collector, analyzer, ff, res, store, baseURL)
+	mux := muxer.New(collector, planner, ff, res, store, baseURL)
 	store.SetOnDelete(mux.CleanupJob)
 
 	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{

@@ -81,6 +81,20 @@ func TestParseDubbedDetection(t *testing.T) {
 	}
 }
 
+func TestParseEdition(t *testing.T) {
+	cases := map[string]string{
+		"Movie.Extended.Cut.2160p.mkv":       "Extended",
+		"Movie.Directors.Cut.1080p.mkv":      "Director's Cut",
+		"Movie.Theatrical.Edition.1080p.mkv": "Theatrical",
+		"Movie.Special.Edition.1080p.mkv":    "Special Edition",
+	}
+	for input, want := range cases {
+		if got := Parse(input).Edition; got != want {
+			t.Errorf("Parse(%q).Edition = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func containsAll(haystack, needles []string) bool {
 	for _, n := range needles {
 		found := false

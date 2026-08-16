@@ -1,6 +1,10 @@
 package model
 
-import "github.com/streammux/streammux/internal/domain/constants"
+import (
+	"strconv"
+
+	"github.com/streammux/streammux/internal/domain/constants"
+)
 
 type Service struct {
 	ID          string            `json:"id"`
@@ -34,6 +38,7 @@ type ParsedFile struct {
 	Resolution    string   `json:"resolution"`
 	Quality       string   `json:"quality"`
 	Encode        string   `json:"encode"`
+	Edition       string   `json:"edition,omitempty"`
 	VisualTags    []string `json:"visualTags"`
 	AudioTags     []string `json:"audioTags"`
 	AudioChannels []string `json:"audioChannels"`
@@ -51,6 +56,19 @@ type CollectedStream struct {
 	Size          int64      `json:"size"`
 	IsDubbed      bool       `json:"isDubbed"`
 	Language      string     `json:"language"`
+}
+
+// SourceKey identifies the underlying media without resolving it. It is stable
+// across signed debrid URLs when the addon supplies an info hash.
+func (s CollectedStream) SourceKey() string {
+	if s.Stream.InfoHash != "" {
+		index := ""
+		if s.Stream.FileIdx != nil {
+			index = strconv.Itoa(*s.Stream.FileIdx)
+		}
+		return "torrent:" + s.Stream.InfoHash + ":" + index
+	}
+	return "url:" + s.Stream.URL
 }
 
 type Stream struct {
@@ -73,39 +91,55 @@ type StremioStream struct {
 	BehaviorHints map[string]any `json:"behaviorHints,omitempty"`
 }
 
+type PlaybackPlanKind string
+
+const (
+	PlanDualSource        PlaybackPlanKind = "dual-source"
+	PlanSingleSource      PlaybackPlanKind = "single-source"
+	PlanSubtitledFallback PlaybackPlanKind = "subtitled-fallback"
+)
+
+// PlaybackPlan is an ordered, immutable playback option. Plans are tried in
+// order by the startup coordinator. A zero Audio value means the plan uses the
+// first/default audio stream from Video, which is reserved for the final
+// subtitled fallback.
+type PlaybackPlan struct {
+	ID             string
+	Kind           PlaybackPlanKind
+	Video          CollectedStream
+	Audio          CollectedStream
+	HasTargetAudio bool
+	VideoScore     int
+	AudioScore     int
+}
+
+func (p PlaybackPlan) VideoURL() string { return p.Video.Stream.URL }
+
+func (p PlaybackPlan) AudioURL() string {
+	if p.Audio.Stream.URL != "" {
+		return p.Audio.Stream.URL
+	}
+	return p.Video.Stream.URL
+}
+
+func (p PlaybackPlan) SingleSource() bool {
+	if p.Audio.Stream.URL == "" && p.Audio.Stream.InfoHash == "" {
+		return true
+	}
+	return p.Audio.SourceKey() == p.Video.SourceKey()
+}
+
 type MuxJob struct {
-	ID             string `json:"id"`
-	VideoURL       string `json:"videoUrl"`
-	AudioURL       string `json:"audioUrl"`
-	TargetLanguage string `json:"targetLanguage"`
-	Title          string `json:"title"`
+	ID             string         `json:"id"`
+	TargetLanguage string         `json:"targetLanguage"`
+	Title          string         `json:"title"`
+	Plans          []PlaybackPlan `json:"-"`
+	Config         Config         `json:"-"`
 
-	// Runtime fields (not serialized):
-	Duration      float64 `json:"-"` // probed once, cached
-	CacheDir      string  `json:"-"` // temp dir for cached segments
-	PlaylistReady bool    `json:"-"` // playlist has been written
-
-	// AudioTrackIndex is the numeric index of the target-language audio track
-	// (resolved once by probing the audio source). -1 when unknown.
-	AudioTrackIndex int `json:"-"`
-
-	// Resolved URLs (not serialized). Addon URLs redirect through a debrid
-	// proxy (e.g. torrentio → torbox API → CDN) that is slow to re-resolve on
-	// every request. We resolve once and use the final CDN URL directly, which
-	// supports HTTP Range and answers in milliseconds.
-	VideoResolved string `json:"-"`
-	AudioResolved string `json:"-"`
-
-	// AudioCandidates (not serialized) is the ordered list of audio source URLs
-	// to try, best first. Debrid sources sometimes return a short error video
-	// (no audio track) instead of the real file; we fall back through this
-	// list until one yields a usable audio track.
-	AudioCandidates []string `json:"-"`
-
-	// VideoCandidates (not serialized) is the ordered list of video source URLs
-	// to try, best first, excluding the primary. Used when the primary video is
-	// a broken debrid response (e.g. a short trailer instead of the movie).
-	VideoCandidates []string `json:"-"`
+	// Runtime fields are managed by the muxer and never serialized.
+	CacheDir      string  `json:"-"`
+	Duration      float64 `json:"-"`
+	PlaylistReady bool    `json:"-"`
 }
 
 type Manifest struct {

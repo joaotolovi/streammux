@@ -3,60 +3,82 @@ package muxer
 import (
 	"context"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/streammux/streammux/internal/application/analyzer"
 	"github.com/streammux/streammux/internal/application/collector"
 	"github.com/streammux/streammux/internal/application/ffmpeg"
+	"github.com/streammux/streammux/internal/application/planner"
 	"github.com/streammux/streammux/internal/application/resolver"
-	"github.com/streammux/streammux/internal/domain/constants"
 	"github.com/streammux/streammux/internal/domain/model"
 	"github.com/streammux/streammux/internal/domain/ports"
 )
 
+type streamCollector interface {
+	CollectStreams(context.Context, []model.Addon, string, string) []model.CollectedStream
+}
+
+type playbackPlanner interface {
+	Build([]model.CollectedStream, string) []model.PlaybackPlan
+}
+
+type mediaEngine interface {
+	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
+	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
+}
+
+// Policy groups the small number of operational deadlines used during startup
+// and recovery. They are intentionally internal defaults rather than user-facing
+// knobs until measurements from real Stremio clients justify configuration.
+type Policy struct {
+	StartupTimeout    time.Duration
+	AttemptTimeout    time.Duration
+	FallbackDelay     time.Duration
+	SegmentTimeout    time.Duration
+	IdleTimeout       time.Duration
+	HealthWindow      time.Duration
+	RecoveryCooldown  time.Duration
+	MinRealtime       float64
+	MinPublishedAhead time.Duration
+	DurationTolerance float64
+}
+
+func defaultPolicy() Policy {
+	return Policy{
+		StartupTimeout:    12 * time.Second,
+		AttemptTimeout:    7 * time.Second,
+		FallbackDelay:     1500 * time.Millisecond,
+		SegmentTimeout:    20 * time.Second,
+		IdleTimeout:       90 * time.Second,
+		HealthWindow:      12 * time.Second,
+		RecoveryCooldown:  30 * time.Second,
+		MinRealtime:       0.95,
+		MinPublishedAhead: 12 * time.Second,
+		DurationTolerance: 0.001,
+	}
+}
+
 type Muxer struct {
-	collector *collector.Collector
-	analyzer  *analyzer.Analyzer
-	ffmpeg    *ffmpeg.Muxer
+	collector streamCollector
+	planner   playbackPlanner
+	ffmpeg    mediaEngine
+	resolver  *resolver.Resolver
 	store     ports.MuxStore
+	baseURL   string
+	policy    Policy
 
-	// baseURL is the public origin (e.g. https://mystreamux.joaotolovi.com)
-	// used to build absolute URLs for muxed streams so players resolve them
-	// reliably. Empty falls back to a path-relative URL.
-	baseURL string
-
-	// httpClient follows redirects to resolve addon URLs into their final CDN
-	// URLs. Addon URLs redirect through a slow debrid proxy; the final CDN URL
-	// supports Range and answers in milliseconds.
 	httpClient *http.Client
 
-	// playlistMu serializes playlist generation per job so concurrent requests
-	// don't race on CacheDir/PlaylistReady.
-	playlistMu sync.Mutex
+	stateMu sync.Mutex
+	states  map[string]*playbackState
 
-	// resolveMu serializes URL resolution so a slow debrid redirect chain is
-	// only walked once, even under concurrent segment requests.
-	resolveMu sync.Mutex
-
-	// sessMu guards sessions and sessionAccess.
-	sessMu sync.Mutex
-
-	// sessions holds the active continuous ffmpeg session per job. There is at
-	// most one per job: it produces segments sequentially and is restarted only
-	// on seek outside its generated range.
-	sessions map[string]*ffmpeg.Session
-
-	// sessionAccess records the last segment request time per job, used to
-	// reap sessions when the player goes away (closing the app) instead of
-	// letting ffmpeg keep downloading the whole film for up to the job TTL.
-	sessionAccess map[string]time.Time
+	cacheMu        sync.Mutex
+	resolved       map[string]resolvedEntry
+	resolveFlights map[string]*resolveFlight
+	probes         map[string]probeEntry
+	probeFlights   map[string]*probeFlight
 }
 
 type Result struct {
@@ -64,717 +86,144 @@ type Result struct {
 	Subtitled *model.StremioStream
 }
 
-func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
+func New(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
 	m := &Muxer{
-		collector: col,
-		analyzer:  an,
-		ffmpeg:    ff,
-		store:     store,
-		baseURL:   strings.TrimSuffix(baseURL, "/"),
-		httpClient: &http.Client{
-			Timeout: 90 * time.Second,
-		},
-		sessions:      make(map[string]*ffmpeg.Session),
-		sessionAccess: make(map[string]time.Time),
+		collector:      col,
+		planner:        pl,
+		ffmpeg:         ff,
+		resolver:       res,
+		store:          store,
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		policy:         defaultPolicy(),
+		httpClient:     &http.Client{Timeout: 12 * time.Second},
+		states:         make(map[string]*playbackState),
+		resolved:       make(map[string]resolvedEntry),
+		resolveFlights: make(map[string]*resolveFlight),
+		probes:         make(map[string]probeEntry),
+		probeFlights:   make(map[string]*probeFlight),
 	}
 	go m.reapIdleSessions()
 	return m
 }
 
-// sessionIdleTimeout is how long a continuous session is kept after its last
-// segment request. If the player closes, the session is cancelled so ffmpeg
-// stops downloading the film instead of running until the job TTL.
-const sessionIdleTimeout = 60 * time.Second
-
-// reapIdleSessions periodically cancels sessions that have had no segment
-// request for sessionIdleTimeout. Runs for the lifetime of the process.
-func (m *Muxer) reapIdleSessions() {
-	t := time.NewTicker(20 * time.Second)
-	defer t.Stop()
-	for range t.C {
-		m.sessMu.Lock()
-		now := time.Now()
-		for jobID, sess := range m.sessions {
-			last, ok := m.sessionAccess[jobID]
-			if ok && now.Sub(last) > sessionIdleTimeout {
-				sess.Cancel()
-				delete(m.sessions, jobID)
-				delete(m.sessionAccess, jobID)
-				log.Printf("mux: session for job %s idle, cancelled", jobID)
-			}
-		}
-		m.sessMu.Unlock()
-	}
-}
-
-// browserUA is the User-Agent sent on resolution/measurement requests. Debrid
-// proxies reject the Go default UA.
-const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-
+// Process performs only addon collection and inexpensive metadata planning.
+// Network resolution, probing and FFmpeg work remain lazy until the user plays.
 func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, contentID string) (*Result, error) {
-	videoAddons := cfg.AddonsByRole(constants.RoleVideo)
-	audioAddons := cfg.AddonsByRole(constants.RoleAudio)
-
-	var allAddons []model.Addon
-	allAddons = append(allAddons, videoAddons...)
-	allAddons = append(allAddons, audioAddons...)
-
-	if len(allAddons) == 0 {
+	addons := uniqueAddons(cfg.ValidAddons())
+	if len(addons) == 0 {
 		return &Result{}, nil
 	}
 
-	// Collect and parse streams from all configured addons. This is the only
-	// network work done at listing time — no ffprobe, no debrid resolution.
-	// Those happen lazily when the user actually plays the muxed stream.
-	streams := m.collector.CollectStreams(ctx, allAddons, contentType, contentID)
-	if len(streams) == 0 {
+	streams := m.collector.CollectStreams(ctx, addons, contentType, contentID)
+	plans := m.planner.Build(streams, cfg.Language)
+	if len(plans) == 0 {
 		return &Result{}, nil
 	}
 
 	result := &Result{}
-
-	bestVideo, bestAudioDubbed := m.selectPair(streams, cfg.Language)
-
-	if bestVideo != nil {
-		videoLang := bestVideo.Language
-		if videoLang == "" {
-			videoLang = "English"
+	if subtitle, ok := firstPlan(plans, func(plan model.PlaybackPlan) bool {
+		return plan.Kind == model.PlanSubtitledFallback
+	}); ok {
+		language := subtitle.Video.Language
+		if language == "" {
+			language = "English"
 		}
 		result.Subtitled = directStream(
-			fmt.Sprintf("🎞️ Legendado — %s %s", bestVideo.Parsed.Resolution, bestVideo.Parsed.Quality),
-			fmt.Sprintf("Fonte: %s | %s", bestVideo.AddonName, videoLang),
-			bestVideo.Stream,
+			fmt.Sprintf("🎞️ Legendado — %s %s", subtitle.Video.Parsed.Resolution, subtitle.Video.Parsed.Quality),
+			fmt.Sprintf("Fonte: %s | %s", subtitle.Video.AddonName, language),
+			subtitle.Video.Stream,
 		)
 	}
 
-	if bestAudioDubbed != nil && bestVideo != nil {
-		videoURL := bestVideo.Stream.URL
-		audioURL := bestAudioDubbed.Stream.URL
+	primary, hasDubbed := firstPlan(plans, func(plan model.PlaybackPlan) bool {
+		return plan.HasTargetAudio
+	})
+	if !hasDubbed {
+		return result, nil
+	}
 
-		if videoURL != "" && audioURL != "" {
-			// Always schedule a remux so the player automatically gets the
-			// user's target-language audio track (the source's default track
-			// is usually English). Single-source when video and audio come
-			// from the same URL (one HTTP connection), two-source otherwise.
-			job := &model.MuxJob{
-				VideoURL:         videoURL,
-				AudioURL:         audioURL,
-				TargetLanguage:   cfg.Language,
-				Title:            fmt.Sprintf("%s + %s", bestVideo.AddonName, bestAudioDubbed.AddonName),
-				VideoCandidates:  m.videoCandidates(streams, videoURL),
-				AudioCandidates:  m.audioCandidates(streams, cfg.Language),
-				AudioTrackIndex:  -1,
-			}
-			jobID := m.store.Save(job)
-			result.Dubbed = &model.StremioStream{
-				Name:        fmt.Sprintf("🎬 Dublado — %s %s + Áudio %s", bestVideo.Parsed.Resolution, bestVideo.Parsed.Quality, cfg.Language),
-				Description: fmt.Sprintf("Vídeo: %s (%s) | Áudio: %s | Remux", bestVideo.AddonName, bestVideo.Parsed.Resolution, bestAudioDubbed.AddonName),
-				URL:         m.muxURL(jobID),
-				BehaviorHints: map[string]any{
-					"notWebReady": true,
-				},
-			}
-		} else {
-			result.Dubbed = directStream(
-				fmt.Sprintf("🔊 Dublado — %s %s", bestAudioDubbed.Parsed.Resolution, bestAudioDubbed.Parsed.Quality),
-				fmt.Sprintf("Fonte: %s | Sem remux (já dublado)", bestAudioDubbed.AddonName),
-				bestAudioDubbed.Stream,
-			)
-		}
+	job := &model.MuxJob{
+		TargetLanguage: cfg.Language,
+		Title:          primary.Video.AddonName + " + " + primary.Audio.AddonName,
+		Plans:          plans,
+		Config:         *cfg,
+	}
+	jobID := m.store.Save(job)
+
+	mode := "Remux"
+	if primary.SingleSource() {
+		mode = "Fonte única"
+	}
+	result.Dubbed = &model.StremioStream{
+		Name: fmt.Sprintf(
+			"🎬 Dublado — %s %s + Áudio %s",
+			primary.Video.Parsed.Resolution,
+			primary.Video.Parsed.Quality,
+			cfg.Language,
+		),
+		Description: fmt.Sprintf(
+			"Vídeo: %s (%s) | Áudio: %s | %s com fallback automático",
+			primary.Video.AddonName,
+			primary.Video.Parsed.Resolution,
+			primary.Audio.AddonName,
+			mode,
+		),
+		URL: m.muxURL(jobID),
+		BehaviorHints: map[string]any{
+			"notWebReady": true,
+		},
 	}
 
 	return result, nil
 }
 
-// muxURL builds the absolute URL of the HLS playlist for a job.
+func uniqueAddons(addons []model.Addon) []model.Addon {
+	seen := make(map[string]struct{}, len(addons))
+	out := make([]model.Addon, 0, len(addons))
+	for _, addon := range addons {
+		key := addon.ID + "\x00" + addon.ManifestURL
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, addon)
+	}
+	return out
+}
+
+func firstPlan(plans []model.PlaybackPlan, matches func(model.PlaybackPlan) bool) (model.PlaybackPlan, bool) {
+	for _, plan := range plans {
+		if matches(plan) {
+			return plan, true
+		}
+	}
+	return model.PlaybackPlan{}, false
+}
+
 func (m *Muxer) muxURL(jobID string) string {
-	u := "/mux/" + jobID + "/playlist.m3u8"
-	if m.baseURL != "" {
-		u = m.baseURL + u
+	path := "/mux/" + jobID + "/playlist.m3u8"
+	if m.baseURL == "" {
+		return path
 	}
-	return u
+	return m.baseURL + path
 }
 
-// audioCandidates returns the ordered list of audio source URLs (best first)
-// that match the target language, excluding the primary choice. Used as a
-// fallback when a debrid source returns a broken/error video with no audio.
-// Limited to a few candidates to avoid hammering the debrid proxy with a probe
-// per stream (which is what triggered rate-limits).
-func (m *Muxer) audioCandidates(streams []model.CollectedStream, targetLanguage string) []string {
-	ranked := m.analyzer.RankAudio(streams, targetLanguage)
-	var out []string
-	seen := map[string]bool{}
-	for i := range ranked {
-		u := ranked[i].Stream.Stream.URL
-		if u == "" || seen[u] {
-			continue
-		}
-		seen[u] = true
-		// Skip the primary (first) candidate — it's already job.AudioURL.
-		if i == 0 {
-			continue
-		}
-		out = append(out, u)
-		if len(out) >= 2 {
-			break
-		}
-	}
-	return out
+// DirectFallbackError tells the HTTP layer that every bounded HLS startup
+// attempt failed, but a direct source remains available as the last-resort path.
+type DirectFallbackError struct {
+	URL string
+	Err error
 }
 
-// videoCandidates returns the ordered list of video source URLs (best first),
-// excluding the primary choice. Used as a fallback when the primary video is a
-// broken debrid response (e.g. a short trailer instead of the movie).
-// Limited to a few candidates to avoid hammering the debrid proxy with a probe
-// per stream (which is what triggered rate-limits).
-func (m *Muxer) videoCandidates(streams []model.CollectedStream, primaryURL string) []string {
-	ranked := m.analyzer.RankVideo(streams)
-	var out []string
-	seen := map[string]bool{}
-	for i := range ranked {
-		u := ranked[i].Stream.Stream.URL
-		if u == "" || seen[u] {
-			continue
-		}
-		seen[u] = true
-		if u == primaryURL {
-			continue
-		}
-		out = append(out, u)
-		if len(out) >= 2 {
-			break
-		}
+func (e *DirectFallbackError) Error() string {
+	if e.Err == nil {
+		return "direct playback fallback required"
 	}
-	return out
+	return "direct playback fallback required: " + e.Err.Error()
 }
 
-func truncate(s string) string {
-	if len(s) > 70 {
-		return s[:70] + "..."
-	}
-	return s
-}
+func (e *DirectFallbackError) Unwrap() error { return e.Err }
 
-// selectPair picks the best video and best dubbed audio using filename parsing
-// only (no ffprobe). It filters candidates by addon role and, for audio, by the
-// target language.
-func (m *Muxer) selectPair(streams []model.CollectedStream, targetLanguage string) (*model.CollectedStream, *model.CollectedStream) {
-	var bestVideo, bestAudio *model.CollectedStream
-
-	videoRanked := m.analyzer.RankVideo(streams)
-	for i := range videoRanked {
-		if videoRanked[i].Stream.Stream.URL != "" {
-			bestVideo = &videoRanked[i].Stream
-			break
-		}
-	}
-
-	audioRanked := m.analyzer.RankAudio(streams, targetLanguage)
-	for i := range audioRanked {
-		if audioRanked[i].Stream.Stream.URL != "" {
-			bestAudio = &audioRanked[i].Stream
-			break
-		}
-	}
-
-	return bestVideo, bestAudio
-}
-
-// EnsurePlaylist makes sure the job has a cache dir and a static .m3u8 playlist.
-// The duration is probed once and cached on the job. The playlist is generated
-// by code (not FFmpeg) with #EXT-X-ENDLIST, so the player shows the full seek
-// bar immediately.
-func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
-	if job.PlaylistReady {
-		return nil
-	}
-
-	m.playlistMu.Lock()
-	defer m.playlistMu.Unlock()
-
-	// Re-check after acquiring the lock (another request may have finished).
-	if job.PlaylistReady {
-		return nil
-	}
-
-	if job.CacheDir == "" {
-		dir, err := os.MkdirTemp("", "streammux-*")
-		if err != nil {
-			return fmt.Errorf("create cache dir: %w", err)
-		}
-		job.CacheDir = dir
-	}
-
-	// Pick a valid video source and probe its duration once. Debrid proxies
-	// sometimes return a short trailer/preview instead of the real file; if the
-	// probed duration is implausibly short for a movie/series (or probing
-	// fails), fall back through the ordered video candidates. Each candidate is
-	// resolved to its CDN URL before probing.
-	//
-	// We also check whether the source's sustained throughput can keep up with
-	// the chosen video's bitrate. If not, we walk down the quality list to the
-	// best source that the connection can actually sustain — a 4K REMUX that a
-	// slow CDN can't deliver in real time would otherwise freeze playback.
-	if job.Duration == 0 {
-		dur, chosen := m.pickVideoSource(ctx, job)
-		job.Duration = dur
-		if chosen != "" && chosen != job.VideoURL {
-			job.VideoURL = chosen
-			job.VideoResolved = ""
-			log.Printf("mux: video switched to %s", truncate(chosen))
-		}
-	}
-
-	// Resolve the target-language audio source once, by probing each candidate
-	// and picking the best one that is a real file (not a broken debrid
-	// response like static/500.mp4) and yields an audio track. Validating here
-	// (not during every segment) avoids stalling generation on a broken source.
-	if job.AudioTrackIndex < 0 && job.AudioURL != "" {
-		chosen, trackIdx := m.pickAudioSource(ctx, job)
-		if chosen != "" {
-			job.AudioURL = chosen
-			job.AudioResolved = ""
-			job.AudioTrackIndex = trackIdx
-			log.Printf("mux: audio source chosen for job %s", truncate(chosen))
-		} else {
-			log.Printf("mux: no valid audio source for job %s, using primary", job.ID)
-			job.AudioTrackIndex = 0
-		}
-	}
-
-	segDur := ffmpeg.SegDuration()
-	count := int(job.Duration / segDur)
-	if job.Duration > float64(count)*segDur {
-		count++
-	}
-
-	var b strings.Builder
-	b.WriteString("#EXTM3U\n#EXT-X-VERSION:3\n")
-	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(segDur)))
-	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
-	for i := 0; i < count; i++ {
-		end := float64(i+1) * segDur
-		d := segDur
-		if end > job.Duration {
-			d = job.Duration - float64(i)*segDur
-		}
-		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\nseg_%05d.ts\n", d, i))
-	}
-	b.WriteString("#EXT-X-ENDLIST\n")
-
-	if err := os.WriteFile(filepath.Join(job.CacheDir, "playlist.m3u8"), []byte(b.String()), 0644); err != nil {
-		return fmt.Errorf("write playlist: %w", err)
-	}
-
-	job.PlaylistReady = true
-	return nil
-}
-
-// PlaylistPath returns the filesystem path to the playlist, or empty if not ready.
-func (m *Muxer) PlaylistPath(job *model.MuxJob) string {
-	if job.CacheDir == "" || !job.PlaylistReady {
-		return ""
-	}
-	return filepath.Join(job.CacheDir, "playlist.m3u8")
-}
-
-// SegmentPath returns the filesystem path for a cached segment, or empty if
-// not yet generated.
-func (m *Muxer) SegmentPath(job *model.MuxJob, segIndex int) string {
-	if job.CacheDir == "" {
-		return ""
-	}
-	p := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
-	if _, err := os.Stat(p); err != nil {
-		return ""
-	}
-	return p
-}
-
-// EnsureSegment returns the path of a generated segment, starting or restarting
-// the continuous ffmpeg session for the job as needed and waiting for the
-// segment to be written.
-//
-// Architecture: one ffmpeg session per playback produces segments sequentially
-// (single -ss up front; both sources read in lockstep). This avoids the
-// per-segment reconnect/seek cost and the A/V drift that came from running a
-// fresh ffmpeg per segment. The session is restarted only when the requested
-// segment is outside the range it has generated so far (a seek).
-func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segIndex int) (string, error) {
-	if job.CacheDir == "" {
-		if err := m.EnsurePlaylist(ctx, job); err != nil {
-			return "", err
-		}
-	}
-
-	// Track session activity so idle sessions are reaped when the player goes
-	// away (rather than letting ffmpeg download the whole film for the job TTL).
-	m.sessMu.Lock()
-	m.sessionAccess[job.ID] = time.Now()
-	m.sessMu.Unlock()
-
-	// If the segment already exists, serve it.
-	if p := m.SegmentPath(job, segIndex); p != "" {
-		return p, nil
-	}
-
-	// Determine whether to (re)start the session for this segment.
-	if err := m.ensureSession(ctx, job, segIndex); err != nil {
-		return "", err
-	}
-
-	// Wait for the segment to be produced.
-	segPath := filepath.Join(job.CacheDir, fmt.Sprintf("seg_%05d.ts", segIndex))
-	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	for {
-		if _, err := os.Stat(segPath); err == nil {
-			return segPath, nil
-		}
-		select {
-		case <-waitCtx.Done():
-			return "", fmt.Errorf("timeout waiting for segment %d", segIndex)
-		case <-time.After(300 * time.Millisecond):
-		}
-	}
-}
-
-// ensureSession starts a continuous ffmpeg session for the job, restarting the
-// existing one if the requested segment is behind where it started (seek back).
-// Forward seeks are served by waiting: the session generates sequentially, so
-// it will reach a forward segment in time.
-func (m *Muxer) ensureSession(ctx context.Context, job *model.MuxJob, segIndex int) error {
-	audioTrack := job.AudioTrackIndex
-	if audioTrack < 0 {
-		audioTrack = 0
-	}
-
-	videoURL := m.resolvedURL(ctx, job, "video")
-	if videoURL == "" {
-		return fmt.Errorf("no resolvable video source")
-	}
-	audioURL := m.resolvedURL(ctx, job, "audio")
-	if audioURL == "" {
-		return fmt.Errorf("no resolvable audio source")
-	}
-
-	m.sessMu.Lock()
-	defer m.sessMu.Unlock()
-
-	sess, ok := m.sessions[job.ID]
-	if ok && sess != nil {
-		// Session is running and this segment is at/after its start point: keep
-		// it (ffmpeg will produce it). Only restart for seek-back.
-		if segIndex >= sess.StartN() {
-			return nil
-		}
-		// Seek back: kill and restart from the new position.
-		sess.Cancel()
-		delete(m.sessions, job.ID)
-	}
-
-	newSess, err := m.ffmpeg.StartSession(context.Background(), videoURL, audioURL, audioTrack, segIndex, job.CacheDir)
-	if err != nil {
-		return err
-	}
-	m.sessions[job.ID] = newSess
-	return nil
-}
-
-// pickAudioSource walks the audio candidates and returns the first source that
-// is a real file (probe succeeds) and contains an audio track. It also returns
-// the numeric index of the target-language track (falling back to 0). Debrid
-// proxies sometimes return a broken response (e.g. static/500.mp4) that would
-// otherwise stall every segment's ffmpeg run until timeout.
-func (m *Muxer) pickAudioSource(ctx context.Context, job *model.MuxJob) (string, int) {
-	code := ffmpeg.LanguageCode(job.TargetLanguage)
-
-	sources := append([]string{job.AudioURL}, job.AudioCandidates...)
-	for i, u := range sources {
-		if u == "" {
-			continue
-		}
-		var resolved string
-		if i == 0 {
-			resolved = m.resolvedURL(ctx, job, "audio")
-		} else {
-			resolved = m.resolveOne(ctx, u)
-		}
-		if resolved == "" {
-			log.Printf("mux: audio source %d failed to resolve, skipping", i)
-			continue
-		}
-
-		res, err := m.ffmpeg.Probe(ctx, resolved)
-		if err != nil {
-			log.Printf("mux: audio probe %d failed: %v", i, err)
-			continue
-		}
-		if len(res.AudioTracks) == 0 {
-			log.Printf("mux: audio source %d has no audio track, skipping", i)
-			continue
-		}
-
-		idx := ffmpeg.AudioTrackIndexByLanguage(res.AudioTracks, code)
-		if idx < 0 {
-			idx = 0
-		}
-		if i > 0 {
-			log.Printf("mux: audio fell back to candidate %d (track %d)", i, idx)
-		}
-		return u, idx
-	}
-	return "", -1
-}
-
-// pickVideoSource walks the video quality list (primary first, then candidates
-// in ranked order) and returns the duration and best source URL that is both a
-// real file (duration plausible) and sustainable by the source's throughput.
-//
-// Debrid proxies sometimes return a short trailer instead of the movie, and a
-// 4K REMUX may need more bandwidth than a slow CDN can deliver in real time —
-// both would freeze playback. So we skip broken/short sources and drop down the
-// quality ladder until the chosen stream fits the measured throughput. If no
-// source is sustainable we still return the best valid one (better to play than
-// nothing), falling back to 7200s duration when nothing probes.
-func (m *Muxer) pickVideoSource(ctx context.Context, job *model.MuxJob) (float64, string) {
-	const minDuration = 600 // 10 minutes; a real movie/series is far longer
-	const sustainFactor = 1.3
-
-	sources := append([]string{job.VideoURL}, job.VideoCandidates...)
-
-	best := struct {
-		dur    float64
-		resolved string
-	}{}
-
-	// Throughput is measured once (on the first resolvable source) and reused
-	// for every candidate — measuring it per candidate multiplied the number of
-	// debrid requests and triggered rate-limits.
-	throughput := 0.0
-
-	for i, u := range sources {
-		if u == "" {
-			continue
-		}
-		var resolved string
-		if i == 0 {
-			resolved = m.resolvedURL(ctx, job, "video")
-		} else {
-			resolved = m.resolveOne(ctx, u)
-		}
-		if resolved == "" {
-			log.Printf("mux: video source %d failed to resolve, skipping", i)
-			continue
-		}
-
-		res, err := m.ffmpeg.Probe(ctx, resolved)
-		if err != nil {
-			log.Printf("mux: video probe %d failed: %v", i, err)
-			continue
-		}
-		if res.Duration < minDuration {
-			log.Printf("mux: video candidate %d too short (%.0fs), skipping", i, res.Duration)
-			continue
-		}
-
-		// Remember the best valid source in case none is sustainable.
-		if best.resolved == "" {
-			best.dur = res.Duration
-			best.resolved = resolved
-		}
-
-		if throughput == 0 {
-			throughput = m.measureThroughput(ctx, resolved)
-			log.Printf("mux: source throughput %.1f Mbps", throughput/1e6)
-		}
-
-		if res.VideoBitrate > 0 && throughput > 0 && throughput >= res.VideoBitrate*sustainFactor {
-			log.Printf("mux: video candidate %d sustainable (%.1f Mbps > %.1f Mbps)", i, throughput/1e6, res.VideoBitrate/1e6)
-			return res.Duration, resolved
-		}
-		if throughput > 0 {
-			log.Printf("mux: video candidate %d too fast for source (%.1f Mbps needed, %.1f Mbps available), trying next", i, res.VideoBitrate/1e6, throughput/1e6)
-		}
-	}
-
-	if best.resolved != "" {
-		log.Printf("mux: no sustainable video, using best valid source")
-		return best.dur, best.resolved
-	}
-
-	log.Printf("mux: no valid video source, using 7200s fallback")
-	return 7200, ""
-}
-
-// measureThroughput estimates the sustained download rate of a source.
-//
-// Debrid URLs start slowly: the proxy assembles the torrent / locates the file
-// before the first byte, which can take 5-20s with zero bytes flowing. Measuring
-// from the start of the request (including that TTFB) wildly under-reports the
-// real throughput, causing good sources to be rejected as "too slow".
-//
-// So we first discard a warm-up chunk (which absorbs the TTFB and the cold start
-// of the CDN/torrent), then measure the time to download a second chunk. That
-// second window reflects the sustained rate.
-func (m *Muxer) measureThroughput(ctx context.Context, url string) float64 {
-	if url == "" {
-		return 0
-	}
-
-	const warmupBytes = 512 * 1024
-	const sampleBytes = 2 * 1024 * 1024
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return 0
-	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", warmupBytes+sampleBytes-1))
-	req.Header.Set("User-Agent", browserUA)
-
-	resp, err := m.httpClient.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-
-	// Discard the warm-up chunk: this absorbs the TTFB (torrent assembly, cold
-	// CDN edge) that otherwise poisons the measurement.
-	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, warmupBytes)); err != nil {
-		return 0
-	}
-
-	start := time.Now()
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, sampleBytes))
-	elapsed := time.Since(start).Seconds()
-	if err != nil || elapsed <= 0 || n == 0 {
-		return 0
-	}
-	return float64(n) / elapsed
-}
-
-// resolveOne follows the redirect chain of a single URL and returns the final
-// CDN URL, or "" on failure. No caching — callers decide whether to cache.
-func (m *Muxer) resolveOne(ctx context.Context, url string) string {
-	if url == "" {
-		return ""
-	}
-	return m.followRedirects(ctx, url)
-}
-
-// resolvedURL returns the final CDN URL for a job source, resolving the addon's
-// redirect chain once and caching the result on the job. Addon URLs point at a
-// debrid proxy that re-resolves the torrent on every request (slow, rate-
-// limited); the final CDN URL supports HTTP Range and answers in milliseconds.
-//
-// On failure it returns "" (never the raw addon URL) so callers skip the source
-// or fail fast instead of handing ffmpeg a URL that will stall on the redirect
-// chain.
-func (m *Muxer) resolvedURL(ctx context.Context, job *model.MuxJob, which string) string {
-	var cached *string
-	var original string
-	switch which {
-	case "video":
-		cached, original = &job.VideoResolved, job.VideoURL
-	case "audio":
-		cached, original = &job.AudioResolved, job.AudioURL
-	default:
-		return ""
-	}
-
-	if *cached != "" {
-		return *cached
-	}
-
-	m.resolveMu.Lock()
-	defer m.resolveMu.Unlock()
-
-	// Re-check under the lock: another request may have resolved it already.
-	if *cached != "" {
-		return *cached
-	}
-
-	final := m.followRedirects(ctx, original)
-	if final == "" {
-		return ""
-	}
-	*cached = final
-	return final
-}
-
-// followRedirects issues a range request and returns the final URL after
-// following redirects, or "" on failure. Transient errors (429/5xx) are
-// retried a few times with a short backoff, since debrid proxies are flaky.
-func (m *Muxer) followRedirects(ctx context.Context, url string) string {
-	const attempts = 3
-	for i := 0; i < attempts; i++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return ""
-		}
-		req.Header.Set("Range", "bytes=0-0")
-		req.Header.Set("User-Agent", browserUA)
-
-		resp, err := m.httpClient.Do(req)
-		if err != nil {
-			if i < attempts-1 {
-				if !sleepCtx(ctx, time.Duration(i+1)*time.Second) {
-					return ""
-				}
-				continue
-			}
-			return ""
-		}
-
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
-		resp.Body.Close()
-
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			if i < attempts-1 {
-				if !sleepCtx(ctx, time.Duration(i+1)*time.Second) {
-					return ""
-				}
-				continue
-			}
-			return ""
-		}
-
-		if resp.Request == nil || resp.Request.URL == nil {
-			return ""
-		}
-		return resp.Request.URL.String()
-	}
-	return ""
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
-}
-
-// CleanupJob removes the temp cache directory for a job.
-func (m *Muxer) CleanupJob(job *model.MuxJob) {
-	m.sessMu.Lock()
-	if sess, ok := m.sessions[job.ID]; ok {
-		sess.Cancel()
-		delete(m.sessions, job.ID)
-	}
-	delete(m.sessionAccess, job.ID)
-	m.sessMu.Unlock()
-	if job.CacheDir != "" {
-		os.RemoveAll(job.CacheDir)
-	}
-}
-
-// directStream builds a StremioStream pointing at the source stream. When the
-// source has a direct URL it is used; otherwise the infoHash is preserved so
-// Stremio can resolve it itself.
 func directStream(name, description string, src model.Stream) *model.StremioStream {
 	out := &model.StremioStream{Name: name, Description: description}
 	if src.URL != "" {

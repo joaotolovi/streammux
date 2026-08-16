@@ -110,6 +110,17 @@ var (
 		"DivX": createRegex(`divx|dvix`),
 	}
 
+	editionRegexes = map[string]*regexp2.Regexp{
+		"Director's Cut":  createRegex(`director'?s?[ .\-_]?cut`),
+		"Extended":        createRegex(`extended([ .\-_]?(cut|edition))?`),
+		"Theatrical":      createRegex(`theatrical([ .\-_]?(cut|edition))?`),
+		"Unrated":         createRegex(`unrated`),
+		"Uncut":           createRegex(`uncut`),
+		"Final Cut":       createRegex(`final[ .\-_]?cut`),
+		"Redux":           createRegex(`redux`),
+		"Special Edition": createRegex(`special[ .\-_]?edition`),
+	}
+
 	languageRegexes = map[string]*regexp2.Regexp{
 		"Multi":               createLanguageRegex(`multi`),
 		"Dual Audio":          createLanguageRegex(`dual[ .\-_]?(audio|lang(uage)?|flac|ac3|aac2?)?`),
@@ -235,6 +246,7 @@ var (
 	resolutionOrder = []string{"2160p", "1440p", "1080p", "720p", "576p", "480p", "360p", "240p", "144p"}
 	qualityOrder    = []string{"BluRay REMUX", "BluRay", "WEB-DL", "WEBRip", "HDRip", "HC HD-Rip", "DVD REMUX", "DVDRip", "HDTV", "CAM", "TS", "TC", "SCR"}
 	encodeOrder     = []string{"AV1", "HEVC", "AVC", "VC-1", "XviD", "DivX"}
+	editionOrder    = []string{"Director's Cut", "Extended", "Theatrical", "Unrated", "Uncut", "Final Cut", "Redux", "Special Edition"}
 )
 
 func Parse(input string) model.ParsedFile {
@@ -252,6 +264,7 @@ func Parse(input string) model.ParsedFile {
 	p.Resolution = matchOrdered(resolutionOrder, resolutionRegexes, s, "Unknown")
 	p.Quality = matchOrdered(qualityOrder, qualityRegexes, s, "Unknown")
 	p.Encode = matchOrdered(encodeOrder, encodeRegexes, s, "Unknown")
+	p.Edition = matchOrdered(editionOrder, editionRegexes, s, "")
 
 	p.VisualTags = matchAllMap(visualTagRegexes, s)
 	p.AudioTags = matchAllMap(audioTagRegexes, s)

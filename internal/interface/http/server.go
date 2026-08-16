@@ -2,6 +2,7 @@ package http
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -68,6 +69,14 @@ func (s *Server) routes() {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range")
+	w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -152,10 +161,18 @@ func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate the static playlist (probes duration once, cached on the job).
+	// Start the bounded playback race. If every HLS plan misses the startup
+	// budget, redirect to the best direct source rather than leaving the player
+	// with a dead stream.
 	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		var direct *muxer.DirectFallbackError
+		if errors.As(err, &direct) && direct.URL != "" {
+			log.Printf("mux playlist: using direct fallback after HLS startup failure: %v", err)
+			http.Redirect(w, r, direct.URL, http.StatusTemporaryRedirect)
+			return
+		}
 		log.Printf("mux playlist: %v", err)
-		writeError(w, http.StatusInternalServerError, "playlist generation failed")
+		writeError(w, http.StatusBadGateway, "no playable source started in time")
 		return
 	}
 
@@ -198,14 +215,14 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	// the segment to be written.
 	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
 		log.Printf("mux segment: %v", err)
-		writeError(w, http.StatusInternalServerError, "segment generation failed")
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
 		return
 	}
 
 	segPath, err := s.muxer.EnsureSegment(r.Context(), job, segIndex)
 	if err != nil {
 		log.Printf("mux segment %d: %v", segIndex, err)
-		writeError(w, http.StatusInternalServerError, "segment generation failed")
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
 		return
 	}
 

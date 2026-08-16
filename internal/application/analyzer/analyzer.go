@@ -24,14 +24,17 @@ func (a *Analyzer) RankVideo(streams []model.CollectedStream) []RankedStream {
 		if s.AddonRole != "" && s.AddonRole != constants.RoleVideo && s.AddonRole != constants.RoleBoth {
 			continue
 		}
-		score := scoreVideo(s)
+		score := VideoScore(s)
 		ranked = append(ranked, RankedStream{Stream: s, VideoScore: score})
 	}
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].VideoScore != ranked[j].VideoScore {
 			return ranked[i].VideoScore > ranked[j].VideoScore
 		}
-		return ranked[i].Stream.Size > ranked[j].Stream.Size
+		if ranked[i].Stream.Size != ranked[j].Stream.Size {
+			return ranked[i].Stream.Size > ranked[j].Stream.Size
+		}
+		return stableKey(ranked[i].Stream) < stableKey(ranked[j].Stream)
 	})
 	return ranked
 }
@@ -43,17 +46,20 @@ func (a *Analyzer) RankAudio(streams []model.CollectedStream, targetLanguage str
 		if s.AddonRole != "" && s.AddonRole != constants.RoleAudio && s.AddonRole != constants.RoleBoth {
 			continue
 		}
-		if !matchesLanguage(s, targetLanguage) {
+		if !MatchesLanguage(s, targetLanguage) {
 			continue
 		}
-		score := scoreAudio(s)
+		score := AudioScore(s)
 		ranked = append(ranked, RankedStream{Stream: s, AudioScore: score})
 	}
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].AudioScore != ranked[j].AudioScore {
 			return ranked[i].AudioScore > ranked[j].AudioScore
 		}
-		return ranked[i].Stream.Size > ranked[j].Stream.Size
+		if ranked[i].Stream.Size != ranked[j].Stream.Size {
+			return ranked[i].Stream.Size > ranked[j].Stream.Size
+		}
+		return stableKey(ranked[i].Stream) < stableKey(ranked[j].Stream)
 	})
 	return ranked
 }
@@ -74,7 +80,9 @@ func (a *Analyzer) BestAudio(streams []model.CollectedStream, targetLanguage str
 	return &ranked[0].Stream
 }
 
-func scoreVideo(s model.CollectedStream) int {
+// VideoScore returns the intrinsic picture-quality score. Addon roles are
+// intentionally not part of this score; planners use them as preferences.
+func VideoScore(s model.CollectedStream) int {
 	score := 0
 	score += getScore(constants.ResolutionScores, s.Parsed.Resolution)
 	score += getScore(constants.QualityScores, s.Parsed.Quality)
@@ -92,7 +100,8 @@ func scoreVideo(s model.CollectedStream) int {
 	return score
 }
 
-func scoreAudio(s model.CollectedStream) int {
+// AudioScore returns the intrinsic audio-quality score.
+func AudioScore(s model.CollectedStream) int {
 	score := 0
 	for _, tag := range s.Parsed.AudioTags {
 		score += getScore(constants.AudioTagScores, tag)
@@ -110,7 +119,9 @@ func scoreAudio(s model.CollectedStream) int {
 	return score
 }
 
-func matchesLanguage(s model.CollectedStream, target string) bool {
+// MatchesLanguage reports whether inexpensive addon metadata identifies the
+// target language. FFprobe remains authoritative before a mux starts.
+func MatchesLanguage(s model.CollectedStream, target string) bool {
 	// The addon's configured language is the strongest signal — the user
 	// explicitly marked this addon as a dubbed source.
 	if s.AddonLanguage != "" && s.AddonLanguage == target {
@@ -125,6 +136,10 @@ func matchesLanguage(s model.CollectedStream, target string) bool {
 		}
 	}
 	return false
+}
+
+func stableKey(s model.CollectedStream) string {
+	return s.Stream.URL + "\x00" + s.AddonID + "\x00" + s.Stream.Name
 }
 
 func getScore(m map[string]int, key string) int {
