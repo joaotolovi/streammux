@@ -86,6 +86,16 @@ func (s *Session) StartN() int {
 	return s.startN
 }
 
+// Done returns a channel closed when the session's ffmpeg process exits.
+func (s *Session) Done() <-chan struct{} {
+	if s == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return s.done
+}
+
 // Cancel terminates the session's ffmpeg process.
 func (s *Session) Cancel() {
 	if s != nil && s.cancel != nil {
