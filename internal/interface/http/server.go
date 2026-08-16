@@ -55,9 +55,9 @@ func (s *Server) routes() {
 	// HLS endpoints — playlist and segments
 	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMuxRedirect)
 	s.mux.HandleFunc("GET /mux/{jobId}/playlist.m3u8", s.handleHLSPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/video.m3u8", s.handleHLSVideoPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/audio.m3u8", s.handleHLSAudioPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/{segment}", s.handleHLSSegment)
+	s.mux.HandleFunc("GET /mux/{jobId}/video/video.m3u8", s.handleHLSVideoPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/audio/audio.m3u8", s.handleHLSAudioPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/video/{segment}", s.handleHLSSegment)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
 
 	// API
