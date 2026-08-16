@@ -26,12 +26,6 @@ type Config struct {
 	Language string    `json:"language"`
 	Services []Service `json:"services"`
 	Addons   []Addon   `json:"addons"`
-
-	// AudioDelayMs shifts the dubbed audio relative to the video, in
-	// milliseconds. Positive delays the audio (moves it later); negative
-	// advances it. Used when the video and dubbed-audio sources are different
-	// releases whose content starts at slightly different points.
-	AudioDelayMs int `json:"audioDelayMs,omitempty"`
 }
 
 type User struct {

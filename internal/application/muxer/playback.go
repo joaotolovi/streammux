@@ -249,19 +249,15 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 		return nil, err
 	}
 
-	// The A/V offset is either set manually in the user config (AudioDelayMs)
-	// or estimated by cross-correlating the first seconds of both audio tracks.
-	// The estimate is cached per source pair so it never consumes the attempt
-	// budget twice. EstimateAudioOffset returns how far the dubbed audio lags
-	// the video's audio (positive = audio starts later); the offset we apply is
-	// inverted because it must move the audio back into alignment (-itsoffset
-	// positive delays the audio).
+	// The A/V offset is estimated by cross-correlating the first seconds of
+	// both audio tracks. The estimate is cached per source pair so it never
+	// consumes the attempt budget twice. EstimateAudioOffset returns how far
+	// the dubbed audio lags the video's audio (positive = audio starts later);
+	// the offset we apply is inverted because it must move the audio back into
+	// alignment (-itsoffset positive delays the audio).
 	var audioOffset time.Duration
 	dualSource := strings.TrimSpace(prepared.audioURL) != "" && prepared.audioURL != prepared.videoURL
-	if job.Config.AudioDelayMs != 0 {
-		audioOffset = time.Duration(job.Config.AudioDelayMs) * time.Millisecond
-		log.Printf("mux: using manual audio offset %s", audioOffset)
-	} else if dualSource {
+	if dualSource {
 		if offset, ok := m.audioOffsetFor(plan); ok {
 			audioOffset = offset
 			if offset != 0 {
