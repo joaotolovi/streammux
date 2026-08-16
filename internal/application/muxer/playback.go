@@ -324,12 +324,13 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 	}
 
 	segmentPath := generationSegmentPath(generation, startSegment)
+	audioSegmentPath := generationAudioSegmentPath(generation, startSegment)
 	playlistPath := generationPlaylistPath(generation)
 	ticker := time.NewTicker(75 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		if fileExists(segmentPath) && fileExists(playlistPath) {
+		if fileExists(segmentPath) && fileExists(audioSegmentPath) && fileExists(playlistPath) {
 			return generation, nil
 		}
 		select {
@@ -338,7 +339,7 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 			go cleanupFailedGeneration(generation)
 			return nil, fmt.Errorf("first segment deadline: %w", attemptCtx.Err())
 		case <-session.Done():
-			if fileExists(segmentPath) && fileExists(playlistPath) {
+			if fileExists(segmentPath) && fileExists(audioSegmentPath) && fileExists(playlistPath) {
 				return generation, nil
 			}
 			go cleanupFailedGeneration(generation)
@@ -394,6 +395,65 @@ func (m *Muxer) PlaylistPath(job *model.MuxJob) string {
 		return ""
 	}
 	return path
+}
+
+// VideoPlaylistPath returns the video-only media playlist path.
+func (m *Muxer) VideoPlaylistPath(job *model.MuxJob) string {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return ""
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.lastAccess = time.Now()
+	if state.active == nil {
+		return ""
+	}
+	path := generationVideoPlaylistPath(state.active)
+	if !fileExists(path) {
+		return ""
+	}
+	return path
+}
+
+// AudioPlaylistPath returns the audio-only media playlist path.
+func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return ""
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.lastAccess = time.Now()
+	if state.active == nil {
+		return ""
+	}
+	path := generationAudioPlaylistPath(state.active)
+	if !fileExists(path) {
+		return ""
+	}
+	return path
+}
+
+// AudioSegmentPath returns the audio segment path for the given index, if it
+// exists in any generation.
+func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return ""
+	}
+	state.mu.Lock()
+	state.lastAccess = time.Now()
+	generations := append([]*generation(nil), state.all...)
+	state.mu.Unlock()
+
+	for index := len(generations) - 1; index >= 0; index-- {
+		path := generationAudioSegmentPath(generations[index], segment)
+		if fileExists(path) {
+			return path
+		}
+	}
+	return ""
 }
 
 func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
@@ -477,6 +537,66 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 	}
 }
 
+// EnsureAudioSegment waits for the audio-only segment to be produced by the
+// active session (the same ffmpeg run that produces the video segments).
+func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
+	if err := m.EnsurePlaylist(ctx, job); err != nil {
+		return "", err
+	}
+	if path := m.AudioSegmentPath(job, segment); path != "" {
+		return path, nil
+	}
+
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return "", fmt.Errorf("playback state not found")
+	}
+	deadlineCtx, cancel := context.WithTimeout(ctx, m.policy.SegmentTimeout)
+	defer cancel()
+
+	for {
+		if path := m.AudioSegmentPath(job, segment); path != "" {
+			return path, nil
+		}
+
+		state.mu.Lock()
+		state.lastAccess = time.Now()
+		state.lastRequested = segment
+		active := state.active
+		recovering := state.recovering
+		recoveryWait := state.recoveryWait
+		nextPlan := state.nextPlan
+		state.mu.Unlock()
+
+		if active == nil {
+			if !recovering {
+				m.ensureRecovery(job, state, segment, nextPlan, "no active session")
+			}
+		} else {
+			select {
+			case <-active.session.Done():
+				if !recovering {
+					m.ensureRecovery(job, state, segment, nextPlan, "session ended")
+				}
+			default:
+			}
+		}
+
+		select {
+		case <-deadlineCtx.Done():
+			return "", fmt.Errorf("timeout waiting for audio segment %d: %w", segment, deadlineCtx.Err())
+		case <-time.After(100 * time.Millisecond):
+		case <-recoveryWait:
+			state.mu.Lock()
+			err := state.recoveryErr
+			state.mu.Unlock()
+			if err != nil && m.AudioSegmentPath(job, segment) == "" {
+				return "", err
+			}
+		}
+	}
+}
+
 func (m *Muxer) ensureRecovery(job *model.MuxJob, state *playbackState, startSegment, startPlan int, reason string) {
 	state.mu.Lock()
 	if state.closed || state.recovering {
@@ -541,14 +661,35 @@ func generationPlaylistPath(generation *generation) string {
 	if generation == nil {
 		return ""
 	}
-	return filepath.Join(generation.dir, "live.m3u8")
+	return filepath.Join(generation.dir, "master.m3u8")
+}
+
+func generationVideoPlaylistPath(generation *generation) string {
+	if generation == nil {
+		return ""
+	}
+	return filepath.Join(generation.dir, "video", "video.m3u8")
+}
+
+func generationAudioPlaylistPath(generation *generation) string {
+	if generation == nil {
+		return ""
+	}
+	return filepath.Join(generation.dir, "audio", "audio.m3u8")
 }
 
 func generationSegmentPath(generation *generation, segment int) string {
 	if generation == nil {
 		return ""
 	}
-	return filepath.Join(generation.dir, fmt.Sprintf("seg_%05d.ts", segment))
+	return filepath.Join(generation.dir, "video", fmt.Sprintf("seg_%05d.ts", segment))
+}
+
+func generationAudioSegmentPath(generation *generation, segment int) string {
+	if generation == nil {
+		return ""
+	}
+	return filepath.Join(generation.dir, "audio", fmt.Sprintf("seg_%05d.ts", segment))
 }
 
 func fileExists(path string) bool {
@@ -560,7 +701,7 @@ func fileExists(path string) bool {
 }
 
 func highestCompleteSegment(dir string) int {
-	entries, err := os.ReadDir(dir)
+	entries, err := os.ReadDir(filepath.Join(dir, "video"))
 	if err != nil {
 		return -1
 	}

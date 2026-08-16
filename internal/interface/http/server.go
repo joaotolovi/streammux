@@ -55,7 +55,10 @@ func (s *Server) routes() {
 	// HLS endpoints — playlist and segments
 	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMuxRedirect)
 	s.mux.HandleFunc("GET /mux/{jobId}/playlist.m3u8", s.handleHLSPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/video.m3u8", s.handleHLSVideoPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/audio.m3u8", s.handleHLSAudioPlaylist)
 	s.mux.HandleFunc("GET /mux/{jobId}/{segment}", s.handleHLSSegment)
+	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
 
 	// API
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
@@ -222,6 +225,89 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	segPath, err := s.muxer.EnsureSegment(r.Context(), job, segIndex)
 	if err != nil {
 		log.Printf("mux segment %d: %v", segIndex, err)
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, segPath)
+}
+
+// handleHLSVideoPlaylist serves the video-only media playlist.
+func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "playlist not ready")
+		return
+	}
+	path := s.muxer.VideoPlaylistPath(job)
+	if path == "" {
+		writeError(w, http.StatusInternalServerError, "video playlist not ready")
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, path)
+}
+
+// handleHLSAudioPlaylist serves the audio-only media playlist.
+func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "playlist not ready")
+		return
+	}
+	path := s.muxer.AudioPlaylistPath(job)
+	if path == "" {
+		writeError(w, http.StatusInternalServerError, "audio playlist not ready")
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, path)
+}
+
+// handleHLSAudioSegment serves an audio-only segment.
+func (s *Server) handleHLSAudioSegment(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	segment := filepath.Base(r.PathValue("segment"))
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+
+	var segIndex int
+	if _, err := fmt.Sscanf(segment, "seg_%05d.ts", &segIndex); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid segment")
+		return
+	}
+
+	if cached := s.muxer.AudioSegmentPath(job, segIndex); cached != "" {
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, cached)
+		return
+	}
+
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
+		return
+	}
+
+	// Wait for the audio segment to be produced (same session as video).
+	segPath, err := s.muxer.EnsureAudioSegment(r.Context(), job, segIndex)
+	if err != nil {
+		log.Printf("mux audio segment %d: %v", segIndex, err)
 		writeError(w, http.StatusBadGateway, "segment source unavailable")
 		return
 	}

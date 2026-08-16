@@ -23,34 +23,28 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		t.Fatalf("buildSessionArgs() error = %v", err)
 	}
 
-	want := []string{
-		"-nostdin",
-		"-hide_banner",
-		"-nostats",
-		"-stats_period", "1",
-		"-progress", "pipe:1",
-		"-y",
-		"-ss", "12",
-		"-i", "https://example.test/media.mkv",
-		"-map", "0:v:1",
-		"-map", "0:a:2",
-		"-c:v", "copy",
-		"-c:a", "copy",
-		"-metadata:s:a:0", "language=por",
-		"-disposition:a:0", "default",
-		"-metadata:s:a:0", "title=Português",
-		"-shortest",
-		"-avoid_negative_ts", "make_zero",
-		"-f", "hls",
-		"-hls_time", "4",
-		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments+temp_file+discont_start",
-		"-hls_segment_filename", "/tmp/session/seg_%05d.ts",
-		"-start_number", "3",
-		"/tmp/session/live.m3u8",
+	// Single input, two HLS outputs (video-only + audio-only).
+	if countArgument(got, "-i") != 1 {
+		t.Fatalf("input count = %d, want 1; args: %#v", countArgument(got, "-i"), got)
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildSessionArgs() mismatch\n got: %#v\nwant: %#v", got, want)
+	for _, want := range [][]string{
+		{"-ss", "12", "-i", "https://example.test/media.mkv"},
+		{"-map", "0:v:1"},
+		{"-map", "0:a:2"},
+		{"-c:v", "copy"},
+		{"-c:a", "copy"},
+		{"-metadata:s:a:0", "language=por"},
+		{"-disposition:a:0", "default"},
+		{"-metadata:s:a:0", "title=Português"},
+		{"-hls_flags", "independent_segments+temp_file+discont_start"},
+		{"-hls_segment_filename", "/tmp/session/video/seg_%05d.ts"},
+		{"-hls_segment_filename", "/tmp/session/audio/seg_%05d.ts"},
+		{"/tmp/session/video/video.m3u8"},
+		{"/tmp/session/audio/audio.m3u8"},
+	} {
+		if !containsArguments(got, want) {
+			t.Errorf("args do not contain %q: %#v", want, got)
+		}
 	}
 }
 
@@ -80,8 +74,9 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
 		{"-c:a", "aac"},
-		{"-shortest"},
 		{"-hls_flags", "independent_segments+temp_file+discont_start"},
+		{"/tmp/dual/video/video.m3u8"},
+		{"/tmp/dual/audio/audio.m3u8"},
 	} {
 		if !containsArguments(got, want) {
 			t.Errorf("args do not contain %q: %#v", want, got)

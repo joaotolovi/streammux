@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -75,6 +76,13 @@ func New(binaryPath string) *Muxer {
 func (m *Muxer) StartSession(ctx context.Context, spec SessionSpec) (*Session, error) {
 	args, err := buildSessionArgs(spec)
 	if err != nil {
+		return nil, err
+	}
+
+	// Write the master playlist that exposes the audio as an independent
+	// rendition. This is what lets the player's native audio-delay control
+	// seek/offset the audio track on its own.
+	if err := writeMasterPlaylist(spec.OutputDir); err != nil {
 		return nil, err
 	}
 
@@ -186,13 +194,30 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if dualSource {
 		audioInput = 1
 	}
+
+	hlsFlags := "independent_segments+temp_file"
+	if spec.StartSegment > 0 {
+		hlsFlags += "+discont_start"
+	}
+
+	// Video-only rendition.
 	args = append(args,
 		"-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex),
-		"-map", fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex),
 		"-c:v", "copy",
-		"-c:a", string(audioMode),
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_playlist_type", "event",
+		"-hls_flags", hlsFlags,
+		"-hls_segment_filename", filepath.Join(spec.OutputDir, "video", "seg_%05d.ts"),
+		"-start_number", strconv.Itoa(spec.StartSegment),
+		filepath.Join(spec.OutputDir, "video", "video.m3u8"),
 	)
 
+	// Audio-only rendition.
+	args = append(args,
+		"-map", fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex),
+		"-c:a", string(audioMode),
+	)
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args,
 			"-metadata:s:a:0", "language="+language,
@@ -202,21 +227,14 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
 	}
-
-	hlsFlags := "independent_segments+temp_file"
-	if spec.StartSegment > 0 {
-		hlsFlags += "+discont_start"
-	}
 	args = append(args,
-		"-shortest",
-		"-avoid_negative_ts", "make_zero",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
 		"-hls_playlist_type", "event",
 		"-hls_flags", hlsFlags,
-		"-hls_segment_filename", filepath.Join(spec.OutputDir, "seg_%05d.ts"),
+		"-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),
-		filepath.Join(spec.OutputDir, "live.m3u8"),
+		filepath.Join(spec.OutputDir, "audio", "audio.m3u8"),
 	)
 	return args, nil
 }
@@ -340,4 +358,16 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// writeMasterPlaylist writes the master playlist that exposes the audio as an
+// independent rendition (video-only + audio-only), so the player's native
+// audio-delay control can seek/offset the audio track on its own.
+func writeMasterPlaylist(outputDir string) error {
+	master := "#EXTM3U\n" +
+		"#EXT-X-VERSION:6\n" +
+		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio/audio.m3u8\"\n" +
+		"#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO=\"aud\"\n" +
+		"video/video.m3u8\n"
+	return os.WriteFile(filepath.Join(outputDir, "master.m3u8"), []byte(master), 0644)
 }
