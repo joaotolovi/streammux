@@ -89,8 +89,11 @@ type probeLimits struct {
 	probeSize       string
 }
 
-// Probe inspects a source with ffprobe. If a deliberately small first probe
-// finds no streams or duration, it makes one larger attempt.
+// Probe inspects a source with ffprobe. The first pass is small for speed; if
+// it does not return a complete picture (no streams, no duration, or no audio
+// track at all), a second pass reads more of the container header. The MKV
+// header (which lists every track) lives at the start of the file, so a
+// moderately larger probesize is enough — it is not a full-file download.
 func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()

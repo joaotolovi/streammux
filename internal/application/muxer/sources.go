@@ -327,8 +327,26 @@ func targetAudioTrack(tracks []ffmpeg.AudioTrack, targetLanguage string, source 
 		}
 	}
 
-	// A single untagged track from a source explicitly identified as dubbed is a
-	// safe fallback. Multiaudio files must never silently fall back to track zero.
+	// When the addon explicitly identifies this source as dubbed in the target
+	// language (AddonLanguage / IsDubbed / parsed flags), accept an undefined
+	// or untagged track. Many "DUAL" remuxes tag the dubbed audio as `und`
+	// (undefined) or leave it empty, so rejecting those rejects the dubbed
+	// track unfairly. Prefer an undefined/empty track before falling back to
+	// the first one.
+	if analyzer.MatchesLanguage(source, targetLanguage) {
+		for _, track := range tracks {
+			lang := strings.TrimSpace(track.Language)
+			if lang == "" || lang == "und" {
+				return track.Index
+			}
+		}
+		if len(tracks) > 0 {
+			return tracks[0].Index
+		}
+	}
+
+	// A single untagged track from a source explicitly identified as dubbed is
+	// also a safe fallback. Multiaudio files never fall back further than this.
 	if len(tracks) == 1 && analyzer.MatchesLanguage(source, targetLanguage) {
 		return tracks[0].Index
 	}

@@ -44,7 +44,11 @@ func TestHealthTrackerHealthyWindowResetsSlowState(t *testing.T) {
 	}
 }
 
-func TestTargetAudioTrackNeverFallsBackToZeroForUnknownMultiaudio(t *testing.T) {
+func TestTargetAudioTrackFallsBackToFirstTrackForDubbedMultiaudio(t *testing.T) {
+	// A source explicitly marked as dubbed in the target language is trusted:
+	// the small probe may not have read the full MKV header, so the tagged por
+	// track can be beyond what ffprobe returned. Falling back to the first
+	// (default) track of a dubbed source is safer than rejecting the plan.
 	tracks := []ffmpeg.AudioTrack{
 		{Index: 0, Language: "eng"},
 		{Index: 1, Language: "spa"},
@@ -54,6 +58,54 @@ func TestTargetAudioTrackNeverFallsBackToZeroForUnknownMultiaudio(t *testing.T) 
 		IsDubbed:      true,
 		Language:      "Portuguese (Brazil)",
 	}
+	if got := targetAudioTrack(tracks, "Portuguese (Brazil)", source); got != 0 {
+		t.Fatalf("targetAudioTrack() = %d, want 0 (dubbed multiaudio fallback)", got)
+	}
+}
+
+func TestTargetAudioTrackAcceptsUndTaggedDubbedTrack(t *testing.T) {
+	// "DUAL" remuxes often tag the dubbed audio as `und` (undefined) instead of
+	// `por`. A source identified as dubbed must accept that track rather than
+	// reject the plan.
+	tracks := []ffmpeg.AudioTrack{
+		{Index: 0, Language: "eng"},
+		{Index: 1, Language: "und"},
+		{Index: 2, Language: "spa"},
+	}
+	source := model.CollectedStream{
+		AddonLanguage: "Portuguese (Brazil)",
+		IsDubbed:      true,
+	}
+	if got := targetAudioTrack(tracks, "Portuguese (Brazil)", source); got != 1 {
+		t.Fatalf("targetAudioTrack() = %d, want 1 (und dubbed track)", got)
+	}
+}
+
+func TestTargetAudioTrackPrefersTaggedPorOverUnd(t *testing.T) {
+	// When both a real `por` tag and an `und` track exist, the explicit por
+	// track wins.
+	tracks := []ffmpeg.AudioTrack{
+		{Index: 0, Language: "und"},
+		{Index: 1, Language: "por"},
+		{Index: 2, Language: "spa"},
+	}
+	source := model.CollectedStream{
+		AddonLanguage: "Portuguese (Brazil)",
+		IsDubbed:      true,
+	}
+	if got := targetAudioTrack(tracks, "Portuguese (Brazil)", source); got != 1 {
+		t.Fatalf("targetAudioTrack() = %d, want 1 (por beats und)", got)
+	}
+}
+
+func TestTargetAudioTrackNeverFallsBackForUnknownMultiaudio(t *testing.T) {
+	// Without the addon identifying the source as dubbed, an untagged multiaudio
+	// file must not silently pick track zero.
+	tracks := []ffmpeg.AudioTrack{
+		{Index: 0, Language: "eng"},
+		{Index: 1, Language: "spa"},
+	}
+	source := model.CollectedStream{} // no dubbed signals
 	if got := targetAudioTrack(tracks, "Portuguese (Brazil)", source); got != -1 {
 		t.Fatalf("targetAudioTrack() = %d, want -1", got)
 	}
