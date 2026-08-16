@@ -97,52 +97,72 @@ func (m *Muxer) EstimateAudioOffset(ctx context.Context, videoURL, audioURL stri
 		return 0, fmt.Errorf("insufficient audio for sync (%d and %d samples)", len(videoPCM), len(audioPCM))
 	}
 
-	lag := crossCorrelateLag(videoPCM, audioPCM, syncSampleRate)
+	lag := crossCorrelateLag(videoPCM, audioPCM)
 	return time.Duration(lag) * time.Second / syncSampleRate, nil
 }
 
-// crossCorrelateLag returns the sample lag k where audioPCM[i] best matches
-// videoPCM[i+k], i.e. how many samples audioPCM is behind videoPCM. A positive
-// lag means the dubbed audio starts later than the video's audio; shifting the
-// audio input forward by k samples (negative itsoffset) would align them.
+// crossCorrelateLag returns the sample lag k where audioPCM lags videoPCM by k
+// samples: videoPCM[i] best matches audioPCM[i+k]. A positive lag means the
+// dubbed audio starts later than the video's audio.
 //
-// The search is done at a reduced rate for speed, then refined around the peak
-// at the full rate. Signals are centered (mean removed) so that loud scenes
-// common to both tracks dominate the correlation.
-func crossCorrelateLag(videoPCM, audioPCM []int16, _ int) int {
-	// Bound the search to +/-3s, which covers intro differences between releases.
-	const maxLag = 3 * syncSampleRate
+// Both passes use a mean-centered, normalized correlation (covariance divided
+// by the number of overlapping samples). Without this normalization the raw
+// dot-product naturally peaks near whichever lag has the most overlapping
+// samples — which is lag 0 when both clips are the same length, but shifts
+// unpredictably whenever the two decoded clips differ in length, producing a
+// wrong offset exactly in that case.
+func crossCorrelateLag(videoPCM, audioPCM []int16) int {
+	// Bound the search to what the shorter decoded clip can actually support,
+	// so we never search into lags with near-zero real overlap. Cap it so a
+	// few seconds of shared signal always remain to correlate against.
+	maxLag := len(videoPCM)
+	if len(audioPCM) < maxLag {
+		maxLag = len(audioPCM)
+	}
+	maxLag /= 2
+	if limit := int(syncSampleSeconds-2) * syncSampleRate; maxLag > limit {
+		maxLag = limit
+	}
+	if maxLag <= 0 {
+		return 0
+	}
 
 	// Coarse pass: decimate both signals to ~500Hz (factor 16) and search every
 	// 4th lag (0.5s resolution) — cheap and robust.
 	const decimate = 16
 	const lagStep = 4 * decimate
 	v, a := decimatePCM(videoPCM, decimate), decimatePCM(audioPCM, decimate)
+	vm, am := mean(v), mean(a)
 
 	coarseBest := 0
 	best := math.Inf(-1)
 	for lag := -maxLag; lag <= maxLag; lag += lagStep {
-		score := correlateScore(v, a, lag/decimate)
-		if score > best {
-			best = score
+		score, n := correlateScoreCentered(v, a, lag/decimate, vm, am)
+		if n == 0 {
+			continue
+		}
+		if normalized := score / float64(n); normalized > best {
+			best = normalized
 			coarseBest = lag
 		}
 	}
 
-	// Fine pass: +/-0.5s around the coarse peak at half rate (4kHz), using only
-	// the first few seconds of signal — the intro alignment is what matters.
+	// Fine pass: +/-0.5s around the coarse peak, at half the decimation, using
+	// the same normalized metric so the refinement can't reintroduce the bias.
 	const fineDecimate = 2
-	const fineWindowSeconds = 4
-	vf := decimatePCM(videoPCM[:min(len(videoPCM), fineWindowSeconds*syncSampleRate)], fineDecimate)
-	af := decimatePCM(audioPCM, fineDecimate)
-	vm, am := mean(vf), mean(af)
+	vf, af := decimatePCM(videoPCM, fineDecimate), decimatePCM(audioPCM, fineDecimate)
+	vfm, afm := mean(vf), mean(af)
 
 	bestLag := coarseBest
 	fineBest := math.Inf(-1)
-	for lag := (coarseBest - syncSampleRate/2) / fineDecimate; lag <= (coarseBest+syncSampleRate/2)/fineDecimate; lag++ {
-		score := correlateScoreCentered(vf, af, lag, vm, am)
-		if score > fineBest {
-			fineBest = score
+	window := syncSampleRate / 2
+	for lag := (coarseBest - window) / fineDecimate; lag <= (coarseBest+window)/fineDecimate; lag++ {
+		score, n := correlateScoreCentered(vf, af, lag, vfm, afm)
+		if n == 0 {
+			continue
+		}
+		if normalized := score / float64(n); normalized > fineBest {
+			fineBest = normalized
 			bestLag = lag * fineDecimate
 		}
 	}
@@ -173,30 +193,20 @@ func mean(pcm []int16) float64 {
 	return float64(sum) / float64(len(pcm))
 }
 
-// correlateScore computes the cross-correlation at the given lag without
-// centering; used for the coarse pass where only the relative peak matters.
-func correlateScore(videoPCM, audioPCM []int16, lag int) float64 {
-	var sum int64
-	for i := 0; i < len(videoPCM); i++ {
-		j := i + lag
-		if j < 0 || j >= len(audioPCM) {
-			continue
-		}
-		sum += int64(videoPCM[i]) * int64(audioPCM[j])
-	}
-	return float64(sum)
-}
-
-// correlateScoreCentered computes the mean-centered cross-correlation at the
-// given lag, which removes any DC offset from both signals.
-func correlateScoreCentered(videoPCM, audioPCM []int16, lag int, vm, am float64) float64 {
+// correlateScoreCentered computes the mean-centered cross-correlation sum at
+// the given lag together with the number of overlapping samples. Callers must
+// divide by that count before comparing scores across different lags, since
+// the raw sum grows with overlap size, not with correlation strength.
+func correlateScoreCentered(videoPCM, audioPCM []int16, lag int, vm, am float64) (float64, int) {
 	var sum float64
+	var n int
 	for i := 0; i < len(videoPCM); i++ {
 		j := i + lag
 		if j < 0 || j >= len(audioPCM) {
 			continue
 		}
 		sum += (float64(videoPCM[i]) - vm) * (float64(audioPCM[j]) - am)
+		n++
 	}
-	return sum
+	return sum, n
 }
