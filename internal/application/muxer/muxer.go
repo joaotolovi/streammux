@@ -415,44 +415,58 @@ func (m *Muxer) GenerateSegment(ctx context.Context, job *model.MuxJob, segIndex
 		}
 	}
 
-	// Audio source is pre-validated at playlist time (pickAudioSource), so only
-	// the single working URL is used here.
-	var audioURL string
-	for _, src := range append([]string{job.AudioURL}, job.AudioCandidates...) {
+	// Build the list of audio sources to try: the primary plus fallback
+	// candidates, each resolved to its CDN URL. The primary is pre-validated at
+	// playlist time, but it can still die mid-playback (token expiry, CDN drop),
+	// so we fall back through the candidates if needed.
+	audioSources := append([]string{job.AudioURL}, job.AudioCandidates...)
+	var audioURLs []string
+	for i, src := range audioSources {
 		if src == "" {
 			continue
 		}
-		resolved := m.resolvedURL(ctx, job, "audio")
-		if resolved == "" {
-			continue
+		var resolved string
+		if i == 0 {
+			resolved = m.resolvedURL(ctx, job, "audio")
+		} else {
+			resolved = m.resolveOne(ctx, src)
 		}
-		audioURL = resolved
-		break
+		if resolved != "" {
+			audioURLs = append(audioURLs, resolved)
+		}
 	}
 
-	if len(videoURLs) == 0 || audioURL == "" {
-		return fmt.Errorf("no resolvable video (%d) or audio sources", len(videoURLs))
+	if len(videoURLs) == 0 || len(audioURLs) == 0 {
+		return fmt.Errorf("no resolvable video (%d) or audio (%d) sources", len(videoURLs), len(audioURLs))
 	}
 
-	log.Printf("mux: seg %d video=%s audioTrack=%d", segIndex, truncate(videoURLs[0]), audioTrack)
+	log.Printf("mux: seg %d video=%s audioTrack=%d audioSrc=%d", segIndex, truncate(videoURLs[0]), audioTrack, len(audioURLs))
 
 	var lastErr error
-	// Try each video source (best first) with the validated audio source.
+	// Try each video source against each audio source (best first).
 	for vi, videoURL := range videoURLs {
-		err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
-		if err == nil {
-			if vi > 0 {
-				job.VideoURL = videoSources[vi]
-				job.VideoResolved = ""
-				job.VideoCandidates = nil
-				log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
+		for ai, audioURL := range audioURLs {
+			err := m.ffmpeg.GenerateSegment(ctx, videoURL, audioURL, audioTrack, offset, out)
+			if err == nil {
+				if vi > 0 {
+					job.VideoURL = videoSources[vi]
+					job.VideoResolved = ""
+					job.VideoCandidates = nil
+					log.Printf("mux: seg %d fell back to video candidate %d", segIndex, vi)
+				}
+				if ai > 0 {
+					job.AudioURL = audioSources[ai]
+					job.AudioResolved = ""
+					job.AudioCandidates = nil
+					log.Printf("mux: seg %d fell back to audio candidate %d", segIndex, ai)
+				}
+				return nil
 			}
-			return nil
-		}
-		lastErr = err
-		log.Printf("mux: (v%d) failed for seg %d: %v", vi, segIndex, err)
-		if truncErr := resetFile(out); truncErr != nil {
-			return fmt.Errorf("reset output: %w", truncErr)
+			lastErr = err
+			log.Printf("mux: (v%d,a%d) failed for seg %d: %v", vi, ai, segIndex, err)
+			if truncErr := resetFile(out); truncErr != nil {
+				return fmt.Errorf("reset output: %w", truncErr)
+			}
 		}
 	}
 
