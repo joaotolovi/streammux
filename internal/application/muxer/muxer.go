@@ -67,11 +67,15 @@ func New(col *collector.Collector, an *analyzer.Analyzer, ff *ffmpeg.Muxer, _ *r
 		store:     store,
 		baseURL:   strings.TrimSuffix(baseURL, "/"),
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 90 * time.Second,
 		},
 		segLocks: make(map[string]*sync.Mutex),
 	}
 }
+
+// browserUA is the User-Agent sent on resolution/measurement requests. Debrid
+// proxies reject the Go default UA.
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 // SegmentLock returns the singleflight mutex for a (job, segment) pair so that
 // concurrent requests for the same segment generate it only once.
@@ -622,6 +626,7 @@ func (m *Muxer) measureThroughput(ctx context.Context, url string) float64 {
 		return 0
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", warmupBytes+sampleBytes-1))
+	req.Header.Set("User-Agent", browserUA)
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
@@ -704,6 +709,7 @@ func (m *Muxer) followRedirects(ctx context.Context, url string) string {
 			return ""
 		}
 		req.Header.Set("Range", "bytes=0-0")
+		req.Header.Set("User-Agent", browserUA)
 
 		resp, err := m.httpClient.Do(req)
 		if err != nil {

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const probeTimeout = 40 * time.Second
+const probeTimeout = 90 * time.Second
 
 // segmentTimeout bounds each ffmpeg segment generation. A 4s segment from a
 // fast CDN should finish in a few seconds; this cap releases the per-segment
