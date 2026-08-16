@@ -46,9 +46,12 @@ type Policy struct {
 
 func defaultPolicy() Policy {
 	return Policy{
-		StartupTimeout:    12 * time.Second,
-		AttemptTimeout:    7 * time.Second,
-		SegmentTimeout:    20 * time.Second,
+		// The Stremio client tolerates roughly 60s before it gives up on
+		// starting playback, so startup can use a generous window. Lenient uses
+		// half of StartupTimeout and re-runs cached probes, so it stays fast.
+		StartupTimeout:    45 * time.Second,
+		AttemptTimeout:    20 * time.Second,
+		SegmentTimeout:    30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		HealthWindow:      12 * time.Second,
 		RecoveryCooldown:  30 * time.Second,
