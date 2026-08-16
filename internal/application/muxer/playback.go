@@ -250,11 +250,12 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 	}
 
 	// The A/V offset is estimated by cross-correlating the first seconds of
-	// both audio tracks. The estimate is cached per source pair so it never
-	// consumes the attempt budget twice. EstimateAudioOffset returns how far
-	// the dubbed audio lags the video's audio (positive = audio starts later);
-	// the offset we apply is inverted because it must move the audio back into
-	// alignment (-itsoffset positive delays the audio).
+	// the video source's primary audio against the dubbed track. The estimate
+	// is cached per source pair so it never consumes the attempt budget twice.
+	// DetectAudioOffset returns how far the dubbed audio lags the video's
+	// audio (positive = audio starts later); the offset we apply is inverted
+	// because it must move the audio back into alignment (-itsoffset positive
+	// delays the audio). The correlation is only trusted when the peak is clear.
 	var audioOffset time.Duration
 	dualSource := strings.TrimSpace(prepared.audioURL) != "" && prepared.audioURL != prepared.videoURL
 	if dualSource {
@@ -264,13 +265,15 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 				log.Printf("mux: using cached audio offset %s", offset)
 			}
 		} else {
-			offset, err := m.ffmpeg.EstimateAudioOffset(parent, prepared.videoURL, prepared.audioURL, prepared.videoTrackIndex, prepared.audioTrackIndex)
+			lag, track, confidence, err := m.detectOffset(prepared)
 			if err != nil {
 				log.Printf("mux: audio offset estimation failed (continuing without): %v", err)
+			} else if confidence < ffmpeg.SyncMinConfidence {
+				log.Printf("mux: audio offset inconclusive (conf %.1f, continuing without): video track a:%d", confidence, track)
 			} else {
-				audioOffset = -offset
+				audioOffset = -lag
 				m.cacheAudioOffset(plan, audioOffset)
-				log.Printf("mux: estimated audio offset %s (lag %s)", audioOffset, offset)
+				log.Printf("mux: estimated audio offset %s from video track a:%d (conf %.1f)", audioOffset, track, confidence)
 			}
 		}
 	}

@@ -53,6 +53,9 @@ type preparedPlan struct {
 	audioTrackIndex int
 	audioMode       ffmpeg.AudioMode
 	duration        float64
+	// videoAudioTracks are the video source's audio tracks, used to pick which
+	// one to correlate against the dub for A/V offset estimation.
+	videoAudioTracks []ffmpeg.AudioTrack
 }
 
 func (m *Muxer) preparePlan(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan) (*preparedPlan, error) {
@@ -77,6 +80,23 @@ func (m *Muxer) cacheAudioOffset(plan model.PlaybackPlan, offset time.Duration) 
 	m.offsetMu.Lock()
 	defer m.offsetMu.Unlock()
 	m.offsets[audioOffsetKey(plan)] = offset
+}
+
+// detectOffset finds the audio alignment between the dub and the video source.
+// All video candidate tracks are decoded in a single fetch (see
+// ffmpeg.ExtractPCMMulti) and correlated against the dub; the track with the
+// sharpest, most isolated correlation peak provides the offset.
+func (m *Muxer) detectOffset(prepared *preparedPlan) (time.Duration, int, float64, error) {
+	if len(prepared.videoAudioTracks) == 0 {
+		return 0, -1, 0, fmt.Errorf("no audio tracks on video source")
+	}
+	return m.ffmpeg.DetectAudioOffset(
+		prepared.videoURL,
+		prepared.audioURL,
+		prepared.videoAudioTracks,
+		prepared.audioTrackIndex,
+		ffmpeg.SyncSeconds,
+	)
 }
 
 func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan, lenient bool) (*preparedPlan, error) {
@@ -122,6 +142,7 @@ func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan mod
 	prepared.videoTrackIndex = videoProbe.VideoStreams[0].Index
 	prepared.audioTrackIndex = trackIndex
 	prepared.duration = videoProbe.Duration
+	prepared.videoAudioTracks = videoProbe.AudioTracks
 	for _, track := range audioProbe.AudioTracks {
 		if track.Index == trackIndex {
 			prepared.audioMode = compatibleAudioMode(track.Codec)

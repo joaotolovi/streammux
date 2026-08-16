@@ -27,7 +27,7 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
-	EstimateAudioOffset(context.Context, string, string, int, int) (time.Duration, error)
+	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
 }
 
 // Policy groups the small number of operational deadlines used during startup
