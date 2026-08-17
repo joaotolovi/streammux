@@ -1134,14 +1134,18 @@ func (m *Muxer) segmentPath(job *model.MuxJob, segment int, audio bool) string {
 
 // isForwardSeek reports whether a segment request is a real user seek rather
 // than pre-buffering: a large jump beyond the previous maximum that the
-// encoder has not reached.
+// encoder has not reached. maxRequested < 0 (no requests since the film
+// started) counts as unknown, not as zero.
 const seekJumpThreshold = 20
 
 func isForwardSeek(maxRequested, physical, highest, startSegment int) bool {
-	if maxRequested < 0 || physical <= maxRequested+seekJumpThreshold {
+	if physical <= highest+8 {
 		return false
 	}
-	return highest >= startSegment && physical > highest+8
+	if maxRequested < 0 {
+		return highest >= startSegment && physical > startSegment+seekJumpThreshold
+	}
+	return physical > maxRequested+seekJumpThreshold
 }
 
 func vodSegmentCount(filmDuration float64) int {

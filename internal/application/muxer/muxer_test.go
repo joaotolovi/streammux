@@ -387,9 +387,14 @@ func TestIsForwardSeekDistinguishesBufferingFromSeek(t *testing.T) {
 	if isForwardSeek(5, 22, 3, 0) {
 		t.Fatal("modest jump must not be a forward seek")
 	}
-	// Never seek before the segment the encoder has produced exists.
-	if isForwardSeek(-1, 600, 0, 0) {
-		t.Fatal("no prior max must not be a forward seek")
+	// First request after startup jumping far ahead of production is a seek
+	// (this is the regression: maxRequested < 0 used to disable detection).
+	if !isForwardSeek(-1, 179, 5, 3) {
+		t.Fatal("first-request far jump must be a forward seek")
+	}
+	// First request near the encoder position is normal buffering.
+	if isForwardSeek(-1, 8, 5, 3) {
+		t.Fatal("first-request near production must not be a seek")
 	}
 }
 
