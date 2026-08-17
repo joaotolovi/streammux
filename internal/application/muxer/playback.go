@@ -30,10 +30,14 @@ type playbackState struct {
 	// the health monitor and recovery; variants are additional renditions.
 	variants     map[int]*generation
 	variantPlans map[int]int
-	starting     bool
-	startWait    chan struct{}
-	startErr     error
-	directURL    string
+	// failedPlans tracks plan indices that failed source validation. They are
+	// excluded from the ABR master playlist so the player never selects a
+	// variant that will immediately error (source error / 502).
+	failedPlans map[int]bool
+	starting    bool
+	startWait   chan struct{}
+	startErr    error
+	directURL   string
 
 	placeholder        *generation
 	errorGeneration    *generation
@@ -86,6 +90,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		cacheDir:      dir,
 		variants:      make(map[int]*generation),
 		variantPlans:  make(map[int]int),
+		failedPlans:   make(map[int]bool),
 		lastRequested: -1,
 		maxRequested:  -1,
 		lastAccess:    time.Now(),
@@ -567,6 +572,10 @@ func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantInd
 		state.mu.Unlock()
 		return "", fmt.Errorf("variant %d maps to plan %d out of range", variantIndex, planIndex)
 	}
+	if state.failedPlans[planIndex] {
+		state.mu.Unlock()
+		return "", fmt.Errorf("variant %d (plan %d) failed source validation", variantIndex, planIndex)
+	}
 	// Reuse the active generation if it is the plan we need.
 	if state.active != nil && state.active.planIndex == planIndex {
 		active := state.active
@@ -587,6 +596,11 @@ func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantInd
 
 	gen, err := m.startAttempt(ctx, job, state, planIndex, startSegment, false)
 	if err != nil {
+		// The variant is the only consumer of this plan path; a validation
+		// failure here means it must not be advertised again.
+		state.mu.Lock()
+		state.failedPlans[planIndex] = true
+		state.mu.Unlock()
 		return "", err
 	}
 	state.mu.Lock()
@@ -676,6 +690,9 @@ func (m *Muxer) ensureVariantSegmentInGeneration(ctx context.Context, job *model
 func (m *Muxer) startVariantAtOffset(ctx context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int) (string, error) {
 	gen, err := m.startAttempt(ctx, job, state, planIndex, startSegment, false)
 	if err != nil {
+		state.mu.Lock()
+		state.failedPlans[planIndex] = true
+		state.mu.Unlock()
 		return "", err
 	}
 	state.mu.Lock()
@@ -874,11 +891,21 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Advertise the active plan as v0, then lighter plans below it.
-	// v0 always reuses state.active in EnsureVariant, so the handoff
-	// race is safe regardless of when the player requests it.
+	// Advertise the active plan as v0, then lighter plans below it that have
+	// not failed validation. v0 always reuses state.active in EnsureVariant,
+	// so the handoff race is safe regardless of when the player requests it.
+	state.mu.Lock()
+	failed := make(map[int]bool, len(state.failedPlans))
+	for k, v := range state.failedPlans {
+		failed[k] = v
+	}
+	state.mu.Unlock()
+
 	planIndices := []int{activePlan}
 	for i := activePlan + 1; i < len(job.Plans) && len(planIndices) < 4; i++ {
+		if failed[i] {
+			continue
+		}
 		planIndices = append(planIndices, i)
 	}
 

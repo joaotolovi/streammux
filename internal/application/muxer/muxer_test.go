@@ -338,8 +338,9 @@ func TestMasterPlaylistAdvertisesActivePlanUnderItsIndex(t *testing.T) {
 
 func TestMasterPlaylistOmitsAlreadyFailedPlansAboveActive(t *testing.T) {
 	state := &playbackState{
-		active:       &generation{dir: t.TempDir(), planIndex: 2},
+		active:       &generation{dir: t.TempDir(), planIndex: 0},
 		variantPlans: make(map[int]int),
+		failedPlans:  map[int]bool{1: true, 2: true},
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{
@@ -356,15 +357,16 @@ func TestMasterPlaylistOmitsAlreadyFailedPlansAboveActive(t *testing.T) {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	// Active plan 2 (720p) is v0; only plans below it (plan 3, 480p) follow.
-	if !strings.Contains(playlist, "RESOLUTION=720p") {
-		t.Fatalf("active plan 2 missing: %s", playlist)
+	// Active plan 0 (2160p) is v0; plans 1 and 2 failed validation and must
+	// be omitted; only plan 3 (480p) follows.
+	if !strings.Contains(playlist, "RESOLUTION=2160p") {
+		t.Fatalf("active plan 0 missing: %s", playlist)
 	}
-	if strings.Contains(playlist, "RESOLUTION=2160p") || strings.Contains(playlist, "RESOLUTION=1080p") {
-		t.Fatalf("failed plans above active were advertised: %s", playlist)
+	if strings.Contains(playlist, "RESOLUTION=1080p") || strings.Contains(playlist, "RESOLUTION=720p") {
+		t.Fatalf("failed plans were advertised: %s", playlist)
 	}
 	if !strings.Contains(playlist, "RESOLUTION=480p") {
-		t.Fatalf("plan below active missing: %s", playlist)
+		t.Fatalf("valid plan below active missing: %s", playlist)
 	}
 }
 
