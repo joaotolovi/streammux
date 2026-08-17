@@ -12,17 +12,29 @@ import (
 	"path/filepath"
 )
 
-//go:embed placeholder.mp4
+//go:embed placeholder.mp4 error.mp4
 var files embed.FS
 
-// PlaceholderPath extracts the unified 120s placeholder (intro crossfaded into
-// loop, 120s total — the max wait before we error) to a temp dir.
+// PlaceholderPath extracts the default placeholder to a temporary directory.
 func PlaceholderPath() (path, dir string, err error) {
 	dir, err = os.MkdirTemp("", "streammux-assets-*")
 	if err != nil {
 		return "", "", fmt.Errorf("assets temp dir: %w", err)
 	}
 	path, err = extract("placeholder.mp4", dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", "", err
+	}
+	return path, dir, nil
+}
+
+func ErrorPath() (path, dir string, err error) {
+	dir, err = os.MkdirTemp("", "streammux-assets-*")
+	if err != nil {
+		return "", "", fmt.Errorf("assets temp dir: %w", err)
+	}
+	path, err = extract("error.mp4", dir)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return "", "", err

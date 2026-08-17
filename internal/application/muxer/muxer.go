@@ -73,6 +73,7 @@ type Muxer struct {
 	policy    Policy
 
 	placeholderPath string
+	errorPath       string
 
 	httpClient *http.Client
 
@@ -107,6 +108,10 @@ func NewWithPlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpe
 }
 
 func NewWithSinglePlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath string) *Muxer {
+	return NewWithErrorPlaceholder(col, pl, ff, res, store, baseURL, placeholderPath, "")
+}
+
+func NewWithErrorPlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath, errorPath string) *Muxer {
 	m := &Muxer{
 		collector:       col,
 		planner:         pl,
@@ -116,6 +121,7 @@ func NewWithSinglePlaceholder(col *collector.Collector, pl *planner.Planner, ff 
 		baseURL:         strings.TrimSuffix(baseURL, "/"),
 		policy:          defaultPolicy(),
 		placeholderPath: placeholderPath,
+		errorPath:       errorPath,
 		httpClient:      &http.Client{Timeout: 12 * time.Second},
 		states:          make(map[string]*playbackState),
 		resolved:        make(map[string]resolvedEntry),

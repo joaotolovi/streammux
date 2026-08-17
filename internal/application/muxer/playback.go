@@ -32,6 +32,7 @@ type playbackState struct {
 	directURL string
 
 	placeholder        *generation
+	errorGeneration    *generation
 	retiredPlaceholder *generation
 	placeholderStarted bool
 	placeholderWait    chan struct{}
@@ -221,6 +222,23 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	winner, err := m.coordinateAttempts(job, state, 0, 0, m.policy.StartupTimeout)
 	if err != nil {
 		direct := m.resolveDirectFallback(job, state)
+		if direct == "" && m.errorPath != "" {
+			if errorGeneration, errorErr := m.startErrorGeneration(state); errorErr == nil {
+				state.mu.Lock()
+				state.active = errorGeneration
+				state.errorGeneration = errorGeneration
+				state.starting = false
+				state.startErr = err
+				state.directURL = ""
+				wait := state.startWait
+				state.mu.Unlock()
+				if wait != nil {
+					close(wait)
+				}
+				log.Printf("mux: startup failed; serving error video: %v", err)
+				return
+			}
+		}
 		state.mu.Lock()
 		state.starting = false
 		state.startErr = err
@@ -294,6 +312,47 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 // immediate playback while the film is prepared in the background. It writes
 // into a dedicated generation directory and closes placeholderWait once the
 // placeholder master is ready.
+func (m *Muxer) startErrorGeneration(state *playbackState) (*generation, error) {
+	state.mu.Lock()
+	state.nextGeneration++
+	generationID := state.nextGeneration
+	placeholder := state.placeholder
+	state.placeholder = nil
+	state.mu.Unlock()
+	if placeholder != nil {
+		placeholder.session.Cancel()
+	}
+
+	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.errorPath, dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	generation := &generation{id: generationID, dir: dir, session: session, isPlaceholder: true}
+	ticker := time.NewTicker(75 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(10 * time.Second)
+	for {
+		if fileExists(generationSegmentPath(generation, 0)) && fileExists(generationAudioSegmentPath(generation, 0)) && fileExists(generationPlaylistPath(generation)) {
+			return generation, nil
+		}
+		select {
+		case <-session.Done():
+			_ = os.RemoveAll(dir)
+			return nil, session.Err()
+		case <-deadline:
+			session.Cancel()
+			_ = os.RemoveAll(dir)
+			return nil, fmt.Errorf("error video timed out before first segment")
+		case <-ticker.C:
+		}
+	}
+}
+
 func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	state.mu.Lock()
 	state.nextGeneration++

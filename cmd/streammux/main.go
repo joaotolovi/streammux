@@ -64,6 +64,8 @@ func main() {
 		placeholderPath = envOr("PLACEHOLDER_LOOP", "")
 	}
 	assetsDir := ""
+	errorAssetsDir := ""
+	errorPath := envOr("ERROR_VIDEO", "")
 	if placeholderPath == "" {
 		var err error
 		placeholderPath, assetsDir, err = assets.PlaceholderPath()
@@ -71,10 +73,20 @@ func main() {
 			log.Fatalf("placeholder assets: %v", err)
 		}
 	}
-	mux := muxer.NewWithSinglePlaceholder(collector, planner, ff, res, store, baseURL, placeholderPath)
+	if errorPath == "" {
+		var err error
+		errorPath, errorAssetsDir, err = assets.ErrorPath()
+		if err != nil {
+			log.Fatalf("error assets: %v", err)
+		}
+	}
+	mux := muxer.NewWithErrorPlaceholder(collector, planner, ff, res, store, baseURL, placeholderPath, errorPath)
 	store.SetOnDelete(mux.CleanupJob)
 	if assetsDir != "" {
 		defer os.RemoveAll(assetsDir)
+	}
+	if errorAssetsDir != "" {
+		defer os.RemoveAll(errorAssetsDir)
 	}
 
 	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{
