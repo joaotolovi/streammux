@@ -1055,6 +1055,20 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	return ""
 }
 
+// isForwardSeek reports whether a segment request is a real user seek rather
+// than pre-buffering. Pre-buffering (ExoPlayer) requests segments
+// incrementally, so the max requested grows by ~1 each time; a real seek jumps
+// far ahead (e.g. 5 -> 600). We require a large jump beyond the previous max
+// to avoid restarting the session on every buffered segment after handoff.
+const seekJumpThreshold = 20
+
+func isForwardSeek(maxRequested, physical, highest, startSegment int) bool {
+	if maxRequested < 0 || physical <= maxRequested+seekJumpThreshold {
+		return false
+	}
+	return highest >= startSegment && physical > highest+8
+}
+
 func vodSegmentCount(filmDuration float64) int {
 	if filmDuration <= 0 {
 		return 0
@@ -1126,15 +1140,7 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
 				}
 			default:
-				// Distinguish pre-buffering from a real seek:
-				// Pre-buffering: player requests segments incrementally
-				//   (e.g. 2, 3, 4, 5, 6...). maxRequested grows gradually.
-				// Real seek: player jumps (e.g. from 5 to 600). The gap
-				//   between the previous max and the new request is large.
-				// Only restart the session at the new offset for a real
-				// seek — pre-buffering just waits for the encoder.
-				isSeek := maxReq >= 0 && physical > maxReq+20
-				if isSeek && highest >= active.startSegment && physical > highest+8 && !recovering {
+				if isForwardSeek(maxReq, physical, highest, active.startSegment) && !recovering {
 					m.ensureRecovery(job, state, physical, active.planIndex, "forward seek")
 				}
 			}

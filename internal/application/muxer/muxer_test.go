@@ -262,6 +262,26 @@ func TestSynchronizedPlaceholderPlaylistUsesCommonWindow(t *testing.T) {
 	}
 }
 
+func TestIsForwardSeekDistinguishesBufferingFromSeek(t *testing.T) {
+	// Pre-buffering: max grows incrementally (2,3,4,5...), so a request just
+	// ahead of the max is NOT a seek — wait for the encoder.
+	if isForwardSeek(3, 11, 2, 0) {
+		t.Fatal("sequential pre-buffering must not be a forward seek")
+	}
+	// A large jump beyond the previous max is a real seek.
+	if !isForwardSeek(5, 600, 3, 0) {
+		t.Fatal("large jump must be a forward seek")
+	}
+	// A request ahead of the max but within the jump threshold is buffering.
+	if isForwardSeek(5, 22, 3, 0) {
+		t.Fatal("modest jump must not be a forward seek")
+	}
+	// Never seek before the segment the encoder has produced exists.
+	if isForwardSeek(-1, 600, 0, 0) {
+		t.Fatal("no prior max must not be a forward seek")
+	}
+}
+
 func TestEstimatedBandwidthScalesWithResolution(t *testing.T) {
 	plan := model.PlaybackPlan{
 		Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p", Encode: "HEVC"}},
