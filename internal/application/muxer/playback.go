@@ -42,6 +42,9 @@ type playbackState struct {
 	// stitched is true once the master has been rewritten to include both the
 	// placeholder prefix and the film suffix. Segment lookups must check it.
 	stitched bool
+	// placeholderStartedAt tracks when the placeholder master became ready;
+	// used to cap the handoff to what the player actually consumed.
+	placeholderStartedAt time.Time
 
 	recovering   bool
 	recoveryWait chan struct{}
@@ -236,17 +239,27 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.directURL = ""
 	state.lastRecovery = time.Now()
 	placeholder := state.placeholder
-	// Capture the handoff as the last placeholder segment actually visible
-	// in the stitched playlist (disk highest at stitch time). The stitched
-	// playlist renumbers film segments starting at highest+1.
+	// Capture the handoff capped to what the player actually consumed.
+	// The placeholder never stops (concat loop), so disk highest = total
+	// buffered (~handoff=558 after 34s in the bug report). The player
+	// only consumed elapsed/segDuration segments (e.g. 34/4 ≈ 8).
+	// Stitching at 558 forces a ~936-entry playlist the player rejects.
 	if placeholder != nil {
+		startedAt := state.placeholderStartedAt
 		state.mu.Unlock()
 		h := highestCompleteSegment(placeholder.dir)
 		state.mu.Lock()
 		if h >= 0 {
+			// Cap to elapsed: player buffered ~ elapsed/4 segments.
+			if !startedAt.IsZero() {
+				elapsed := time.Since(startedAt).Seconds()
+				consumed := int(elapsed / ffmpeg.SegDuration())
+				if consumed < h {
+					h = consumed
+				}
+			}
 			state.placeholderHighest = h
 		}
-		ho2 := state.placeholderHighest
 		state.mu.Unlock()
 		placeholder.session.Cancel()
 		select {
@@ -254,12 +267,6 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		case <-time.After(2 * time.Second):
 		}
 		state.mu.Lock()
-		// If placeholder produced more segments while we cancelled, extend
-		// handoff so stitched playlist doesn't miss any.
-		h2 := highestCompleteSegment(placeholder.dir)
-		if h2 > ho2 {
-			state.placeholderHighest = h2
-		}
 		state.stitched = true
 		state.mu.Unlock()
 		state.mu.Lock()
@@ -370,6 +377,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 
 	state.mu.Lock()
 	state.placeholder = gen
+	state.placeholderStartedAt = time.Now()
 	wait := state.placeholderWait
 	state.mu.Unlock()
 	if wait != nil {
@@ -1032,14 +1040,59 @@ func (m *Muxer) stitchedVideoPlaylistContent(state *playbackState) ([]byte, bool
 	}
 	phLines := strings.Split(strings.TrimRight(string(phRaw), "\n"), "\n")
 	filmLines := strings.Split(strings.TrimRight(string(filmRaw), "\n"), "\n")
+	// Compute max TARGETDURATION so stitched EXTINF never exceeds it.
+	maxTarget := 0
+	for _, lines := range [][]string{phLines, filmLines} {
+		for _, l := range lines {
+			if strings.HasPrefix(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:") {
+				var v int
+				if _, err := fmt.Sscanf(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:%d", &v); err == nil && v > maxTarget {
+					maxTarget = v
+				}
+			}
+		}
+	}
+	limit := state.placeholderHighest + 1
+	if limit < 0 {
+		limit = 0
+	}
 	var out []string
 	headerDone := false
+	phSegs := 0
 	for _, l := range phLines {
 		trim := strings.TrimSpace(l)
-		if strings.HasPrefix(trim, "#EXTINF:") || (!headerDone && trim != "" && !strings.HasPrefix(trim, "#")) {
-			headerDone = true
+		isSegFile := trim != "" && !strings.HasPrefix(trim, "#")
+		if !headerDone {
+			if strings.HasPrefix(trim, "#EXTINF:") || isSegFile {
+				headerDone = true
+			}
 		}
 		if headerDone && strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
+			continue
+		}
+		// Rewrite TARGETDURATION to max so film segments with larger EXTINF are valid.
+		if strings.HasPrefix(trim, "#EXT-X-TARGETDURATION:") && maxTarget > 0 {
+			l = fmt.Sprintf("#EXT-X-TARGETDURATION:%d", maxTarget)
+		}
+		// After header, count segments and truncate to handoff.
+		if headerDone && isSegFile {
+			if phSegs >= limit {
+				// Skip this segment file; the preceding EXTINF was already
+				// added and must be removed. The previous iteration added
+				// EXTINF for this segment — drop it.
+				if len(out) > 0 && strings.HasPrefix(strings.TrimSpace(out[len(out)-1]), "#EXTINF:") {
+					out = out[:len(out)-1]
+				}
+				continue
+			}
+			phSegs++
+		}
+		// Keep header lines and segments within limit; drop extra placeholder segments.
+		if !headerDone {
+			out = append(out, l)
+			if strings.HasPrefix(trim, "#EXTINF:") {
+				headerDone = true
+			}
 			continue
 		}
 		out = append(out, l)
@@ -1085,8 +1138,6 @@ func (m *Muxer) stitchedVideoPlaylistContent(state *playbackState) ([]byte, bool
 			continue
 		}
 		if trim != "" && !strings.HasPrefix(trim, "#") {
-			// Renumber film segment filenames so the stitched playlist has
-			// monotonically increasing indices (no duplicate seg_00000.ts).
 			l = fmt.Sprintf("seg_%05d.ts", filmIndex+offset)
 			filmIndex++
 		}
@@ -1119,14 +1170,52 @@ func (m *Muxer) stitchedAudioPlaylistContent(state *playbackState) ([]byte, bool
 	}
 	phLines := strings.Split(strings.TrimRight(string(phRaw), "\n"), "\n")
 	filmLines := strings.Split(strings.TrimRight(string(filmRaw), "\n"), "\n")
+	maxTarget := 0
+	for _, lines := range [][]string{phLines, filmLines} {
+		for _, l := range lines {
+			if strings.HasPrefix(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:") {
+				var v int
+				if _, err := fmt.Sscanf(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:%d", &v); err == nil && v > maxTarget {
+					maxTarget = v
+				}
+			}
+		}
+	}
+	limit := state.placeholderHighest + 1
+	if limit < 0 {
+		limit = 0
+	}
 	var out []string
 	headerDone := false
+	phSegs := 0
 	for _, l := range phLines {
 		trim := strings.TrimSpace(l)
-		if strings.HasPrefix(trim, "#EXTINF:") || (!headerDone && trim != "" && !strings.HasPrefix(trim, "#")) {
-			headerDone = true
+		isSegFile := trim != "" && !strings.HasPrefix(trim, "#")
+		if !headerDone {
+			if strings.HasPrefix(trim, "#EXTINF:") || isSegFile {
+				headerDone = true
+			}
 		}
 		if headerDone && strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
+			continue
+		}
+		if strings.HasPrefix(trim, "#EXT-X-TARGETDURATION:") && maxTarget > 0 {
+			l = fmt.Sprintf("#EXT-X-TARGETDURATION:%d", maxTarget)
+		}
+		if headerDone && isSegFile {
+			if phSegs >= limit {
+				if len(out) > 0 && strings.HasPrefix(strings.TrimSpace(out[len(out)-1]), "#EXTINF:") {
+					out = out[:len(out)-1]
+				}
+				continue
+			}
+			phSegs++
+		}
+		if !headerDone {
+			out = append(out, l)
+			if strings.HasPrefix(trim, "#EXTINF:") {
+				headerDone = true
+			}
 			continue
 		}
 		out = append(out, l)
