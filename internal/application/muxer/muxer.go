@@ -55,9 +55,9 @@ func defaultPolicy() Policy {
 		AttemptTimeout:    20 * time.Second,
 		SegmentTimeout:    30 * time.Second,
 		IdleTimeout:       90 * time.Second,
-		HealthWindow:      12 * time.Second,
-		RecoveryCooldown:  30 * time.Second,
-		MinRealtime:       0.95,
+		HealthWindow:      4 * time.Second,
+		RecoveryCooldown:  10 * time.Second,
+		MinRealtime:       1.0,
 		MinPublishedAhead: 12 * time.Second,
 		DurationTolerance: 0.002,
 	}

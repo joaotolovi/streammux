@@ -20,7 +20,7 @@ func TestHealthTrackerRequiresTwoSlowNonOverlappingWindows(t *testing.T) {
 	if decision := tracker.observe(ffmpeg.ProgressSample{At: start, OutTime: time.Second}); decision.downgrade {
 		t.Fatal("first sample must not request downgrade")
 	}
-	first := tracker.observe(ffmpeg.ProgressSample{At: start.Add(10 * time.Second), OutTime: 5 * time.Second})
+	first := tracker.observe(ffmpeg.ProgressSample{At: start.Add(4 * time.Second), OutTime: 2 * time.Second})
 	if first.downgrade {
 		t.Fatal("one slow window must not request downgrade")
 	}
@@ -28,7 +28,7 @@ func TestHealthTrackerRequiresTwoSlowNonOverlappingWindows(t *testing.T) {
 		t.Fatalf("first realtime = %.2f, want below %.2f", first.realtime, policy.MinRealtime)
 	}
 
-	second := tracker.observe(ffmpeg.ProgressSample{At: start.Add(22 * time.Second), OutTime: 9 * time.Second})
+	second := tracker.observe(ffmpeg.ProgressSample{At: start.Add(8 * time.Second), OutTime: 3 * time.Second})
 	if !second.downgrade {
 		t.Fatalf("two slow windows should request downgrade; realtime %.2f", second.realtime)
 	}
@@ -40,8 +40,8 @@ func TestHealthTrackerHealthyWindowResetsSlowState(t *testing.T) {
 	start := time.Unix(200, 0)
 
 	tracker.observe(ffmpeg.ProgressSample{At: start, OutTime: time.Second})
-	tracker.observe(ffmpeg.ProgressSample{At: start.Add(10 * time.Second), OutTime: 5 * time.Second})
-	healthy := tracker.observe(ffmpeg.ProgressSample{At: start.Add(22 * time.Second), OutTime: 25 * time.Second})
+	tracker.observe(ffmpeg.ProgressSample{At: start.Add(4 * time.Second), OutTime: 2 * time.Second})
+	healthy := tracker.observe(ffmpeg.ProgressSample{At: start.Add(8 * time.Second), OutTime: 10 * time.Second})
 	if healthy.downgrade || healthy.realtime < 1 {
 		t.Fatalf("healthy window = %+v", healthy)
 	}
