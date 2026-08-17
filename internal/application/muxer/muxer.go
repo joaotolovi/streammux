@@ -3,6 +3,7 @@ package muxer
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
+	StartSinglePlaceholderSession(context.Context, string, string, bool) (*ffmpeg.Session, error)
 	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
 }
 
@@ -73,6 +75,11 @@ type Muxer struct {
 	baseURL   string
 	policy    Policy
 
+	// placeholderPath plays instantly while sources prepare; errorPath is the
+	// terminal "no source worked" video. Both optional.
+	placeholderPath string
+	errorPath       string
+
 	httpClient *http.Client
 
 	stateMu sync.Mutex
@@ -86,6 +93,9 @@ type Muxer struct {
 
 	offsetMu sync.Mutex
 	offsets  map[string]time.Duration
+
+	errSegOnce  sync.Once
+	errSegCount int
 }
 
 type Result struct {
@@ -94,24 +104,54 @@ type Result struct {
 }
 
 func New(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
+	return NewWithVideos(col, pl, ff, res, store, baseURL, "", "")
+}
+
+// NewWithVideos configures optional local placeholder and error videos.
+func NewWithVideos(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath, errorPath string) *Muxer {
 	m := &Muxer{
-		collector:      col,
-		planner:        pl,
-		ffmpeg:         ff,
-		resolver:       res,
-		store:          store,
-		baseURL:        strings.TrimSuffix(baseURL, "/"),
-		policy:         defaultPolicy(),
-		httpClient:     &http.Client{Timeout: 15 * time.Second},
-		states:         make(map[string]*playbackState),
-		resolved:       make(map[string]resolvedEntry),
-		resolveFlights: make(map[string]*resolveFlight),
-		probes:         make(map[string]probeEntry),
-		probeFlights:   make(map[string]*probeFlight),
-		offsets:        make(map[string]time.Duration),
+		collector:       col,
+		planner:         pl,
+		ffmpeg:          ff,
+		resolver:        res,
+		store:           store,
+		baseURL:         strings.TrimSuffix(baseURL, "/"),
+		policy:          defaultPolicy(),
+		placeholderPath: placeholderPath,
+		errorPath:       errorPath,
+		httpClient:      &http.Client{Timeout: 15 * time.Second},
+		states:          make(map[string]*playbackState),
+		resolved:        make(map[string]resolvedEntry),
+		resolveFlights:  make(map[string]*resolveFlight),
+		probes:          make(map[string]probeEntry),
+		probeFlights:    make(map[string]*probeFlight),
+		offsets:         make(map[string]time.Duration),
 	}
 	go m.reapIdleSessions()
 	return m
+}
+
+// errorSegmentCount returns how many HLS segments the error video spans,
+// probing the local file once.
+func (m *Muxer) errorSegmentCount() int {
+	m.errSegOnce.Do(func() {
+		m.errSegCount = 8 // ~30s at 4s segments; used if the probe fails
+		if m.errorPath == "" || m.ffmpeg == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if probe, err := m.ffmpeg.Probe(ctx, m.errorPath); err == nil && probe.Duration > 0 {
+			segDur := ffmpeg.SegDuration()
+			if segDur <= 0 {
+				segDur = 4.0
+			}
+			if count := int(math.Ceil(probe.Duration / segDur)); count > 0 {
+				m.errSegCount = count
+			}
+		}
+	})
+	return m.errSegCount
 }
 
 // Process performs only addon collection and inexpensive metadata planning.

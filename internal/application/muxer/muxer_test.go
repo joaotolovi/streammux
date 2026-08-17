@@ -176,10 +176,18 @@ func TestUniqueAddonsDoesNotQueryBothRoleTwice(t *testing.T) {
 	}
 }
 
-func TestBuildVodPlaylistFullTimelineWithDiscontinuity(t *testing.T) {
-	data, ok := buildVodPlaylist(10, []int{2})
+func TestRenderMediaPlaylistVodWithDiscontinuity(t *testing.T) {
+	state := &playbackState{
+		duration:        10,
+		filmBase:        0,
+		discontinuities: []int{2},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	data, ok := mux.VideoPlaylist(job)
 	if !ok {
-		t.Fatal("buildVodPlaylist() returned false")
+		t.Fatal("VideoPlaylist() returned false")
 	}
 	playlist := string(data)
 	for _, want := range []string{
@@ -187,7 +195,6 @@ func TestBuildVodPlaylistFullTimelineWithDiscontinuity(t *testing.T) {
 		"#EXT-X-MEDIA-SEQUENCE:0",
 		"seg_00000.ts",
 		"#EXT-X-DISCONTINUITY\n#EXTINF:2.000000,\nseg_00002.ts",
-		"seg_00001.ts",
 		"#EXT-X-ENDLIST",
 	} {
 		if !strings.Contains(playlist, want) {
@@ -196,6 +203,138 @@ func TestBuildVodPlaylistFullTimelineWithDiscontinuity(t *testing.T) {
 	}
 	if strings.Count(playlist, "#EXT-X-DISCONTINUITY") != 1 {
 		t.Fatalf("expected exactly one discontinuity: %s", playlist)
+	}
+}
+
+func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
+	// The film occupies [2..7) of the public timeline (28s = 7 segments).
+	state := &playbackState{
+		duration:        28,
+		filmBase:        2,
+		discontinuities: []int{2},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	data, ok := mux.VideoPlaylist(job)
+	if !ok {
+		t.Fatal("VideoPlaylist() returned false")
+	}
+	playlist := string(data)
+	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:2\n") {
+		t.Fatalf("playlist must start at the film base: %s", playlist[:120])
+	}
+	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n#EXTINF:4.000000,\nseg_00002.ts") {
+		t.Fatalf("playlist missing cutover discontinuity: %s", playlist)
+	}
+	if strings.Contains(playlist, "seg_00000.ts") || strings.Contains(playlist, "seg_00001.ts") {
+		t.Fatalf("playlist must not list placeholder segments: %s", playlist)
+	}
+	if !strings.Contains(playlist, "seg_00006.ts") || strings.Contains(playlist, "seg_00007.ts") {
+		t.Fatalf("playlist must list exactly the film range: %s", playlist)
+	}
+}
+
+func TestRenderMediaPlaylistErrorTailTruncatesFilm(t *testing.T) {
+	// Mid-playback failure at segment 4: film [0..4) + error [4..4+8).
+	state := &playbackState{
+		duration:        120,
+		filmBase:        0,
+		discontinuities: []int{4},
+		errorGeneration: &generation{dir: t.TempDir(), isError: true},
+		errorStart:      4,
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	data, ok := mux.VideoPlaylist(job)
+	if !ok {
+		t.Fatal("VideoPlaylist() returned false")
+	}
+	playlist := string(data)
+	if strings.Contains(playlist, "seg_00004.ts\n#EXTINF") == false && !strings.Contains(playlist, "seg_00011.ts") {
+		t.Fatalf("error segments missing: %s", playlist)
+	}
+	if strings.Contains(playlist, "seg_00012.ts") {
+		t.Fatalf("playlist must end after the error video: %s", playlist)
+	}
+	if !strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("playlist must end with ENDLIST: %s", playlist)
+	}
+}
+
+func TestRenderMediaPlaylistErrorOnlyAfterPlaceholder(t *testing.T) {
+	// Startup failed while the placeholder played: [0..3) placeholder +
+	// DISCONTINUITY + error video.
+	state := &playbackState{
+		errorGeneration:    &generation{dir: t.TempDir(), isError: true},
+		errorStart:         3,
+		retiredPlaceholder: &generation{dir: t.TempDir()},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	data, ok := mux.VideoPlaylist(job)
+	if !ok {
+		t.Fatal("VideoPlaylist() returned false")
+	}
+	playlist := string(data)
+	if !strings.Contains(playlist, "seg_00000.ts") || !strings.Contains(playlist, "seg_00002.ts") {
+		t.Fatalf("placeholder prefix missing: %s", playlist)
+	}
+	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n#EXTINF:4.000000,\nseg_00003.ts") {
+		t.Fatalf("error cutover missing: %s", playlist)
+	}
+	if !strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("playlist must end with ENDLIST: %s", playlist)
+	}
+}
+
+func TestLastCommonSegmentUsesCommonWindow(t *testing.T) {
+	dir := t.TempDir()
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	video := "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4,\nseg_00000.ts\n#EXTINF:4,\nseg_00001.ts\n"
+	audio := video + "#EXTINF:4,\nseg_00002.ts\n"
+	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastCommonSegment(&generation{dir: dir}); got != 1 {
+		t.Fatalf("lastCommonSegment() = %d, want 1", got)
+	}
+}
+
+func TestSynchronizedLiveWindowExposesCommonSegmentsOnly(t *testing.T) {
+	dir := t.TempDir()
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	video := "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4,\nseg_00000.ts\n#EXTINF:4,\nseg_00001.ts\n"
+	audio := video + "#EXTINF:4,\nseg_00002.ts\n"
+	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
+		t.Fatal(err)
+	}
+	data, ok := synchronizedLiveWindow(&generation{dir: dir})
+	if !ok {
+		t.Fatal("synchronizedLiveWindow() returned false")
+	}
+	playlist := string(data)
+	if strings.Contains(playlist, "seg_00002.ts") {
+		t.Fatalf("window exposed audio-only segment: %s", playlist)
+	}
+	if !strings.Contains(playlist, "seg_00001.ts") || !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:0") {
+		t.Fatalf("window missing common segment: %s", playlist)
 	}
 }
 
@@ -302,7 +441,7 @@ func TestVodPlaylistServesFullDurationImmediately(t *testing.T) {
 	// A 2h film must expose 1800 segments from the very first request.
 	state := &playbackState{
 		duration: 7200,
-		active:   &generation{dir: t.TempDir(), planIndex: 0},
+		filmBase: 0,
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}

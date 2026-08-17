@@ -12,6 +12,7 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		VideoTrackIndex: 1,
 		AudioTrackIndex: 2,
 		StartSegment:    3,
+		StartTime:       12,
 		OutputDir:       "/tmp/session",
 		AudioMode:       AudioModeCopy,
 		AudioLanguage:   "pt-BR",
@@ -55,6 +56,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		VideoTrackIndex: 0,
 		AudioTrackIndex: 3,
 		StartSegment:    5,
+		StartTime:       20,
 		OutputDir:       "/tmp/dual",
 		AudioMode:       AudioMode("AAC"),
 	}

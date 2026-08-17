@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -34,12 +35,17 @@ type SessionSpec struct {
 	AudioURL        string
 	VideoTrackIndex int
 	AudioTrackIndex int
-	StartSegment    int
-	OutputDir       string
-	AudioMode       AudioMode
-	AudioLanguage   string
-	AudioTitle      string
-	UserAgent       string
+	// StartSegment is the first HLS segment number written (start_number).
+	StartSegment int
+	// StartTime is the content offset in seconds (-ss). It is independent of
+	// StartSegment: the placeholder handoff numbers film segments from N while
+	// still playing content from 0:00.
+	StartTime     float64
+	OutputDir     string
+	AudioMode     AudioMode
+	AudioLanguage string
+	AudioTitle    string
+	UserAgent     string
 	// AudioOffset shifts the dubbed audio relative to the video, in seconds.
 	// Positive delays the audio (moves it later); negative advances it. It is
 	// only applied for dual-source sessions and is derived from a cross-
@@ -152,7 +158,10 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		return nil, fmt.Errorf("ffmpeg session: unsupported audio mode %q", spec.AudioMode)
 	}
 
-	offset := float64(spec.StartSegment) * segDuration
+	offset := spec.StartTime
+	if offset < 0 {
+		offset = 0
+	}
 	args := []string{
 		"-nostdin",
 		"-hide_banner",
@@ -350,4 +359,111 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// buildPlaceholderArgs encodes a local video as a live-looking HLS window:
+// real-time read rate and a small sliding window. omitEndlist keeps the
+// timeline open for the placeholder (the film takes over); the error video
+// ends naturally with ENDLIST so playback stops after it.
+func buildPlaceholderArgs(path, outputDir string, omitEndlist bool) []string {
+	videoFlags := "independent_segments+temp_file"
+	audioFlags := "independent_segments+temp_file+split_by_time"
+	if omitEndlist {
+		videoFlags += "+omit_endlist"
+		audioFlags += "+omit_endlist"
+	}
+	return []string{
+		"-nostdin",
+		"-hide_banner",
+		"-nostats",
+		"-readrate", "1",
+		"-readrate_initial_burst", fmtDuration(segDuration),
+		"-i", path,
+		"-map", "0:v:0",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
+		"-force_key_frames", "expr:gte(t,n_forced*4)",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "3",
+		"-hls_allow_cache", "0",
+		"-hls_flags", videoFlags,
+		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "video", "video.m3u8"),
+		"-map", "0:a:0",
+		"-c:a", "aac", "-b:a", "128k",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "3",
+		"-hls_allow_cache", "0",
+		"-hls_flags", audioFlags,
+		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "audio", "audio.m3u8"),
+	}
+}
+
+// StartSinglePlaceholderSession launches a local video as a live-window HLS
+// session. omitEndlist=true keeps the timeline open (placeholder handoff);
+// false lets the stream end with ENDLIST (error video).
+func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, omitEndlist bool) (*Session, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("placeholder session: no video provided")
+	}
+	if strings.TrimSpace(outputDir) == "" {
+		return nil, fmt.Errorf("placeholder session: output directory is required")
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "video"), 0755); err != nil {
+		return nil, fmt.Errorf("placeholder session: video dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "audio"), 0755); err != nil {
+		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
+	}
+
+	args := buildPlaceholderArgs(path, outputDir, omitEndlist)
+
+	sessCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
+	stderr := newTailBuffer(stderrTailSize)
+	cmd.Stderr = stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("placeholder progress pipe: %w", err)
+	}
+
+	s := &Session{
+		cancel:   cancel,
+		done:     make(chan struct{}),
+		progress: make(chan ProgressSample, 1),
+		startN:   0,
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("placeholder start: %w", err)
+	}
+
+	go func() {
+		parseErr := parseProgress(stdout, s.progress, time.Now)
+		if parseErr != nil {
+			_, _ = io.Copy(io.Discard, stdout)
+		}
+		waitErr := cmd.Wait()
+		if waitErr != nil {
+			if ctxErr := sessCtx.Err(); ctxErr != nil {
+				waitErr = ctxErr
+			}
+			s.setErr(ffmpegRunError(waitErr, stderr.String()))
+		} else if parseErr != nil {
+			s.setErr(ffmpegRunError(fmt.Errorf("read progress: %w", parseErr), stderr.String()))
+		}
+		cancel()
+		close(s.progress)
+		close(s.done)
+	}()
+
+	return s, nil
 }

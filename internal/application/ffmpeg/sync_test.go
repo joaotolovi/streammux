@@ -114,8 +114,8 @@ func TestCrossCorrelateLagConfidence(t *testing.T) {
 	noiseA := make([]int16, 15*syncSampleRate)
 	noiseB := make([]int16, len(noiseA))
 	for i := range noiseA {
-		noiseA[i] = int16((i*7919 + 13) % 40000) - 20000
-		noiseB[i] = int16((i*104729 + 7) % 40000) - 20000
+		noiseA[i] = int16((i*7919+13)%40000) - 20000
+		noiseB[i] = int16((i*104729+7)%40000) - 20000
 	}
 	_, confNoise := crossCorrelateLag(noiseA, noiseB)
 	if confNoise >= SyncMinConfidence {
