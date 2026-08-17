@@ -421,6 +421,8 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 	args = append(args,
 		"-map", "[v]",
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
+		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
 		"-hls_playlist_type", "event",

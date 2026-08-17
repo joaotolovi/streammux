@@ -197,17 +197,10 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 }
 
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
-	stitchOffset := 0
-	state.mu.Lock()
-	if state.placeholder != nil {
-		h := highestCompleteSegment(state.placeholder.dir)
-		if h >= 0 {
-			state.placeholderHighest = h
-			stitchOffset = h + 1
-		}
-	}
-	state.mu.Unlock()
-	winner, err := m.coordinateAttempts(job, state, 0, stitchOffset, m.policy.StartupTimeout)
+	// Film always starts at segment 0 on disk. The stitched playlist
+	// virtually renumbers film segments to placeholderHighest+1.., so the
+	// physical offset is resolved at serve time (SegmentPath + Stitched*).
+	winner, err := m.coordinateAttempts(job, state, 0, 0, m.policy.StartupTimeout)
 	if err != nil {
 		direct := m.resolveDirectFallback(job, state)
 		state.mu.Lock()
@@ -243,7 +236,17 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.directURL = ""
 	state.lastRecovery = time.Now()
 	placeholder := state.placeholder
+	// Capture the handoff as the last placeholder segment actually visible
+	// in the stitched playlist (disk highest at stitch time). The stitched
+	// playlist renumbers film segments starting at highest+1.
 	if placeholder != nil {
+		state.mu.Unlock()
+		h := highestCompleteSegment(placeholder.dir)
+		state.mu.Lock()
+		if h >= 0 {
+			state.placeholderHighest = h
+		}
+		ho2 := state.placeholderHighest
 		state.mu.Unlock()
 		placeholder.session.Cancel()
 		select {
@@ -251,6 +254,12 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		case <-time.After(2 * time.Second):
 		}
 		state.mu.Lock()
+		// If placeholder produced more segments while we cancelled, extend
+		// handoff so stitched playlist doesn't miss any.
+		h2 := highestCompleteSegment(placeholder.dir)
+		if h2 > ho2 {
+			state.placeholderHighest = h2
+		}
 		state.stitched = true
 		state.mu.Unlock()
 		state.mu.Lock()
@@ -676,11 +685,13 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 				state.mu.Unlock()
 				return path
 			}
-		}
-		path := generationAudioSegmentPath(state.active, segment)
-		if fileExists(path) {
-			state.mu.Unlock()
-			return path
+		} else {
+			filmIndex := segment - (state.placeholderHighest + 1) + state.active.startSegment
+			path := generationAudioSegmentPath(state.active, filmIndex)
+			if fileExists(path) {
+				state.mu.Unlock()
+				return path
+			}
 		}
 		state.mu.Unlock()
 		return ""
@@ -718,11 +729,13 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 				state.mu.Unlock()
 				return path
 			}
-		}
-		path := generationSegmentPath(state.active, segment)
-		if fileExists(path) {
-			state.mu.Unlock()
-			return path
+		} else {
+			filmIndex := segment - (state.placeholderHighest + 1) + state.active.startSegment
+			path := generationSegmentPath(state.active, filmIndex)
+			if fileExists(path) {
+				state.mu.Unlock()
+				return path
+			}
 		}
 		state.mu.Unlock()
 		return ""
@@ -1053,6 +1066,8 @@ func (m *Muxer) stitchedVideoPlaylistContent(state *playbackState) ([]byte, bool
 			out = append(out, "#EXT-X-DISCONTINUITY")
 		}
 	}
+	offset := state.placeholderHighest + 1 - state.active.startSegment
+	filmIndex := 0
 	inHeader := true
 	for _, l := range filmLines {
 		trim := strings.TrimSpace(l)
@@ -1068,6 +1083,12 @@ func (m *Muxer) stitchedVideoPlaylistContent(state *playbackState) ([]byte, bool
 		}
 		if strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
 			continue
+		}
+		if trim != "" && !strings.HasPrefix(trim, "#") {
+			// Renumber film segment filenames so the stitched playlist has
+			// monotonically increasing indices (no duplicate seg_00000.ts).
+			l = fmt.Sprintf("seg_%05d.ts", filmIndex+offset)
+			filmIndex++
 		}
 		out = append(out, l)
 	}
@@ -1132,6 +1153,8 @@ func (m *Muxer) stitchedAudioPlaylistContent(state *playbackState) ([]byte, bool
 			out = append(out, "#EXT-X-DISCONTINUITY")
 		}
 	}
+	offset := state.placeholderHighest + 1 - state.active.startSegment
+	filmIndex := 0
 	inHeader := true
 	for _, l := range filmLines {
 		trim := strings.TrimSpace(l)
@@ -1147,6 +1170,10 @@ func (m *Muxer) stitchedAudioPlaylistContent(state *playbackState) ([]byte, bool
 		}
 		if strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
 			continue
+		}
+		if trim != "" && !strings.HasPrefix(trim, "#") {
+			l = fmt.Sprintf("seg_%05d.ts", filmIndex+offset)
+			filmIndex++
 		}
 		out = append(out, l)
 	}
