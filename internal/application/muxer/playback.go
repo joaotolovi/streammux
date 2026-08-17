@@ -631,10 +631,10 @@ func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
-	if state.active == nil {
+	if state.active == nil || state.filmDuration <= 0 {
 		return nil, false
 	}
-	return paddedFilmPlaylist(filepath.Join(state.active.dir, "video", "video.m3u8"), state.filmDuration)
+	return buildVodPlaylist(state.filmDuration)
 }
 
 func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
@@ -645,10 +645,10 @@ func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
-	if state.active == nil {
+	if state.active == nil || state.filmDuration <= 0 {
 		return nil, false
 	}
-	return paddedFilmPlaylist(filepath.Join(state.active.dir, "audio", "audio.m3u8"), state.filmDuration)
+	return buildVodPlaylist(state.filmDuration)
 }
 
 func (m *Muxer) StitchedVideoPlaylist(job *model.MuxJob) ([]byte, bool) { return nil, false }
@@ -950,97 +950,62 @@ func highestCompleteSegment(dir string) int {
 
 
 
-func paddedFilmPlaylist(playlistPath string, filmDuration float64) ([]byte, bool) {
-	raw, err := os.ReadFile(playlistPath)
-	if err != nil {
+func buildVodPlaylist(filmDuration float64) ([]byte, bool) {
+	if filmDuration <= 0 {
 		return nil, false
 	}
-	if filmDuration <= 0 {
-		return raw, true
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4.0
 	}
-	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	published := 0.0
-	for _, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
-			if d, err := parseExtInf(strings.TrimSpace(l)); err == nil {
-				published += d
-			}
+	segs := computeEqualLengthSegments(segDur, filmDuration)
+	if len(segs) == 0 {
+		return nil, false
+	}
+	maxSeg := segs[0]
+	for _, s := range segs[1:] {
+		if s > maxSeg {
+			maxSeg = s
 		}
 	}
-	remaining := filmDuration - published
-	if remaining <= 0.5 {
-		return raw, true
+	target := int(math.Ceil(maxSeg))
+	if target < 1 {
+		target = 1
 	}
-	avgSeg := ffmpeg.SegDuration()
-	if v := avgExtInf(lines); v > 0 {
-		avgSeg = v
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:6\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", target))
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	for i, d := range segs {
+		b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", d))
+		b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
 	}
-	virtualCount := int(math.Ceil(remaining / avgSeg))
-	if virtualCount < 1 {
-		virtualCount = 1
-	}
-	if virtualCount > 2000 {
-		virtualCount = 2000
-	}
-	filmSegs := 0
-	for _, l := range lines {
-		if !strings.HasPrefix(strings.TrimSpace(l), "#") && strings.TrimSpace(l) != "" {
-			filmSegs++
-		}
-	}
-	var out []string
-	for _, l := range lines {
-		if strings.TrimSpace(l) == "#EXT-X-ENDLIST" {
-			continue
-		}
-		out = append(out, l)
-	}
-	for i := 0; i < virtualCount; i++ {
-		d := avgSeg
-		if i == virtualCount-1 {
-			d = remaining - float64(i)*avgSeg
-			if d <= 0 {
-				d = avgSeg
-			}
-			if d > avgSeg {
-				d = avgSeg
-			}
-		}
-		out = append(out, fmt.Sprintf("#EXTINF:%.3f,", d))
-		out = append(out, fmt.Sprintf("seg_%05d.ts", filmSegs+i))
-	}
-	return []byte(strings.Join(out, "\n") + "\n"), true
+	b.WriteString("#EXT-X-ENDLIST\n")
+	return []byte(b.String()), true
 }
 
-func parseExtInf(line string) (float64, error) {
-	rest := strings.TrimPrefix(line, "#EXTINF:")
-	rest = strings.SplitN(rest, ",", 2)[0]
-	var v float64
-	_, err := fmt.Sscanf(strings.TrimSpace(rest), "%f", &v)
-	return v, err
-}
-
-func avgExtInf(lines []string) float64 {
-	var sum float64
-	var n int
-	for _, l := range lines {
-		if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
-			if v, err := func() (float64, error) {
-				rest := strings.TrimPrefix(strings.TrimSpace(l), "#EXTINF:")
-				rest = strings.SplitN(rest, ",", 2)[0]
-				var f float64
-				_, err := fmt.Sscanf(strings.TrimSpace(rest), "%f", &f)
-				return f, err
-			}(); err == nil && v > 0 {
-				sum += v
-				n++
-			}
+func computeEqualLengthSegments(segDur, total float64) []float64 {
+	if segDur <= 0 || total <= 0 {
+		return nil
+	}
+	n := int(total / segDur)
+	rem := total - float64(n)*segDur
+	if rem < 1e-9 {
+		out := make([]float64, n)
+		for i := range out {
+			out[i] = segDur
 		}
+		return out
 	}
-	if n == 0 {
-		return 0
+	out := make([]float64, n+1)
+	for i := 0; i < n; i++ {
+		out[i] = segDur
 	}
-	return sum / float64(n)
+	out[n] = rem
+	return out
 }
 
 func (m *Muxer) reapIdleSessions() {
