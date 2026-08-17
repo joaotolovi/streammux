@@ -369,7 +369,7 @@ func (s *Server) handleHLSVariantVideoPlaylist(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadGateway, "playlist not ready")
 		return
 	}
-	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex, 0)
 	if err != nil {
 		log.Printf("mux variant %d: %v", planIndex, err)
 		writeError(w, http.StatusBadGateway, "variant source unavailable")
@@ -398,7 +398,7 @@ func (s *Server) handleHLSVariantAudioPlaylist(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadGateway, "playlist not ready")
 		return
 	}
-	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex, 0)
 	if err != nil {
 		log.Printf("mux variant %d: %v", planIndex, err)
 		writeError(w, http.StatusBadGateway, "variant source unavailable")
@@ -433,13 +433,12 @@ func (s *Server) handleHLSVariantSegment(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadGateway, "segment source unavailable")
 		return
 	}
-	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	segPath, err := s.muxer.EnsureVariantSegment(r.Context(), job, planIndex, segIndex)
 	if err != nil {
 		log.Printf("mux variant %d segment: %v", planIndex, err)
 		writeError(w, http.StatusBadGateway, "variant source unavailable")
 		return
 	}
-	segPath := filepath.Join(filepath.Dir(path), fmt.Sprintf("seg_%05d.ts", segIndex))
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, segPath)
 }
@@ -467,16 +466,16 @@ func (s *Server) handleHLSVariantAudioSegment(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadGateway, "segment source unavailable")
 		return
 	}
-	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	segPath, err := s.muxer.EnsureVariantSegment(r.Context(), job, planIndex, segIndex)
 	if err != nil {
 		log.Printf("mux variant %d audio segment: %v", planIndex, err)
 		writeError(w, http.StatusBadGateway, "variant source unavailable")
 		return
 	}
-	audioDir := filepath.Join(filepath.Dir(filepath.Dir(path)), "audio")
-	segPath := filepath.Join(audioDir, fmt.Sprintf("seg_%05d.ts", segIndex))
+	audioDir := filepath.Join(filepath.Dir(filepath.Dir(segPath)), "audio")
+	audioSeg := filepath.Join(audioDir, fmt.Sprintf("seg_%05d.ts", segIndex))
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeFile(w, r, segPath)
+	http.ServeFile(w, r, audioSeg)
 }
 
 func parsePlanIndex(value string) (int, error) {

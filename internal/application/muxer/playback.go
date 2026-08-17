@@ -532,12 +532,15 @@ func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playback
 
 // EnsureVariant starts (or reuses) the generation for the given plan index,
 // used by the ABR master playlist when the player requests a non-primary
-// variant. It returns the generation's video playlist path once the first
-// segment exists. The primary plan (0) is started by runStartup; variants are
-// started lazily here.
-func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantIndex int) (string, error) {
+// variant. startSegment is the physical offset the player is at when switching
+// variants (an ABR switch is a seek on the new source), so the new generation
+// begins producing there instead of only from segment 0.
+func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantIndex, startSegment int) (string, error) {
 	if variantIndex < 0 {
 		return "", fmt.Errorf("variant %d out of range", variantIndex)
+	}
+	if startSegment < 0 {
+		startSegment = 0
 	}
 	state, err := m.stateFor(job)
 	if err != nil {
@@ -554,9 +557,11 @@ func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantInd
 	}
 	planIndex, ok := state.variantPlans[variantIndex]
 	if !ok {
-		// No mapping yet — EnsurePlaylist hasn't been called or the master
-		// hasn't been rendered. Fall back to variantIndex == planIndex.
-		planIndex = variantIndex
+		// No mapping yet — the master hasn't been rendered for this variant.
+		// Refuse instead of guessing, so the player retries after receiving
+		// the updated master rather than starting a stale plan.
+		state.mu.Unlock()
+		return "", fmt.Errorf("variant %d not yet available", variantIndex)
 	}
 	if planIndex < 0 || planIndex >= len(job.Plans) {
 		state.mu.Unlock()
@@ -568,18 +573,108 @@ func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantInd
 		state.mu.Unlock()
 		return generationVideoPlaylistPath(active), nil
 	}
-	// Reuse an already-started variant generation.
+	// Reuse an already-started variant generation at or before the offset.
 	if gen, ok := state.variants[planIndex]; ok {
-		path := generationVideoPlaylistPath(gen)
-		state.mu.Unlock()
-		if fileExists(path) {
-			return path, nil
+		if gen.startSegment <= startSegment {
+			path := generationVideoPlaylistPath(gen)
+			state.mu.Unlock()
+			if fileExists(path) {
+				return path, nil
+			}
 		}
-	} else {
-		state.mu.Unlock()
+	}
+	state.mu.Unlock()
+
+	gen, err := m.startAttempt(ctx, job, state, planIndex, startSegment, false)
+	if err != nil {
+		return "", err
+	}
+	state.mu.Lock()
+	state.variants[planIndex] = gen
+	state.mu.Unlock()
+	go m.monitorGeneration(job, state, gen)
+	return generationVideoPlaylistPath(gen), nil
+}
+
+// EnsureVariantSegment resolves a segment of an ABR variant. A variant switch
+// is a seek on the new source: if the existing variant generation started
+// before the requested offset and has not yet produced it (e.g. it started at
+// 0 but the player jumped to 50), the generation is restarted at that offset.
+func (m *Muxer) EnsureVariantSegment(ctx context.Context, job *model.MuxJob, variantIndex, segIndex int) (string, error) {
+	if variantIndex < 0 {
+		return "", fmt.Errorf("variant %d out of range", variantIndex)
+	}
+	state, err := m.stateFor(job)
+	if err != nil {
+		return "", err
 	}
 
-	gen, err := m.startAttempt(ctx, job, state, planIndex, 0, false)
+	// Resolve to plan index.
+	state.mu.Lock()
+	if variantIndex == 0 && state.active != nil {
+		active := state.active
+		filmSequence := state.filmSequence
+		state.mu.Unlock()
+		// v0 is the active film generation; its segments are renumbered by
+		// filmSequence, so translate the public index to the physical one.
+		physical := segIndex - filmSequence
+		if physical < 0 {
+			return "", fmt.Errorf("segment %d precedes film sequence", segIndex)
+		}
+		return m.ensureVariantSegmentInGeneration(ctx, job, state, active, physical)
+	}
+	planIndex, ok := state.variantPlans[variantIndex]
+	if !ok {
+		state.mu.Unlock()
+		return "", fmt.Errorf("variant %d not yet available", variantIndex)
+	}
+	if planIndex < 0 || planIndex >= len(job.Plans) {
+		state.mu.Unlock()
+		return "", fmt.Errorf("variant %d maps to plan %d out of range", variantIndex, planIndex)
+	}
+	gen, ok := state.variants[planIndex]
+	state.mu.Unlock()
+
+	// No generation yet — start it at the requested offset (a seek on the new
+	// source).
+	if gen == nil {
+		return m.startVariantAtOffset(ctx, job, state, planIndex, segIndex)
+	}
+	return m.ensureVariantSegmentInGeneration(ctx, job, state, gen, segIndex)
+}
+
+// ensureVariantSegmentInGeneration waits for segIndex in the given generation,
+// restarting it at the offset if the encoder is too far behind.
+func (m *Muxer) ensureVariantSegmentInGeneration(ctx context.Context, job *model.MuxJob, state *playbackState, gen *generation, segIndex int) (string, error) {
+	deadlineCtx, cancel := context.WithTimeout(ctx, m.policy.SegmentTimeout)
+	defer cancel()
+
+	for {
+		if path := generationSegmentPath(gen, segIndex); fileExists(path) {
+			return path, nil
+		}
+		highest := highestCompleteSegment(gen.dir)
+		// The generation started far behind the requested offset and hasn't
+		// produced it: restart at the offset instead of waiting forever.
+		if gen.startSegment <= segIndex && highest >= 0 && segIndex > highest+8 {
+			planIndex := gen.planIndex
+			cancel()
+			return m.startVariantAtOffset(ctx, job, state, planIndex, segIndex)
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return "", fmt.Errorf("timeout waiting for variant %d segment %d: %w", gen.planIndex, segIndex, deadlineCtx.Err())
+		case <-gen.session.Done():
+			return "", fmt.Errorf("variant session ended before segment %d: %v", segIndex, gen.session.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// startVariantAtOffset starts a fresh generation for planIndex at the given
+// physical offset and waits for its first segment.
+func (m *Muxer) startVariantAtOffset(ctx context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int) (string, error) {
+	gen, err := m.startAttempt(ctx, job, state, planIndex, startSegment, false)
 	if err != nil {
 		return "", err
 	}
@@ -779,11 +874,13 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Single-variant master until the variant segment mapping is proven
-	// stable for the placeholder handoff. Advertising multiple variants
-	// before that causes the player to fetch a failing variant (v1) and
-	// surface source error even though the primary (v0) is healthy.
+	// Advertise the active plan as v0, then lighter plans below it.
+	// v0 always reuses state.active in EnsureVariant, so the handoff
+	// race is safe regardless of when the player requests it.
 	planIndices := []int{activePlan}
+	for i := activePlan + 1; i < len(job.Plans) && len(planIndices) < 4; i++ {
+		planIndices = append(planIndices, i)
+	}
 
 	// Record the variant→plan mapping so EnsureVariant can resolve correctly.
 	state.mu.Lock()
