@@ -1,6 +1,7 @@
 package muxer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -171,5 +172,39 @@ func TestUniqueAddonsDoesNotQueryBothRoleTwice(t *testing.T) {
 	unique := uniqueAddons([]model.Addon{both, video})
 	if len(unique) != 1 {
 		t.Fatalf("uniqueAddons() length = %d, want 1", len(unique))
+	}
+}
+
+func TestBuildVodPlaylistPreservesFilmSequence(t *testing.T) {
+	data, ok := buildVodPlaylist(10, 11)
+	if !ok {
+		t.Fatal("buildVodPlaylist() returned false")
+	}
+	playlist := string(data)
+	for _, want := range []string{
+		"#EXT-X-PLAYLIST-TYPE:VOD",
+		"#EXT-X-MEDIA-SEQUENCE:11",
+		"#EXT-X-DISCONTINUITY",
+		"seg_00011.ts",
+		"seg_00012.ts",
+		"seg_00013.ts",
+		"#EXT-X-ENDLIST",
+	} {
+		if !strings.Contains(playlist, want) {
+			t.Fatalf("playlist missing %q: %s", want, playlist)
+		}
+	}
+}
+
+func TestComputeEqualLengthSegmentsUsesShortFinalSegment(t *testing.T) {
+	segments := computeEqualLengthSegments(4, 10)
+	want := []float64{4, 4, 2}
+	if len(segments) != len(want) {
+		t.Fatalf("segments length = %d, want %d", len(segments), len(want))
+	}
+	for i := range want {
+		if segments[i] != want[i] {
+			t.Fatalf("segments[%d] = %v, want %v", i, segments[i], want[i])
+		}
 	}
 }

@@ -31,10 +31,12 @@ type playbackState struct {
 	startErr  error
 	directURL string
 
-	placeholder        *generation
-	placeholderStarted bool
-	placeholderWait    chan struct{}
-	filmDuration       float64
+	placeholder              *generation
+	placeholderStarted       bool
+	placeholderWait          chan struct{}
+	placeholderLastRequested int
+	filmDuration             float64
+	filmSequence             int
 
 	recovering   bool
 	recoveryWait chan struct{}
@@ -49,14 +51,14 @@ type playbackState struct {
 }
 
 type generation struct {
-	id           uint64
-	planIndex    int
-	plan         model.PlaybackPlan
-	prepared     *preparedPlan
-	dir          string
-	session      *ffmpeg.Session
-	startSegment int
-	startedAt    time.Time
+	id            uint64
+	planIndex     int
+	plan          model.PlaybackPlan
+	prepared      *preparedPlan
+	dir           string
+	session       *ffmpeg.Session
+	startSegment  int
+	startedAt     time.Time
 	isPlaceholder bool
 }
 
@@ -73,11 +75,12 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &playbackState{
-		ctx:           ctx,
-		cancel:        cancel,
-		cacheDir:      dir,
-		lastRequested: -1,
-		lastAccess:    time.Now(),
+		ctx:                      ctx,
+		cancel:                   cancel,
+		cacheDir:                 dir,
+		placeholderLastRequested: -1,
+		lastRequested:            -1,
+		lastAccess:               time.Now(),
 	}
 	m.states[job.ID] = state
 	job.CacheDir = dir
@@ -210,6 +213,10 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		}
 		return
 	}
+	filmSequence := state.placeholderLastRequested + 1
+	if filmSequence < 0 {
+		filmSequence = 0
+	}
 	state.active = winner
 	state.all = append(state.all, winner)
 	state.nextPlan = winner.planIndex + 1
@@ -218,6 +225,8 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.directURL = ""
 	state.lastRecovery = time.Now()
 	state.filmDuration = winner.prepared.duration
+	state.filmSequence = filmSequence
+	state.lastRequested = -1
 	placeholder := state.placeholder
 	state.mu.Unlock()
 
@@ -623,21 +632,6 @@ func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
 	return generationAudioPlaylistPath(state.active)
 }
 
-func (m *Muxer) IsVodReady(job *model.MuxJob) bool {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return false
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.active == nil || state.filmDuration <= 0 {
-		return false
-	}
-	highest := highestCompleteSegment(state.active.dir)
-	segs := int(math.Ceil(state.filmDuration / ffmpeg.SegDuration()))
-	return highest >= 0 && highest+1 >= segs-1
-}
-
 func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
@@ -649,10 +643,7 @@ func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	if state.active == nil || state.filmDuration <= 0 {
 		return nil, false
 	}
-	if !IsVodReadyLocked(state) {
-		return nil, false
-	}
-	return buildVodPlaylist(state.filmDuration)
+	return buildVodPlaylist(state.filmDuration, state.filmSequence)
 }
 
 func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
@@ -666,15 +657,8 @@ func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
 	if state.active == nil || state.filmDuration <= 0 {
 		return nil, false
 	}
-	if !IsVodReadyLocked(state) {
-		return nil, false
-	}
-	return buildVodPlaylist(state.filmDuration)
+	return buildVodPlaylist(state.filmDuration, state.filmSequence)
 }
-
-func (m *Muxer) StitchedVideoPlaylist(job *model.MuxJob) ([]byte, bool) { return nil, false }
-
-func (m *Muxer) StitchedAudioPlaylist(job *model.MuxJob) ([]byte, bool) { return nil, false }
 
 func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	state := m.lookupState(job.ID)
@@ -684,21 +668,20 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	if state.active != nil {
-		if IsVodReadyLocked(state) {
-			state.mu.Unlock()
-			if segment < vodSegmentCount(state.filmDuration) {
-				if path := generationAudioSegmentPath(state.active, segment); fileExists(path) {
-					return path
-				}
-			}
+		physical := segment - state.filmSequence
+		active := state.active
+		duration := state.filmDuration
+		state.mu.Unlock()
+		if physical < 0 || physical >= vodSegmentCount(duration) {
 			return ""
 		}
-		if path := generationAudioSegmentPath(state.active, segment); fileExists(path) {
-			state.mu.Unlock()
+		if path := generationAudioSegmentPath(active, physical); fileExists(path) {
 			return path
 		}
-		state.mu.Unlock()
 		return ""
+	}
+	if segment > state.placeholderLastRequested {
+		state.placeholderLastRequested = segment
 	}
 	placeholder := state.placeholder
 	state.mu.Unlock()
@@ -718,21 +701,20 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	if state.active != nil {
-		if IsVodReadyLocked(state) {
-			state.mu.Unlock()
-			if segment < vodSegmentCount(state.filmDuration) {
-				if path := generationSegmentPath(state.active, segment); fileExists(path) {
-					return path
-				}
-			}
+		physical := segment - state.filmSequence
+		active := state.active
+		duration := state.filmDuration
+		state.mu.Unlock()
+		if physical < 0 || physical >= vodSegmentCount(duration) {
 			return ""
 		}
-		if path := generationSegmentPath(state.active, segment); fileExists(path) {
-			state.mu.Unlock()
+		if path := generationSegmentPath(active, physical); fileExists(path) {
 			return path
 		}
-		state.mu.Unlock()
 		return ""
+	}
+	if segment > state.placeholderLastRequested {
+		state.placeholderLastRequested = segment
 	}
 	placeholder := state.placeholder
 	state.mu.Unlock()
@@ -742,15 +724,6 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 		}
 	}
 	return ""
-}
-
-func IsVodReadyLocked(state *playbackState) bool {
-	if state.active == nil || state.filmDuration <= 0 {
-		return false
-	}
-	highest := highestCompleteSegment(state.active.dir)
-	segs := vodSegmentCount(state.filmDuration)
-	return highest >= 0 && highest+1 >= segs
 }
 
 func vodSegmentCount(filmDuration float64) int {
@@ -786,27 +759,31 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 
 		state.mu.Lock()
 		state.lastAccess = time.Now()
-		state.lastRequested = segment
+		physical := segment - state.filmSequence
+		state.lastRequested = physical
 		active := state.active
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		nextPlan := state.nextPlan
 		state.mu.Unlock()
 
+		if physical < 0 {
+			return "", fmt.Errorf("segment %d precedes film sequence", segment)
+		}
 		if active == nil {
 			if !recovering {
-				m.ensureRecovery(job, state, segment, nextPlan, "no active session")
+				m.ensureRecovery(job, state, physical, nextPlan, "no active session")
 			}
 		} else {
 			highest := highestCompleteSegment(active.dir)
 			select {
 			case <-active.session.Done():
 				if !recovering {
-					m.ensureRecovery(job, state, segment, nextPlan, "session ended")
+					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
 				}
 			default:
-				if highest >= active.startSegment && segment > highest+3 && !recovering {
-					m.ensureRecovery(job, state, segment, active.planIndex, "forward seek")
+				if highest >= active.startSegment && physical > highest+3 && !recovering {
+					m.ensureRecovery(job, state, physical, active.planIndex, "forward seek")
 				}
 			}
 		}
@@ -850,22 +827,26 @@ func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segme
 
 		state.mu.Lock()
 		state.lastAccess = time.Now()
-		state.lastRequested = segment
+		physical := segment - state.filmSequence
+		state.lastRequested = physical
 		active := state.active
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		nextPlan := state.nextPlan
 		state.mu.Unlock()
 
+		if physical < 0 {
+			return "", fmt.Errorf("audio segment %d precedes film sequence", segment)
+		}
 		if active == nil {
 			if !recovering {
-				m.ensureRecovery(job, state, segment, nextPlan, "no active session")
+				m.ensureRecovery(job, state, physical, nextPlan, "no active session")
 			}
 		} else {
 			select {
 			case <-active.session.Done():
 				if !recovering {
-					m.ensureRecovery(job, state, segment, nextPlan, "session ended")
+					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
 				}
 			default:
 			}
@@ -1007,9 +988,7 @@ func highestCompleteSegment(dir string) int {
 	return highest
 }
 
-
-
-func buildVodPlaylist(filmDuration float64) ([]byte, bool) {
+func buildVodPlaylist(filmDuration float64, sequence int) ([]byte, bool) {
 	if filmDuration <= 0 {
 		return nil, false
 	}
@@ -1035,12 +1014,15 @@ func buildVodPlaylist(filmDuration float64) ([]byte, bool) {
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", target))
-	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", sequence))
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	if sequence > 0 {
+		b.WriteString("#EXT-X-DISCONTINUITY\n")
+	}
 	for i, d := range segs {
 		b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", d))
-		b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
+		b.WriteString(fmt.Sprintf("seg_%05d.ts\n", sequence+i))
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	return []byte(b.String()), true
