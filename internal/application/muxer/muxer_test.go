@@ -325,7 +325,7 @@ func TestSynchronizedLiveWindowExposesCommonSegmentsOnly(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
 		t.Fatal(err)
 	}
-	data, ok := synchronizedLiveWindow(&generation{dir: dir})
+	data, ok := synchronizedLiveWindow(&generation{dir: dir}, -1)
 	if !ok {
 		t.Fatal("synchronizedLiveWindow() returned false")
 	}
@@ -335,6 +335,28 @@ func TestSynchronizedLiveWindowExposesCommonSegmentsOnly(t *testing.T) {
 	}
 	if !strings.Contains(playlist, "seg_00001.ts") || !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:0") {
 		t.Fatalf("window missing common segment: %s", playlist)
+	}
+
+	// Frozen handoff: the window must not advertise past the cap even though
+	// both playlists now contain further segments.
+	video2 := video + "#EXTINF:4,\nseg_00002.ts\n#EXTINF:4,\nseg_00003.ts\n"
+	audio2 := audio + "#EXTINF:4,\nseg_00003.ts\n"
+	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	frozen, ok := synchronizedLiveWindow(&generation{dir: dir}, 1)
+	if !ok {
+		t.Fatal("synchronizedLiveWindow(cap) returned false")
+	}
+	playlist = string(frozen)
+	if strings.Contains(playlist, "seg_00002.ts") || strings.Contains(playlist, "seg_00003.ts") {
+		t.Fatalf("frozen window advertised past the cap: %s", playlist)
+	}
+	if !strings.Contains(playlist, "seg_00001.ts") {
+		t.Fatalf("frozen window missing last common segment: %s", playlist)
 	}
 }
 

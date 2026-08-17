@@ -47,8 +47,11 @@ type playbackState struct {
 	placeholderWait    chan struct{}
 
 	// filmBase is the public segment index where film content 0:00 lives
-	// (nonzero when a placeholder played first).
+	// (nonzero when a placeholder played first). While >= 0 the placeholder
+	// live window is frozen at [..filmBase-1] so the media sequence can only
+	// move forward across the handoff (players reject sequence regression).
 	filmBase        int
+	placeholderLive bool
 	discontinuities []int
 
 	// errorGeneration is the terminal "no source worked" video.
@@ -363,17 +366,19 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 			break
 		}
 
-		// Handoff point: freeze the placeholder and number the film after it.
+		// Handoff point: freeze the advertised placeholder window at its
+		// last common segment. The session keeps running until the film
+		// takes over (rendering caps at filmBase-1), so the media sequence
+		// can only move forward — players reject sequence regression.
 		state.mu.Lock()
 		ph := state.placeholder
-		state.mu.Unlock()
 		base := 0
 		if ph != nil {
 			if common := lastCommonSegment(ph); common >= 0 {
 				base = common + 1
 			}
+			state.placeholderLive = false
 		}
-		state.mu.Lock()
 		state.filmBase = base
 		state.mu.Unlock()
 
@@ -896,9 +901,10 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob) ([]byte, bool) {
 	errStart := state.errorStart
 	state.mu.Unlock()
 
-	// Live placeholder phase: synchronized sliding window of both renditions.
+	// Live placeholder phase: synchronized sliding window of both renditions,
+	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
-		return synchronizedLiveWindow(placeholder)
+		return synchronizedLiveWindow(placeholder, base-1)
 	}
 
 	segDur := ffmpeg.SegDuration()
@@ -970,8 +976,9 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob) ([]byte, bool) {
 }
 
 // synchronizedLiveWindow renders the common A/V window of a live generation
-// so both renditions advertise exactly the same segments.
-func synchronizedLiveWindow(gen *generation) ([]byte, bool) {
+// so both renditions advertise exactly the same segments. cap limits the last
+// advertised segment (>=0) to freeze the window at a handoff point.
+func synchronizedLiveWindow(gen *generation, cap int) ([]byte, bool) {
 	videoPlaylist, err := readLivePlaylist(generationVideoPlaylistPath(gen))
 	if err != nil {
 		return nil, false
@@ -987,6 +994,9 @@ func synchronizedLiveWindow(gen *generation) ([]byte, bool) {
 	last := videoPlaylist.last
 	if audioPlaylist.last < last {
 		last = audioPlaylist.last
+	}
+	if cap >= 0 && last > cap {
+		last = cap
 	}
 	if first < 0 || last < first {
 		return nil, false
