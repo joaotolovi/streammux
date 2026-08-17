@@ -56,18 +56,22 @@ func main() {
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
 
-	// Placeholder videos: env vars override the embedded defaults.
-	introPath := envOr("PLACEHOLDER_INTRO", "")
-	loopPath := envOr("PLACEHOLDER_LOOP", "")
+	placeholderPath := envOr("PLACEHOLDER_VIDEO", "")
+	if placeholderPath == "" {
+		placeholderPath = envOr("PLACEHOLDER_INTRO", "")
+	}
+	if placeholderPath == "" {
+		placeholderPath = envOr("PLACEHOLDER_LOOP", "")
+	}
 	assetsDir := ""
-	if introPath == "" && loopPath == "" {
+	if placeholderPath == "" {
 		var err error
-		introPath, loopPath, assetsDir, err = assets.PlaceholderPaths()
+		placeholderPath, assetsDir, err = assets.PlaceholderPath()
 		if err != nil {
 			log.Fatalf("placeholder assets: %v", err)
 		}
 	}
-	mux := muxer.NewWithPlaceholder(collector, planner, ff, res, store, baseURL, introPath, loopPath)
+	mux := muxer.NewWithSinglePlaceholder(collector, planner, ff, res, store, baseURL, placeholderPath)
 	store.SetOnDelete(mux.CleanupJob)
 	if assetsDir != "" {
 		defer os.RemoveAll(assetsDir)

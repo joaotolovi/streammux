@@ -12,34 +12,12 @@ import (
 	"path/filepath"
 )
 
-//go:embed intro.mp4 loop.mp4 placeholder.mp4
+//go:embed placeholder.mp4
 var files embed.FS
 
-// PlaceholderPaths extracts the embedded intro and loop videos to a temporary
-// directory and returns their paths. The caller is responsible for removing
-// the returned directory when done. placeholder.mp4 is the unified 120s
-// intro+loop video (max wait); intro/loop are kept for backwards compat.
-func PlaceholderPaths() (introPath, loopPath, dir string, err error) {
-	dir, err = os.MkdirTemp("", "streammux-assets-*")
-	if err != nil {
-		return "", "", "", fmt.Errorf("assets temp dir: %w", err)
-	}
-	introPath, err = extract("intro.mp4", dir)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return "", "", "", err
-	}
-	loopPath, err = extract("loop.mp4", dir)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return "", "", "", err
-	}
-	return introPath, loopPath, dir, nil
-}
-
-// Placeholder120Path extracts the unified 120s placeholder (intro + loop,
-// trimmed to exactly 120s — the max wait before we error) to a temp dir.
-func Placeholder120Path() (path, dir string, err error) {
+// PlaceholderPath extracts the unified 120s placeholder (intro crossfaded into
+// loop, 120s total — the max wait before we error) to a temp dir.
+func PlaceholderPath() (path, dir string, err error) {
 	dir, err = os.MkdirTemp("", "streammux-assets-*")
 	if err != nil {
 		return "", "", fmt.Errorf("assets temp dir: %w", err)

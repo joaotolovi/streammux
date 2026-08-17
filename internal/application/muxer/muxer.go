@@ -27,7 +27,7 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
-	StartPlaceholderSession(context.Context, string, string, string) (*ffmpeg.Session, error)
+	StartSinglePlaceholderSession(context.Context, string, string) (*ffmpeg.Session, error)
 	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
 }
 
@@ -72,12 +72,7 @@ type Muxer struct {
 	baseURL   string
 	policy    Policy
 
-	// placeholderIntroPath and placeholderLoopPath are optional local videos
-	// played immediately while the real film is being prepared in the
-	// background. The intro plays once, then the loop video repeats until the
-	// film is ready.
-	placeholderIntroPath string
-	placeholderLoopPath   string
+	placeholderPath string
 
 	httpClient *http.Client
 
@@ -103,26 +98,31 @@ func New(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *r
 	return NewWithPlaceholder(col, pl, ff, res, store, baseURL, "", "")
 }
 
-// NewWithPlaceholder is New plus optional local placeholder videos: an intro
-// that plays once and a loop video that repeats until the film is ready.
 func NewWithPlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, introPath, loopPath string) *Muxer {
+	path := introPath
+	if path == "" {
+		path = loopPath
+	}
+	return NewWithSinglePlaceholder(col, pl, ff, res, store, baseURL, path)
+}
+
+func NewWithSinglePlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath string) *Muxer {
 	m := &Muxer{
-		collector:           col,
-		planner:             pl,
-		ffmpeg:              ff,
-		resolver:            res,
-		store:               store,
-		baseURL:             strings.TrimSuffix(baseURL, "/"),
-		policy:              defaultPolicy(),
-		placeholderIntroPath: introPath,
-		placeholderLoopPath:  loopPath,
-		httpClient:          &http.Client{Timeout: 12 * time.Second},
-		states:              make(map[string]*playbackState),
-		resolved:            make(map[string]resolvedEntry),
-		resolveFlights:      make(map[string]*resolveFlight),
-		probes:              make(map[string]probeEntry),
-		probeFlights:        make(map[string]*probeFlight),
-		offsets:             make(map[string]time.Duration),
+		collector:       col,
+		planner:         pl,
+		ffmpeg:          ff,
+		resolver:        res,
+		store:           store,
+		baseURL:         strings.TrimSuffix(baseURL, "/"),
+		policy:          defaultPolicy(),
+		placeholderPath: placeholderPath,
+		httpClient:      &http.Client{Timeout: 12 * time.Second},
+		states:          make(map[string]*playbackState),
+		resolved:        make(map[string]resolvedEntry),
+		resolveFlights:  make(map[string]*resolveFlight),
+		probes:          make(map[string]probeEntry),
+		probeFlights:    make(map[string]*probeFlight),
+		offsets:         make(map[string]time.Duration),
 	}
 	go m.reapIdleSessions()
 	return m

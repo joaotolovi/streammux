@@ -124,9 +124,7 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		return &DirectFallbackError{URL: direct, Err: cause}
 	}
 
-	// If a placeholder is available and the film is not ready, start the
-	// placeholder now and kick off film preparation in the background.
-	if m.placeholderIntroPath != "" || m.placeholderLoopPath != "" {
+	if m.placeholderPath != "" {
 		if !state.placeholderStarted {
 			state.placeholderStarted = true
 			state.placeholderWait = make(chan struct{})
@@ -312,7 +310,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		return
 	}
 
-	session, err := m.ffmpeg.StartPlaceholderSession(state.ctx, m.placeholderIntroPath, m.placeholderLoopPath, dir)
+	session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.placeholderPath, dir)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		state.mu.Lock()
@@ -383,7 +381,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	if wait != nil {
 		close(wait)
 	}
-	log.Printf("mux: placeholder playing (intro=%v loop=%v)", m.placeholderIntroPath != "", m.placeholderLoopPath != "")
+	log.Printf("mux: placeholder playing (%s)", m.placeholderPath)
 }
 
 // coordinateAttempts tries playback plans sequentially, one at a time, until
