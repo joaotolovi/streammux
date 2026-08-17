@@ -586,11 +586,11 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 			}
 			select {
 			case <-session.Done():
-				log.Printf("mux: error video ended before first segment (attempt %d): %v", attempt+1, session.Err())
+				log.Printf("mux: error video ended before first segment (attempt %d): %v; stderr tail: %s", attempt+1, session.Err(), session.StderrTail())
 				break waitLoop
 			case <-deadline:
 				session.Cancel()
-				log.Printf("mux: error video timed out before first segment (attempt %d)", attempt+1)
+				log.Printf("mux: error video timed out before first segment (attempt %d, start %d, dir %s); stderr tail: %s", attempt+1, start, dir, session.StderrTail())
 				break waitLoop
 			case <-ticker.C:
 			}

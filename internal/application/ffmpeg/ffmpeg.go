@@ -60,9 +60,19 @@ type Session struct {
 	done       chan struct{}
 	progress   chan ProgressSample
 	startN     int
+	// stderrTail retains the last ffmpeg stderr bytes for diagnostics.
+	stderrTail *tailBuffer
 
 	mu  sync.RWMutex
 	err error
+}
+
+// StderrTail returns the last ffmpeg stderr output (diagnostics only).
+func (s *Session) StderrTail() string {
+	if s == nil || s.stderrTail == nil {
+		return ""
+	}
+	return s.stderrTail.String()
 }
 
 // Muxer launches FFmpeg and ffprobe processes.
@@ -96,10 +106,11 @@ func (m *Muxer) StartSession(ctx context.Context, spec SessionSpec) (*Session, e
 	}
 
 	s := &Session{
-		cancel:   cancel,
-		done:     make(chan struct{}),
-		progress: make(chan ProgressSample, 1),
-		startN:   spec.StartSegment,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		progress:   make(chan ProgressSample, 1),
+		startN:     spec.StartSegment,
+		stderrTail: stderr,
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -361,28 +372,28 @@ func tail(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-// buildPlaceholderArgs encodes a local video as a live-looking HLS window:
-// real-time read rate and a small sliding window. omitEndlist keeps the
-// timeline open for the placeholder (the film takes over); the error video
-// ends naturally with ENDLIST so playback stops after it.
-func buildPlaceholderArgs(path, outputDir string, omitEndlist bool) []string {
+// buildPlaceholderArgs encodes a local video as a live-looking HLS window.
+// realtime=true paces the placeholder at 1x with a sliding window and no
+// ENDLIST (the film takes over the timeline). realtime=false encodes the
+// terminal error video as fast as possible — it is short VOD content and must
+// have all its segments ready in seconds, so no pacing and a natural ENDLIST.
+func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 	preset := "veryfast"
-	if !omitEndlist {
+	if !realtime {
 		preset = "ultrafast"
 	}
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
-	if omitEndlist {
+	if realtime {
 		videoFlags += "+omit_endlist"
 		audioFlags += "+omit_endlist"
 	}
-	return []string{
-		"-nostdin",
-		"-hide_banner",
-		"-nostats",
-		"-readrate", "1",
-		"-readrate_initial_burst", fmtDuration(segDuration),
-		"-i", path,
+	args := []string{"-nostdin", "-hide_banner", "-nostats"}
+	if realtime {
+		args = append(args, "-readrate", "1", "-readrate_initial_burst", fmtDuration(segDuration))
+	}
+	args = append(args, "-i", path)
+	args = append(args,
 		"-map", "0:v:0",
 		"-c:v", "libx264", "-preset", preset, "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
@@ -405,14 +416,15 @@ func buildPlaceholderArgs(path, outputDir string, omitEndlist bool) []string {
 		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
 		"-start_number", "0",
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
-	}
+	)
+	return args
 }
 
 // StartSinglePlaceholderSession launches a local video as a live-window HLS
-// session. omitEndlist=true keeps the timeline open (placeholder handoff);
-// false lets the stream end with ENDLIST (error video). The error video uses
-// ultrafast so it starts even under CPU contention.
-func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, omitEndlist bool) (*Session, error) {
+// session. realtime=true paces the placeholder at 1x keeping the timeline
+// open (film handoff); false encodes the terminal error video as fast as
+// possible with a natural ENDLIST.
+func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, realtime bool) (*Session, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("placeholder session: no video provided")
 	}
@@ -426,7 +438,7 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputD
 		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
 	}
 
-	args := buildPlaceholderArgs(path, outputDir, omitEndlist)
+	args := buildPlaceholderArgs(path, outputDir, realtime)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
@@ -440,10 +452,11 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputD
 	}
 
 	s := &Session{
-		cancel:   cancel,
-		done:     make(chan struct{}),
-		progress: make(chan ProgressSample, 1),
-		startN:   0,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		progress:   make(chan ProgressSample, 1),
+		startN:     0,
+		stderrTail: stderr,
 	}
 
 	if err := cmd.Start(); err != nil {
