@@ -87,7 +87,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 func TestBuildPlaceholderArgsProduceNonSeekableLivePlaylist(t *testing.T) {
 	args := buildPlaceholderArgs("/tmp/placeholder.mp4", "/tmp/placeholder")
 	for _, want := range [][]string{
-		{"-readrate", "1", "-readrate_initial_burst", "4", "-i", "/tmp/placeholder.mp4"},
+		{"-re", "-i", "/tmp/placeholder.mp4"},
 		{"-map", "0:v:0"},
 		{"-map", "0:a:0"},
 		{"-hls_list_size", "1"},
