@@ -955,6 +955,11 @@ func paddedFilmPlaylist(playlistPath string, filmDuration float64) ([]byte, bool
 	if err != nil {
 		return nil, false
 	}
+	// Don't pad to full duration: film is still encoding and virtual
+	// segments would 404 when the player tries to fetch them. Return
+	// the live playlist and let the timeline grow as segments arrive.
+	return raw, true
+	_ = filmDuration
 	if filmDuration <= 0 {
 		return raw, true
 	}
