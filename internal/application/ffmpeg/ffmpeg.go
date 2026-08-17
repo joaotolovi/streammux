@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -76,13 +75,6 @@ func New(binaryPath string) *Muxer {
 func (m *Muxer) StartSession(ctx context.Context, spec SessionSpec) (*Session, error) {
 	args, err := buildSessionArgs(spec)
 	if err != nil {
-		return nil, err
-	}
-
-	// Write the master playlist that exposes the audio as an independent
-	// rendition. This is what lets the player's native audio-delay control
-	// seek/offset the audio track on its own.
-	if err := writeMasterPlaylist(spec.OutputDir); err != nil {
 		return nil, err
 	}
 
@@ -358,121 +350,4 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
-}
-
-// writeMasterPlaylist writes the master playlist that exposes the audio as an
-// independent rendition (video-only + audio-only), so the player's native
-// audio-delay control can seek/offset the audio track on its own.
-func writeMasterPlaylist(outputDir string) error {
-	master := "#EXTM3U\n" +
-		"#EXT-X-VERSION:6\n" +
-		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"main\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio/audio.m3u8\"\n" +
-		"#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO=\"aud\"\n" +
-		"video/video.m3u8\n"
-	return os.WriteFile(filepath.Join(outputDir, "master.m3u8"), []byte(master), 0644)
-}
-
-func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath, outputDir string) (*Session, error) {
-	path := introPath
-	if path == "" {
-		path = loopPath
-	}
-	return m.StartSinglePlaceholderSession(ctx, path, outputDir)
-}
-
-func buildPlaceholderArgs(placeholderPath, outputDir string) []string {
-	return []string{
-		"-nostdin",
-		"-hide_banner",
-		"-nostats",
-		"-readrate", "1",
-		"-readrate_initial_burst", fmtDuration(segDuration),
-		"-i", placeholderPath,
-		"-map", "0:v:0",
-		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
-		"-force_key_frames", "expr:gte(t,n_forced*4)",
-		"-f", "hls",
-		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "3",
-		"-hls_allow_cache", "0",
-		"-hls_flags", "independent_segments+temp_file+omit_endlist",
-		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
-		"-start_number", "0",
-		filepath.Join(outputDir, "video", "video.m3u8"),
-		"-map", "0:a:0",
-		"-c:a", "aac", "-b:a", "128k",
-		"-f", "hls",
-		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "3",
-		"-hls_allow_cache", "0",
-		"-hls_flags", "independent_segments+temp_file+split_by_time+omit_endlist",
-		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
-		"-start_number", "0",
-		filepath.Join(outputDir, "audio", "audio.m3u8"),
-	}
-}
-
-func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, placeholderPath, outputDir string) (*Session, error) {
-	if strings.TrimSpace(placeholderPath) == "" {
-		return nil, fmt.Errorf("placeholder session: no placeholder video provided")
-	}
-	if strings.TrimSpace(outputDir) == "" {
-		return nil, fmt.Errorf("placeholder session: output directory is required")
-	}
-	if err := os.MkdirAll(filepath.Join(outputDir, "video"), 0755); err != nil {
-		return nil, fmt.Errorf("placeholder session: video dir: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(outputDir, "audio"), 0755); err != nil {
-		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
-	}
-	if err := writeMasterPlaylist(outputDir); err != nil {
-		return nil, err
-	}
-
-	args := buildPlaceholderArgs(placeholderPath, outputDir)
-
-	sessCtx, cancel := context.WithCancel(ctx)
-	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
-	stderr := newTailBuffer(stderrTailSize)
-	cmd.Stderr = stderr
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("placeholder progress pipe: %w", err)
-	}
-
-	s := &Session{
-		cancel:   cancel,
-		done:     make(chan struct{}),
-		progress: make(chan ProgressSample, 1),
-		startN:   0,
-	}
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("placeholder start: %w", err)
-	}
-
-	go func() {
-		parseErr := parseProgress(stdout, s.progress, time.Now)
-		if parseErr != nil {
-			_, _ = io.Copy(io.Discard, stdout)
-		}
-		waitErr := cmd.Wait()
-		if waitErr != nil {
-			if ctxErr := sessCtx.Err(); ctxErr != nil {
-				waitErr = ctxErr
-			}
-			s.setErr(ffmpegRunError(waitErr, stderr.String()))
-		} else if parseErr != nil {
-			s.setErr(ffmpegRunError(fmt.Errorf("read progress: %w", parseErr), stderr.String()))
-		}
-		cancel()
-		close(s.progress)
-		close(s.done)
-	}()
-
-	return s, nil
 }

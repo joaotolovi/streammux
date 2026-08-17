@@ -24,6 +24,8 @@ type VideoStream struct {
 	Title     string
 	BitRate   float64
 	FrameRate float64
+	Width     int
+	Height    int
 }
 
 // AudioTrack is a detected audio stream. Index is relative to audio streams
@@ -63,6 +65,8 @@ type probeStream struct {
 	Duration     string `json:"duration"`
 	StartTime    string `json:"start_time"`
 	Channels     int    `json:"channels"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
 	AvgFrameRate string `json:"avg_frame_rate"`
 	RFrameRate   string `json:"r_frame_rate"`
 	Tags         struct {
@@ -233,6 +237,8 @@ func (p probeJSON) result() *ProbeResult {
 				Title:     strings.TrimSpace(stream.Tags.Title),
 				BitRate:   bitRate,
 				FrameRate: frameRate,
+				Width:     stream.Width,
+				Height:    stream.Height,
 			})
 			if result.VideoBitrate <= 0 && bitRate > 0 {
 				result.VideoBitrate = bitRate

@@ -16,6 +16,13 @@ import (
 	"github.com/streammux/streammux/internal/domain/model"
 )
 
+// ErrBeyondEnd reports a segment request past the end of the film.
+var ErrBeyondEnd = errors.New("segment beyond end of film")
+
+// playbackState is the per-job VOD timeline. The public HLS timeline is
+// static: segment n always maps to file seg_%05d.ts of whichever generation
+// produced it, and the media playlists expose the full film duration from the
+// first request so the player can seek anywhere immediately.
 type playbackState struct {
 	mu sync.Mutex
 
@@ -23,29 +30,17 @@ type playbackState struct {
 	cancel context.CancelFunc
 
 	cacheDir string
-	active   *generation
-	all      []*generation
-	// variants holds a generation per plan index, started on demand when the
-	// player requests that ABR variant. active is the primary (plan 0) used by
-	// the health monitor and recovery; variants are additional renditions.
-	variants     map[int]*generation
-	variantPlans map[int]int
-	// failedPlans tracks plan indices that failed source validation. They are
-	// excluded from the ABR master playlist so the player never selects a
-	// variant that will immediately error (source error / 502).
-	failedPlans map[int]bool
-	starting    bool
-	startWait   chan struct{}
-	startErr    error
-	directURL   string
 
-	placeholder        *generation
-	errorGeneration    *generation
-	retiredPlaceholder *generation
-	placeholderStarted bool
-	placeholderWait    chan struct{}
-	filmDuration       float64
-	filmSequence       int
+	// active is the ffmpeg session currently encoding. Segments produced by
+	// earlier generations remain servable via all (newest first).
+	active *generation
+	all    []*generation
+
+	starting  bool
+	startWait chan struct{}
+	startErr  error
+	directURL string
+	lastStart time.Time
 
 	recovering   bool
 	recoveryWait chan struct{}
@@ -53,23 +48,27 @@ type playbackState struct {
 
 	nextGeneration uint64
 	nextPlan       int
-	lastRequested  int
-	maxRequested   int
-	lastAccess     time.Time
-	lastRecovery   time.Time
-	closed         bool
+
+	duration        float64 // film duration in seconds (from probe)
+	discontinuities []int   // public segments preceded by EXT-X-DISCONTINUITY
+	lastRequested   int
+	maxRequested    int
+	lastAccess      time.Time
+	lastRecovery    time.Time
+	closed          bool
+
+	deliveries []deliverySample
 }
 
 type generation struct {
-	id            uint64
-	planIndex     int
-	plan          model.PlaybackPlan
-	prepared      *preparedPlan
-	dir           string
-	session       *ffmpeg.Session
-	startSegment  int
-	startedAt     time.Time
-	isPlaceholder bool
+	id           uint64
+	planIndex    int
+	plan         model.PlaybackPlan
+	prepared     *preparedPlan
+	dir          string
+	session      *ffmpeg.Session
+	startSegment int
+	startedAt    time.Time
 }
 
 func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
@@ -88,9 +87,6 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		ctx:           ctx,
 		cancel:        cancel,
 		cacheDir:      dir,
-		variants:      make(map[int]*generation),
-		variantPlans:  make(map[int]int),
-		failedPlans:   make(map[int]bool),
 		lastRequested: -1,
 		maxRequested:  -1,
 		lastAccess:    time.Now(),
@@ -100,11 +96,8 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	return state, nil
 }
 
-// EnsurePlaylist returns as soon as a playable playlist exists. If a local
-// placeholder video is configured and the real film is not ready yet, it
-// starts the placeholder immediately (so the player gets instant playback) and
-// prepares the film in the background. When the film becomes ready, the active
-// generation switches to it and the same master URL starts serving the film.
+// EnsurePlaylist blocks until a playable generation exists, retrying failed
+// startups after a cooldown (resuming from the next untried plan).
 func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	state, err := m.stateFor(job)
 	if err != nil {
@@ -113,7 +106,7 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 
 	state.mu.Lock()
 	state.lastAccess = time.Now()
-	if state.active != nil && fileExists(generationPlaylistPath(state.active)) {
+	if state.active != nil {
 		state.mu.Unlock()
 		return nil
 	}
@@ -123,59 +116,21 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		state.mu.Unlock()
 		return &DirectFallbackError{URL: direct, Err: cause}
 	}
-
-	if m.placeholderPath != "" {
-		if !state.placeholderStarted {
-			state.placeholderStarted = true
-			state.placeholderWait = make(chan struct{})
-			go m.runPlaceholder(job, state)
-		}
-		if !state.starting {
-			state.starting = true
-			state.startWait = make(chan struct{})
-			state.startErr = nil
-			go m.runStartup(job, state)
-		}
-		wait := state.placeholderWait
-		state.mu.Unlock()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-wait:
-		}
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		if state.placeholder != nil && fileExists(generationPlaylistPath(state.placeholder)) {
-			return nil
-		}
-		// Placeholder failed to start; fall through to waiting for the film.
-		if state.active != nil && fileExists(generationPlaylistPath(state.active)) {
-			return nil
-		}
-		if state.directURL != "" {
-			return &DirectFallbackError{URL: state.directURL, Err: state.startErr}
-		}
-		if state.startErr != nil {
-			return state.startErr
-		}
-		return fmt.Errorf("playback startup finished without a playable source")
+	// Allow one retry per cooldown window; retries resume from nextPlan so
+	// the user's second click tries fresh sources instead of repeating.
+	if state.startErr != nil && time.Since(state.lastStart) > m.policy.RetryCooldown {
+		state.starting = false
+		state.startErr = nil
 	}
-
-	// No placeholder: block until the film is ready (original behavior).
-	start := false
 	if !state.starting {
 		state.starting = true
 		state.startWait = make(chan struct{})
 		state.startErr = nil
-		start = true
+		state.lastStart = time.Now()
+		go m.runStartup(job, state)
 	}
 	wait := state.startWait
 	state.mu.Unlock()
-
-	if start {
-		go m.runStartup(job, state)
-	}
 
 	select {
 	case <-ctx.Done():
@@ -185,7 +140,7 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.active != nil && fileExists(generationPlaylistPath(state.active)) {
+	if state.active != nil {
 		return nil
 	}
 	if state.directURL != "" {
@@ -197,61 +152,14 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	return fmt.Errorf("playback startup finished without a playable source")
 }
 
-func placeholderFilmSequence(placeholder *generation) int {
-	if placeholder == nil {
-		return 0
-	}
-	videoLast := lastPlaylistSegment(generationVideoPlaylistPath(placeholder))
-	audioLast := lastPlaylistSegment(generationAudioPlaylistPath(placeholder))
-	if videoLast < 0 || audioLast < 0 {
-		return 0
-	}
-	if audioLast < videoLast {
-		videoLast = audioLast
-	}
-	return videoLast + 1
-}
-
-func lastPlaylistSegment(path string) int {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return -1
-	}
-	last := -1
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		var segment int
-		if _, err := fmt.Sscanf(line, "seg_%05d.ts", &segment); err == nil && segment > last {
-			last = segment
-		}
-	}
-	return last
-}
-
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
-	winner, err := m.coordinateAttempts(job, state, 0, 0, m.policy.StartupTimeout)
+	startPlan := state.nextPlan
+	if startPlan < 0 {
+		startPlan = 0
+	}
+	winner, err := m.coordinateAttempts(job, state, startPlan, 0, m.policy.StartupTimeout)
 	if err != nil {
 		direct := m.resolveDirectFallback(job, state)
-		if direct == "" && m.errorPath != "" {
-			if errorGeneration, errorErr := m.startErrorGeneration(state); errorErr == nil {
-				state.mu.Lock()
-				state.active = errorGeneration
-				state.errorGeneration = errorGeneration
-				state.starting = false
-				state.startErr = err
-				state.directURL = ""
-				wait := state.startWait
-				state.mu.Unlock()
-				if wait != nil {
-					close(wait)
-				}
-				log.Printf("mux: startup failed; serving error video: %v", err)
-				return
-			}
-		}
 		state.mu.Lock()
 		state.starting = false
 		state.startErr = err
@@ -261,6 +169,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		if wait != nil {
 			close(wait)
 		}
+		log.Printf("mux: startup failed (next retry from plan %d): %v", state.nextPlan, err)
 		return
 	}
 
@@ -277,39 +186,16 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		}
 		return
 	}
-	placeholder := state.placeholder
-	state.mu.Unlock()
-	filmSequence := placeholderFilmSequence(placeholder)
-	state.mu.Lock()
-	if state.closed {
-		state.mu.Unlock()
-		winner.session.Cancel()
-		return
-	}
 	state.active = winner
 	state.all = append(state.all, winner)
 	state.nextPlan = winner.planIndex + 1
 	state.starting = false
 	state.startErr = nil
 	state.directURL = ""
+	state.duration = winner.prepared.duration
 	state.lastRecovery = time.Now()
-	state.filmDuration = winner.prepared.duration
-	state.filmSequence = filmSequence
 	state.lastRequested = -1
-	state.maxRequested = filmSequence - 1
-	state.retiredPlaceholder = placeholder
-	state.placeholder = nil
-	state.mu.Unlock()
-
-	if placeholder != nil {
-		placeholder.session.Cancel()
-		select {
-		case <-placeholder.session.Done():
-		case <-time.After(2 * time.Second):
-		}
-	}
-
-	state.mu.Lock()
+	state.maxRequested = -1
 	wait := state.startWait
 	state.mu.Unlock()
 
@@ -322,175 +208,16 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	go m.monitorGeneration(job, state, winner)
 }
 
-// runPlaceholder starts the local intro/loop video session so the player gets
-// immediate playback while the film is prepared in the background. It writes
-// into a dedicated generation directory and closes placeholderWait once the
-// placeholder master is ready.
-func (m *Muxer) startErrorGeneration(state *playbackState) (*generation, error) {
-	state.mu.Lock()
-	state.nextGeneration++
-	generationID := state.nextGeneration
-	placeholder := state.placeholder
-	state.placeholder = nil
-	state.mu.Unlock()
-	if placeholder != nil {
-		placeholder.session.Cancel()
-	}
-
-	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
-	}
-	session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.errorPath, dir)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
-	}
-	generation := &generation{id: generationID, dir: dir, session: session, isPlaceholder: true}
-	ticker := time.NewTicker(75 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.After(10 * time.Second)
-	for {
-		if fileExists(generationSegmentPath(generation, 0)) && fileExists(generationAudioSegmentPath(generation, 0)) && fileExists(generationPlaylistPath(generation)) {
-			return generation, nil
-		}
-		select {
-		case <-session.Done():
-			_ = os.RemoveAll(dir)
-			return nil, session.Err()
-		case <-deadline:
-			session.Cancel()
-			_ = os.RemoveAll(dir)
-			return nil, fmt.Errorf("error video timed out before first segment")
-		case <-ticker.C:
-		}
-	}
-}
-
-func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
-	state.mu.Lock()
-	state.nextGeneration++
-	generationID := state.nextGeneration
-	state.mu.Unlock()
-
-	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		state.mu.Lock()
-		state.placeholderStarted = false
-		wait := state.placeholderWait
-		state.mu.Unlock()
-		if wait != nil {
-			close(wait)
-		}
-		log.Printf("mux: placeholder dir: %v", err)
-		return
-	}
-
-	session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.placeholderPath, dir)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		state.mu.Lock()
-		state.placeholderStarted = false
-		wait := state.placeholderWait
-		state.mu.Unlock()
-		if wait != nil {
-			close(wait)
-		}
-		log.Printf("mux: placeholder start: %v", err)
-		return
-	}
-
-	gen := &generation{
-		id:            generationID,
-		dir:           dir,
-		session:       session,
-		startSegment:  0,
-		startedAt:     time.Now(),
-		isPlaceholder: true,
-	}
-
-	segmentPath := generationSegmentPath(gen, 0)
-	audioSegPath := generationAudioSegmentPath(gen, 0)
-	masterPath := generationPlaylistPath(gen)
-	videoPlPath := generationVideoPlaylistPath(gen)
-	audioPlPath := generationAudioPlaylistPath(gen)
-	ticker := time.NewTicker(75 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.After(10 * time.Second)
-	for {
-		if fileExists(segmentPath) && fileExists(audioSegPath) && fileExists(masterPath) && fileExists(videoPlPath) && fileExists(audioPlPath) {
-			break
-		}
-		select {
-		case <-session.Done():
-			_ = os.RemoveAll(dir)
-			state.mu.Lock()
-			state.placeholderStarted = false
-			wait := state.placeholderWait
-			state.mu.Unlock()
-			if wait != nil {
-				close(wait)
-			}
-			log.Printf("mux: placeholder ended before first segment: %v", session.Err())
-			return
-		case <-deadline:
-			session.Cancel()
-			_ = os.RemoveAll(dir)
-			state.mu.Lock()
-			state.placeholderStarted = false
-			wait := state.placeholderWait
-			state.mu.Unlock()
-			if wait != nil {
-				close(wait)
-			}
-			log.Printf("mux: placeholder timed out before first segment")
-			return
-		case <-ticker.C:
-		}
-	}
-
-	state.mu.Lock()
-	if state.active != nil {
-		gen.session.Cancel()
-		state.mu.Unlock()
-		_ = os.RemoveAll(dir)
-		if wait := state.placeholderWait; wait != nil {
-			select {
-			case <-wait:
-			default:
-				close(wait)
-			}
-		}
-		return
-	}
-	state.placeholder = gen
-	wait := state.placeholderWait
-	state.mu.Unlock()
-	if wait != nil {
-		close(wait)
-	}
-	log.Printf("mux: placeholder playing (%s)", m.placeholderPath)
-}
-
 // coordinateAttempts tries playback plans sequentially, one at a time, until
-// one produces its first segment. Sequential (not parallel) is deliberate:
-// each attempt opens two debrid connections (video + audio), and debrid
-// services cap concurrent slots (~2-3). Running multiple plans in parallel
-// could exceed that cap and trigger rate-limits on every attempt.
-//
-// Two phases, each with its own budget: strict first, then lenient. Strict
-// accepts a track only when its language is confirmed (tag, title, or a
-// single-track dubbed source). Lenient is the last resort — it also accepts an
-// und/untagged track from a dubbed multiaudio source. Giving lenient its own
-// window ensures a slow strict phase cannot starve the retry that matters most
-// when strict fails (probes are cached, so lenient re-runs are fast).
+// one produces its first segment. Sequential is deliberate: each attempt
+// opens up to two debrid connections and debrid services cap concurrent
+// slots (~2-3). Two phases with separate budgets: strict first, then lenient
+// (lenient also accepts und/untagged tracks from a dubbed multiaudio source).
 func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, startPlan, startSegment int, timeout time.Duration) (*generation, error) {
 	if startPlan >= len(job.Plans) {
 		return nil, fmt.Errorf("no playback plans remain")
 	}
 
-	// Lenient gets a fresh budget (cached probes make it quick), independent of
-	// how much the strict phase consumed.
 	lenientTimeout := m.policy.StartupTimeout / 2
 	if lenientTimeout < 5*time.Second {
 		lenientTimeout = 5 * time.Second
@@ -523,6 +250,12 @@ func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playback
 		default:
 		}
 
+		// Plans without the target audio are not HLS candidates; the
+		// subtitled fallback is served as a direct redirect instead.
+		if !job.Plans[planIndex].HasTargetAudio {
+			continue
+		}
+
 		generation, err := m.startAttempt(ctx, job, state, planIndex, startSegment, lenient)
 		if err == nil && generation != nil {
 			return generation, nil
@@ -530,176 +263,15 @@ func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playback
 		if err != nil {
 			failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
 			log.Printf("mux: plan %d failed: %v", planIndex, err)
+			// Advance nextPlan so retries and recoveries skip this plan.
+			state.mu.Lock()
+			if planIndex+1 > state.nextPlan {
+				state.nextPlan = planIndex + 1
+			}
+			state.mu.Unlock()
 		}
 	}
 	return nil, errors.Join(failures...)
-}
-
-// EnsureVariant starts (or reuses) the generation for the given plan index,
-// used by the ABR master playlist when the player requests a non-primary
-// variant. startSegment is the physical offset the player is at when switching
-// variants (an ABR switch is a seek on the new source), so the new generation
-// begins producing there instead of only from segment 0.
-func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantIndex, startSegment int) (string, error) {
-	if variantIndex < 0 {
-		return "", fmt.Errorf("variant %d out of range", variantIndex)
-	}
-	if startSegment < 0 {
-		startSegment = 0
-	}
-	state, err := m.stateFor(job)
-	if err != nil {
-		return "", err
-	}
-
-	// Resolve the variant index to the real plan index via the mapping
-	// established by MasterPlaylist.
-	state.mu.Lock()
-	if variantIndex == 0 && state.active != nil {
-		active := state.active
-		state.mu.Unlock()
-		return generationVideoPlaylistPath(active), nil
-	}
-	planIndex, ok := state.variantPlans[variantIndex]
-	if !ok {
-		// No mapping yet — the master hasn't been rendered for this variant.
-		// Refuse instead of guessing, so the player retries after receiving
-		// the updated master rather than starting a stale plan.
-		state.mu.Unlock()
-		return "", fmt.Errorf("variant %d not yet available", variantIndex)
-	}
-	if planIndex < 0 || planIndex >= len(job.Plans) {
-		state.mu.Unlock()
-		return "", fmt.Errorf("variant %d maps to plan %d out of range", variantIndex, planIndex)
-	}
-	if state.failedPlans[planIndex] {
-		state.mu.Unlock()
-		return "", fmt.Errorf("variant %d (plan %d) failed source validation", variantIndex, planIndex)
-	}
-	// Reuse the active generation if it is the plan we need.
-	if state.active != nil && state.active.planIndex == planIndex {
-		active := state.active
-		state.mu.Unlock()
-		return generationVideoPlaylistPath(active), nil
-	}
-	// Reuse an already-started variant generation at or before the offset.
-	if gen, ok := state.variants[planIndex]; ok {
-		if gen.startSegment <= startSegment {
-			path := generationVideoPlaylistPath(gen)
-			state.mu.Unlock()
-			if fileExists(path) {
-				return path, nil
-			}
-		}
-	}
-	state.mu.Unlock()
-
-	gen, err := m.startAttempt(ctx, job, state, planIndex, startSegment, false)
-	if err != nil {
-		// The variant is the only consumer of this plan path; a validation
-		// failure here means it must not be advertised again.
-		state.mu.Lock()
-		state.failedPlans[planIndex] = true
-		state.mu.Unlock()
-		return "", err
-	}
-	state.mu.Lock()
-	state.variants[planIndex] = gen
-	state.mu.Unlock()
-	go m.monitorGeneration(job, state, gen)
-	return generationVideoPlaylistPath(gen), nil
-}
-
-// EnsureVariantSegment resolves a segment of an ABR variant. A variant switch
-// is a seek on the new source: if the existing variant generation started
-// before the requested offset and has not yet produced it (e.g. it started at
-// 0 but the player jumped to 50), the generation is restarted at that offset.
-func (m *Muxer) EnsureVariantSegment(ctx context.Context, job *model.MuxJob, variantIndex, segIndex int) (string, error) {
-	if variantIndex < 0 {
-		return "", fmt.Errorf("variant %d out of range", variantIndex)
-	}
-	state, err := m.stateFor(job)
-	if err != nil {
-		return "", err
-	}
-
-	// Resolve to plan index.
-	state.mu.Lock()
-	if variantIndex == 0 && state.active != nil {
-		active := state.active
-		filmSequence := state.filmSequence
-		state.mu.Unlock()
-		// v0 is the active film generation; its segments are renumbered by
-		// filmSequence, so translate the public index to the physical one.
-		physical := segIndex - filmSequence
-		if physical < 0 {
-			return "", fmt.Errorf("segment %d precedes film sequence", segIndex)
-		}
-		return m.ensureVariantSegmentInGeneration(ctx, job, state, active, physical)
-	}
-	planIndex, ok := state.variantPlans[variantIndex]
-	if !ok {
-		state.mu.Unlock()
-		return "", fmt.Errorf("variant %d not yet available", variantIndex)
-	}
-	if planIndex < 0 || planIndex >= len(job.Plans) {
-		state.mu.Unlock()
-		return "", fmt.Errorf("variant %d maps to plan %d out of range", variantIndex, planIndex)
-	}
-	gen, ok := state.variants[planIndex]
-	state.mu.Unlock()
-
-	// No generation yet — start it at the requested offset (a seek on the new
-	// source).
-	if gen == nil {
-		return m.startVariantAtOffset(ctx, job, state, planIndex, segIndex)
-	}
-	return m.ensureVariantSegmentInGeneration(ctx, job, state, gen, segIndex)
-}
-
-// ensureVariantSegmentInGeneration waits for segIndex in the given generation,
-// restarting it at the offset if the encoder is too far behind.
-func (m *Muxer) ensureVariantSegmentInGeneration(ctx context.Context, job *model.MuxJob, state *playbackState, gen *generation, segIndex int) (string, error) {
-	deadlineCtx, cancel := context.WithTimeout(ctx, m.policy.SegmentTimeout)
-	defer cancel()
-
-	for {
-		if path := generationSegmentPath(gen, segIndex); fileExists(path) {
-			return path, nil
-		}
-		highest := highestCompleteSegment(gen.dir)
-		// The generation started far behind the requested offset and hasn't
-		// produced it: restart at the offset instead of waiting forever.
-		if gen.startSegment <= segIndex && highest >= 0 && segIndex > highest+8 {
-			planIndex := gen.planIndex
-			cancel()
-			return m.startVariantAtOffset(ctx, job, state, planIndex, segIndex)
-		}
-		select {
-		case <-deadlineCtx.Done():
-			return "", fmt.Errorf("timeout waiting for variant %d segment %d: %w", gen.planIndex, segIndex, deadlineCtx.Err())
-		case <-gen.session.Done():
-			return "", fmt.Errorf("variant session ended before segment %d: %v", segIndex, gen.session.Err())
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-}
-
-// startVariantAtOffset starts a fresh generation for planIndex at the given
-// physical offset and waits for its first segment.
-func (m *Muxer) startVariantAtOffset(ctx context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int) (string, error) {
-	gen, err := m.startAttempt(ctx, job, state, planIndex, startSegment, false)
-	if err != nil {
-		state.mu.Lock()
-		state.failedPlans[planIndex] = true
-		state.mu.Unlock()
-		return "", err
-	}
-	state.mu.Lock()
-	state.variants[planIndex] = gen
-	state.mu.Unlock()
-	go m.monitorGeneration(job, state, gen)
-	return generationVideoPlaylistPath(gen), nil
 }
 
 func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int, lenient bool) (*generation, error) {
@@ -708,14 +280,13 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 	if err != nil {
 		return nil, err
 	}
+	if prepared.duration <= 0 {
+		return nil, fmt.Errorf("plan has no probeable duration")
+	}
 
 	// The A/V offset is estimated by cross-correlating the first seconds of
 	// the video source's primary audio against the dubbed track. The estimate
-	// is cached per source pair so it never consumes the attempt budget twice.
-	// DetectAudioOffset returns how far the dubbed audio lags the video's
-	// audio (positive = audio starts later); the offset we apply is inverted
-	// because it must move the audio back into alignment (-itsoffset positive
-	// delays the audio). The correlation is only trusted when the peak is clear.
+	// is cached per source pair.
 	var audioOffset time.Duration
 	dualSource := strings.TrimSpace(prepared.audioURL) != "" && prepared.audioURL != prepared.videoURL
 	if dualSource {
@@ -754,9 +325,8 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 		return nil, fmt.Errorf("create generation audio directory: %w", err)
 	}
 
-	// The session must outlive the attempt: it is bound to the playback
-	// context, while attemptCtx only gates how long we wait for the first
-	// segment below.
+	// The session is bound to the playback context; attemptCtx only gates
+	// how long we wait for the first segment below.
 	session, err := m.ffmpeg.StartSession(state.ctx, ffmpeg.SessionSpec{
 		VideoURL:        prepared.videoURL,
 		AudioURL:        prepared.audioURL,
@@ -788,12 +358,11 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 
 	segmentPath := generationSegmentPath(generation, startSegment)
 	audioSegmentPath := generationAudioSegmentPath(generation, startSegment)
-	playlistPath := generationPlaylistPath(generation)
 	ticker := time.NewTicker(75 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
-		if fileExists(segmentPath) && fileExists(audioSegmentPath) && fileExists(playlistPath) {
+		if fileExists(segmentPath) && fileExists(audioSegmentPath) {
 			return generation, nil
 		}
 		select {
@@ -802,7 +371,7 @@ func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *p
 			go cleanupFailedGeneration(generation)
 			return nil, fmt.Errorf("first segment deadline: %w", attemptCtx.Err())
 		case <-session.Done():
-			if fileExists(segmentPath) && fileExists(audioSegmentPath) && fileExists(playlistPath) {
+			if fileExists(segmentPath) && fileExists(audioSegmentPath) {
 				return generation, nil
 			}
 			go cleanupFailedGeneration(generation)
@@ -842,33 +411,9 @@ func (m *Muxer) resolveDirectFallback(job *model.MuxJob, state *playbackState) s
 	return ""
 }
 
-func (m *Muxer) PlaylistPath(job *model.MuxJob) string {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return ""
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.lastAccess = time.Now()
-	if state.placeholder != nil && state.active == nil {
-		path := generationPlaylistPath(state.placeholder)
-		if fileExists(path) {
-			return path
-		}
-	}
-	if state.active == nil {
-		return ""
-	}
-	path := generationPlaylistPath(state.active)
-	if !fileExists(path) {
-		return ""
-	}
-	return path
-}
-
-// MasterPlaylist returns the ABR master playlist advertising the top plans as
-// variants. Each variant points to a per-plan media playlist that is generated
-// on demand when the player requests it. The primary plan (0) is the default.
+// MasterPlaylist renders the master we serve: a single variant whose audio is
+// declared as a rendition group. The audio group declaration is mandatory —
+// without it players ignore the audio playlist entirely.
 func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
@@ -877,329 +422,117 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	active := state.active
-	activePlan := -1
-	activeBitrate := 0.0
-	if active != nil {
-		activePlan = active.planIndex
-		if active.prepared != nil {
-			activeBitrate = active.prepared.videoBitrate
-		}
-	}
-	ready := active != nil
+	duration := state.duration
 	state.mu.Unlock()
-	if !ready {
+	if active == nil || active.prepared == nil || duration <= 0 {
 		return nil, false
 	}
 
-	// Advertise the active plan as v0, then lighter plans below it that have
-	// not failed validation. v0 always reuses state.active in EnsureVariant,
-	// so the handoff race is safe regardless of when the player requests it.
-	state.mu.Lock()
-	failed := make(map[int]bool, len(state.failedPlans))
-	for k, v := range state.failedPlans {
-		failed[k] = v
+	bitrate := active.prepared.videoBitrate
+	if bitrate <= 0 {
+		bitrate = float64(active.plan.EstimatedBandwidth())
 	}
-	state.mu.Unlock()
-
-	planIndices := []int{activePlan}
-	for i := activePlan + 1; i < len(job.Plans) && len(planIndices) < 4; i++ {
-		if failed[i] {
-			continue
-		}
-		planIndices = append(planIndices, i)
+	// Headroom for the audio rendition and TS overhead.
+	bandwidth := int64(bitrate * 1.2)
+	if bandwidth <= 0 {
+		bandwidth = 8_000_000
 	}
-
-	// Record the variant→plan mapping so EnsureVariant can resolve correctly.
-	state.mu.Lock()
-	for vIdx, pIdx := range planIndices {
-		state.variantPlans[vIdx] = pIdx
-	}
-	state.mu.Unlock()
 
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
-	for vIdx, pIdx := range planIndices {
-		plan := job.Plans[pIdx]
-		bw := int64(plan.EstimatedBandwidth())
-		if pIdx == activePlan && activeBitrate > 0 {
-			bw = int64(activeBitrate)
-		}
-		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, plan.Video.Parsed.Resolution))
-		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", vIdx))
+	code := ffmpeg.LanguageCode(job.TargetLanguage)
+	name := job.TargetLanguage
+	if name == "" {
+		name = "Audio"
 	}
+	media := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=YES,AUTOSELECT=YES", name)
+	if code != "" {
+		media += ",LANGUAGE=\"" + code + "\""
+	}
+	media += ",URI=\"audio/audio.m3u8\"\n"
+	b.WriteString(media)
+
+	streamInf := "#EXT-X-STREAM-INF:BANDWIDTH=" + fmt.Sprint(bandwidth)
+	if active.prepared.videoWidth > 0 && active.prepared.videoHeight > 0 {
+		streamInf += fmt.Sprintf(",RESOLUTION=%dx%d", active.prepared.videoWidth, active.prepared.videoHeight)
+	}
+	streamInf += ",AUDIO=\"aud\"\n"
+	b.WriteString(streamInf)
+	b.WriteString("video/video.m3u8\n")
 	return []byte(b.String()), true
 }
 
-// VideoPlaylistPath returns the video-only media playlist path.
-func (m *Muxer) VideoPlaylistPath(job *model.MuxJob) string {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return ""
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.lastAccess = time.Now()
-	if state.placeholder != nil && state.active == nil {
-		path := generationVideoPlaylistPath(state.placeholder)
-		if fileExists(path) {
-			return path
-		}
-	}
-	if state.active == nil {
-		return ""
-	}
-	return generationVideoPlaylistPath(state.active)
+// VideoPlaylist renders the full-length VOD media playlist for the video
+// rendition: every segment of the film is listed from the first request, so
+// the player knows the real duration and can seek freely.
+func (m *Muxer) VideoPlaylist(job *model.MuxJob) ([]byte, bool) {
+	return m.vodPlaylist(job)
 }
 
-// AudioPlaylistPath returns the audio-only media playlist path.
-func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return ""
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.lastAccess = time.Now()
-	if state.placeholder != nil && state.active == nil {
-		path := generationAudioPlaylistPath(state.placeholder)
-		if fileExists(path) {
-			return path
-		}
-	}
-	if state.active == nil {
-		return ""
-	}
-	return generationAudioPlaylistPath(state.active)
+// AudioPlaylist renders the same timeline for the audio rendition.
+func (m *Muxer) AudioPlaylist(job *model.MuxJob) ([]byte, bool) {
+	return m.vodPlaylist(job)
 }
 
-func (m *Muxer) PlaceholderVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
-	return m.synchronizedPlaceholderPlaylist(job, true)
-}
-
-func (m *Muxer) PlaceholderAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
-	return m.synchronizedPlaceholderPlaylist(job, false)
-}
-
-func (m *Muxer) synchronizedPlaceholderPlaylist(job *model.MuxJob, video bool) ([]byte, bool) {
+func (m *Muxer) vodPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return nil, false
 	}
 	state.mu.Lock()
-	if state.active != nil || state.placeholder == nil {
-		state.mu.Unlock()
-		return nil, false
-	}
-	placeholder := state.placeholder
 	state.lastAccess = time.Now()
+	duration := state.duration
+	disc := append([]int(nil), state.discontinuities...)
 	state.mu.Unlock()
-
-	videoPlaylist, err := readLivePlaylist(generationVideoPlaylistPath(placeholder))
-	if err != nil {
+	if duration <= 0 {
 		return nil, false
 	}
-	audioPlaylist, err := readLivePlaylist(generationAudioPlaylistPath(placeholder))
-	if err != nil {
-		return nil, false
-	}
-	first := videoPlaylist.first
-	if audioPlaylist.first > first {
-		first = audioPlaylist.first
-	}
-	last := videoPlaylist.last
-	if audioPlaylist.last < last {
-		last = audioPlaylist.last
-	}
-	if first < 0 || last < first {
-		return nil, false
-	}
-	playlist := videoPlaylist
-	if !video {
-		playlist = audioPlaylist
-	}
-	return playlist.render(first, last), true
+	return buildVodPlaylist(duration, disc)
 }
 
-type livePlaylist struct {
-	header   []string
-	segments map[int][]string
-	first    int
-	last     int
-}
-
-func readLivePlaylist(path string) (livePlaylist, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return livePlaylist{}, err
-	}
-	playlist := livePlaylist{segments: make(map[int][]string), first: -1, last: -1}
-	var pending []string
-	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(trimmed, "#EXT-X-MEDIA-SEQUENCE:"):
-			continue
-		case strings.HasPrefix(trimmed, "#EXTINF:"):
-			pending = append(pending[:0], line)
-		case trimmed != "" && !strings.HasPrefix(trimmed, "#"):
-			var segment int
-			if _, err := fmt.Sscanf(trimmed, "seg_%05d.ts", &segment); err != nil {
-				continue
-			}
-			lines := append([]string(nil), pending...)
-			lines = append(lines, line)
-			playlist.segments[segment] = lines
-			if playlist.first < 0 || segment < playlist.first {
-				playlist.first = segment
-			}
-			if segment > playlist.last {
-				playlist.last = segment
-			}
-			pending = pending[:0]
-		case len(pending) == 0:
-			playlist.header = append(playlist.header, line)
-		default:
-			pending = append(pending, line)
-		}
-	}
-	return playlist, nil
-}
-
-func (p livePlaylist) render(first, last int) []byte {
-	var out []string
-	insertedSequence := false
-	for _, line := range p.header {
-		out = append(out, line)
-		if strings.HasPrefix(strings.TrimSpace(line), "#EXT-X-TARGETDURATION:") {
-			out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", first))
-			insertedSequence = true
-		}
-	}
-	if !insertedSequence {
-		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", first))
-	}
-	for segment := first; segment <= last; segment++ {
-		out = append(out, p.segments[segment]...)
-	}
-	return []byte(strings.Join(out, "\n") + "\n")
-}
-
-func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return nil, false
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.lastAccess = time.Now()
-	if state.active == nil || state.filmDuration <= 0 {
-		return nil, false
-	}
-	return buildVodPlaylist(state.filmDuration, state.filmSequence)
-}
-
-func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return nil, false
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	state.lastAccess = time.Now()
-	if state.active == nil || state.filmDuration <= 0 {
-		return nil, false
-	}
-	return buildVodPlaylist(state.filmDuration, state.filmSequence)
-}
-
-func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return ""
-	}
-	state.mu.Lock()
-	state.lastAccess = time.Now()
-	if state.active != nil {
-		physical := segment - state.filmSequence
-		active := state.active
-		retired := state.retiredPlaceholder
-		duration := state.filmDuration
-		state.mu.Unlock()
-		if physical < 0 {
-			if retired != nil {
-				if path := generationAudioSegmentPath(retired, segment); fileExists(path) {
-					return path
-				}
-			}
-			return ""
-		}
-		if physical >= vodSegmentCount(duration) {
-			return ""
-		}
-		if path := generationAudioSegmentPath(active, physical); fileExists(path) {
-			return path
-		}
-		return ""
-	}
-	placeholder := state.placeholder
-	if placeholder != nil {
-		path := generationAudioSegmentPath(placeholder, segment)
-		if fileExists(path) {
-			state.mu.Unlock()
-			return path
-		}
-	}
-	state.mu.Unlock()
-	return ""
-}
-
+// SegmentPath resolves a public segment index to a file produced by any
+// generation, newest first.
 func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
+	return m.segmentPath(job, segment, false)
+}
+
+// AudioSegmentPath resolves a public audio segment index to a file.
+func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
+	return m.segmentPath(job, segment, true)
+}
+
+func (m *Muxer) segmentPath(job *model.MuxJob, segment int, audio bool) string {
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return ""
 	}
 	state.mu.Lock()
 	state.lastAccess = time.Now()
-	if state.active != nil {
-		physical := segment - state.filmSequence
-		active := state.active
-		retired := state.retiredPlaceholder
-		duration := state.filmDuration
-		state.mu.Unlock()
-		if physical < 0 {
-			if retired != nil {
-				if path := generationSegmentPath(retired, segment); fileExists(path) {
-					return path
-				}
-			}
-			return ""
-		}
-		if physical >= vodSegmentCount(duration) {
-			return ""
-		}
-		if path := generationSegmentPath(active, physical); fileExists(path) {
-			return path
-		}
+	duration := state.duration
+	all := append([]*generation(nil), state.all...)
+	state.mu.Unlock()
+
+	if segment < 0 || duration <= 0 || segment >= vodSegmentCount(duration) {
 		return ""
 	}
-	placeholder := state.placeholder
-	if placeholder != nil {
-		path := generationSegmentPath(placeholder, segment)
+	for i := len(all) - 1; i >= 0; i-- {
+		var path string
+		if audio {
+			path = generationAudioSegmentPath(all[i], segment)
+		} else {
+			path = generationSegmentPath(all[i], segment)
+		}
 		if fileExists(path) {
-			state.mu.Unlock()
 			return path
 		}
 	}
-	state.mu.Unlock()
 	return ""
 }
 
 // isForwardSeek reports whether a segment request is a real user seek rather
-// than pre-buffering. Pre-buffering (ExoPlayer) requests segments
-// incrementally, so the max requested grows by ~1 each time; a real seek jumps
-// far ahead (e.g. 5 -> 600). We require a large jump beyond the previous max
-// to avoid restarting the session on every buffered segment after handoff.
+// than pre-buffering: a large jump beyond the previous maximum that the
+// encoder has not reached.
 const seekJumpThreshold = 20
 
 func isForwardSeek(maxRequested, physical, highest, startSegment int) bool {
@@ -1220,11 +553,23 @@ func vodSegmentCount(filmDuration float64) int {
 	return int(math.Ceil(filmDuration / segDur))
 }
 
+// EnsureSegment serves (or waits for / restarts at) the requested video
+// segment. Backward requests hit the on-disk cache; forward requests beyond
+// what the encoder produced restart the session at that offset.
 func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
+	return m.ensureMediaSegment(ctx, job, segment, false)
+}
+
+// EnsureAudioSegment is EnsureSegment for the audio rendition.
+func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
+	return m.ensureMediaSegment(ctx, job, segment, true)
+}
+
+func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segment int, audio bool) (string, error) {
 	if err := m.EnsurePlaylist(ctx, job); err != nil {
 		return "", err
 	}
-	if path := m.SegmentPath(job, segment); path != "" {
+	if path := m.segmentPath(job, segment, audio); path != "" {
 		return path, nil
 	}
 
@@ -1232,56 +577,60 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 	if state == nil {
 		return "", fmt.Errorf("playback state not found")
 	}
+
+	state.mu.Lock()
+	count := vodSegmentCount(state.duration)
+	state.mu.Unlock()
+	if segment >= count {
+		return "", ErrBeyondEnd
+	}
+
 	deadlineCtx, cancel := context.WithTimeout(ctx, m.policy.SegmentTimeout)
 	defer cancel()
 
 	for {
-		if path := m.SegmentPath(job, segment); path != "" {
+		if path := m.segmentPath(job, segment, audio); path != "" {
 			return path, nil
 		}
 
 		state.mu.Lock()
 		state.lastAccess = time.Now()
-		physical := segment - state.filmSequence
 		active := state.active
-		placeholderActive := state.placeholder != nil && active == nil
-		if !placeholderActive {
-			state.lastRequested = physical
-			if physical > state.maxRequested {
-				state.maxRequested = physical
-			}
-		}
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
+		recoveryErr := state.recoveryErr
 		nextPlan := state.nextPlan
+		state.lastRequested = segment
+		if segment > state.maxRequested {
+			state.maxRequested = segment
+		}
 		maxReq := state.maxRequested
 		state.mu.Unlock()
 
-		if placeholderActive {
-			select {
-			case <-deadlineCtx.Done():
-				return "", fmt.Errorf("timeout waiting for placeholder segment %d: %w", segment, deadlineCtx.Err())
-			case <-time.After(50 * time.Millisecond):
-			}
-			continue
-		}
-		if physical < 0 {
-			return "", fmt.Errorf("segment %d precedes film sequence", segment)
-		}
 		if active == nil {
-			if !recovering {
-				m.ensureRecovery(job, state, physical, nextPlan, "no active session")
+			switch {
+			case recovering:
+				// recovery in flight; wait below
+			case recoveryErr != nil:
+				// Every plan already failed during recovery: fail fast
+				// instead of burning the segment deadline.
+				return "", recoveryErr
+			default:
+				m.ensureRecovery(job, state, segment, nextPlan, "no active session")
 			}
 		} else {
 			highest := highestCompleteSegment(active.dir)
 			select {
 			case <-active.session.Done():
 				if !recovering {
-					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
+					m.ensureRecovery(job, state, segment, nextPlan, "session ended")
 				}
 			default:
-				if isForwardSeek(maxReq, physical, highest, active.startSegment) && !recovering {
-					m.ensureRecovery(job, state, physical, active.planIndex, "forward seek")
+				// A real seek: either behind this session's start (already
+				// evicted from cache) or far ahead of production. Restart at
+				// the requested offset, same plan first.
+				if (segment < active.startSegment || isForwardSeek(maxReq, segment, highest, active.startSegment)) && !recovering {
+					m.ensureRecovery(job, state, segment, active.planIndex, "seek")
 				}
 			}
 		}
@@ -1294,85 +643,7 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 			state.mu.Lock()
 			err := state.recoveryErr
 			state.mu.Unlock()
-			if err != nil && m.SegmentPath(job, segment) == "" {
-				return "", err
-			}
-		}
-	}
-}
-
-// EnsureAudioSegment waits for the audio-only segment to be produced by the
-// active session (the same ffmpeg run that produces the video segments).
-func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
-	if err := m.EnsurePlaylist(ctx, job); err != nil {
-		return "", err
-	}
-	if path := m.AudioSegmentPath(job, segment); path != "" {
-		return path, nil
-	}
-
-	state := m.lookupState(job.ID)
-	if state == nil {
-		return "", fmt.Errorf("playback state not found")
-	}
-	deadlineCtx, cancel := context.WithTimeout(ctx, m.policy.SegmentTimeout)
-	defer cancel()
-
-	for {
-		if path := m.AudioSegmentPath(job, segment); path != "" {
-			return path, nil
-		}
-
-		state.mu.Lock()
-		state.lastAccess = time.Now()
-		physical := segment - state.filmSequence
-		active := state.active
-		placeholderActive := state.placeholder != nil && active == nil
-		if !placeholderActive {
-			state.lastRequested = physical
-			if physical > state.maxRequested {
-				state.maxRequested = physical
-			}
-		}
-		recovering := state.recovering
-		recoveryWait := state.recoveryWait
-		nextPlan := state.nextPlan
-		state.mu.Unlock()
-
-		if placeholderActive {
-			select {
-			case <-deadlineCtx.Done():
-				return "", fmt.Errorf("timeout waiting for placeholder audio segment %d: %w", segment, deadlineCtx.Err())
-			case <-time.After(50 * time.Millisecond):
-			}
-			continue
-		}
-		if physical < 0 {
-			return "", fmt.Errorf("audio segment %d precedes film sequence", segment)
-		}
-		if active == nil {
-			if !recovering {
-				m.ensureRecovery(job, state, physical, nextPlan, "no active session")
-			}
-		} else {
-			select {
-			case <-active.session.Done():
-				if !recovering {
-					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
-				}
-			default:
-			}
-		}
-
-		select {
-		case <-deadlineCtx.Done():
-			return "", fmt.Errorf("timeout waiting for audio segment %d: %w", segment, deadlineCtx.Err())
-		case <-time.After(100 * time.Millisecond):
-		case <-recoveryWait:
-			state.mu.Lock()
-			err := state.recoveryErr
-			state.mu.Unlock()
-			if err != nil && m.AudioSegmentPath(job, segment) == "" {
+			if err != nil && m.segmentPath(job, segment, audio) == "" {
 				return "", err
 			}
 		}
@@ -1409,6 +680,11 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 		if winner.planIndex+1 > state.nextPlan {
 			state.nextPlan = winner.planIndex + 1
 		}
+		// Mark the cutover when the source changes so players reset their
+		// decoders (resolution/HDR can differ between plans).
+		if old != nil && old != winner && old.planIndex != winner.planIndex {
+			state.discontinuities = append(state.discontinuities, startSegment)
+		}
 		state.lastRecovery = time.Now()
 		state.recoveryErr = nil
 	} else {
@@ -1437,27 +713,6 @@ func (m *Muxer) lookupState(jobID string) *playbackState {
 	state := m.states[jobID]
 	m.stateMu.Unlock()
 	return state
-}
-
-func generationPlaylistPath(generation *generation) string {
-	if generation == nil {
-		return ""
-	}
-	return filepath.Join(generation.dir, "master.m3u8")
-}
-
-func generationVideoPlaylistPath(generation *generation) string {
-	if generation == nil {
-		return ""
-	}
-	return filepath.Join(generation.dir, "video", "video.m3u8")
-}
-
-func generationAudioPlaylistPath(generation *generation) string {
-	if generation == nil {
-		return ""
-	}
-	return filepath.Join(generation.dir, "audio", "audio.m3u8")
 }
 
 func generationSegmentPath(generation *generation, segment int) string {
@@ -1500,7 +755,10 @@ func highestCompleteSegment(dir string) int {
 	return highest
 }
 
-func buildVodPlaylist(filmDuration float64, sequence int) ([]byte, bool) {
+// buildVodPlaylist renders the complete VOD media playlist: every segment of
+// the film with its duration, ENDLIST included, and DISCONTINUITY markers at
+// plan cutover points.
+func buildVodPlaylist(filmDuration float64, discontinuities []int) ([]byte, bool) {
 	if filmDuration <= 0 {
 		return nil, false
 	}
@@ -1512,29 +770,29 @@ func buildVodPlaylist(filmDuration float64, sequence int) ([]byte, bool) {
 	if len(segs) == 0 {
 		return nil, false
 	}
-	maxSeg := segs[0]
-	for _, s := range segs[1:] {
-		if s > maxSeg {
-			maxSeg = s
-		}
-	}
-	target := int(math.Ceil(maxSeg))
+	target := int(math.Ceil(segDur))
 	if target < 1 {
 		target = 1
+	}
+	disc := make(map[int]bool, len(discontinuities))
+	for _, d := range discontinuities {
+		if d > 0 && d < len(segs) {
+			disc[d] = true
+		}
 	}
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", target))
-	b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", sequence))
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
-	if sequence > 0 {
-		b.WriteString("#EXT-X-DISCONTINUITY\n")
-	}
 	for i, d := range segs {
+		if disc[i] {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
 		b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", d))
-		b.WriteString(fmt.Sprintf("seg_%05d.ts\n", sequence+i))
+		b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	return []byte(b.String()), true

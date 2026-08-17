@@ -84,26 +84,6 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 	}
 }
 
-func TestBuildPlaceholderArgsProduceNonSeekableLivePlaylist(t *testing.T) {
-	args := buildPlaceholderArgs("/tmp/placeholder.mp4", "/tmp/placeholder")
-	for _, want := range [][]string{
-		{"-readrate", "1", "-readrate_initial_burst", "4", "-i", "/tmp/placeholder.mp4"},
-		{"-map", "0:v:0"},
-		{"-map", "0:a:0"},
-		{"-hls_list_size", "3"},
-		{"-hls_allow_cache", "0"},
-		{"-hls_flags", "independent_segments+temp_file+omit_endlist"},
-		{"-hls_flags", "independent_segments+temp_file+split_by_time+omit_endlist"},
-	} {
-		if !containsArguments(args, want) {
-			t.Errorf("args do not contain %q: %#v", want, args)
-		}
-	}
-	if containsArguments(args, []string{"-hls_playlist_type", "event"}) {
-		t.Fatalf("placeholder must not expose an EVENT timeline: %#v", args)
-	}
-}
-
 func TestBuildSessionArgsRejectsInvalidAudioMode(t *testing.T) {
 	_, err := buildSessionArgs(SessionSpec{
 		VideoURL:        "video",

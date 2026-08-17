@@ -157,9 +157,8 @@ func TestCompatibleReleasesRejectsDifferentEditionsAndDurations(t *testing.T) {
 }
 
 func TestCompatibleAudioModeAlwaysCopiesOriginalAudio(t *testing.T) {
-	// The original audio is copied regardless of codec. Re-encoding to AAC
-	// caused the Android ExoPlayer decoder to reject the stream, so copy is
-	// preferred and codec-specific fallback is left to plan selection.
+	// The original audio is copied regardless of codec. Stremio's player
+	// decodes every common codec, so copy avoids quality loss.
 	for _, codec := range []string{"aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "pcm_s24le"} {
 		if got := compatibleAudioMode(codec); got != ffmpeg.AudioModeCopy {
 			t.Errorf("compatibleAudioMode(%q) = %q, want copy", codec, got)
@@ -177,24 +176,26 @@ func TestUniqueAddonsDoesNotQueryBothRoleTwice(t *testing.T) {
 	}
 }
 
-func TestBuildVodPlaylistPreservesFilmSequence(t *testing.T) {
-	data, ok := buildVodPlaylist(10, 11)
+func TestBuildVodPlaylistFullTimelineWithDiscontinuity(t *testing.T) {
+	data, ok := buildVodPlaylist(10, []int{2})
 	if !ok {
 		t.Fatal("buildVodPlaylist() returned false")
 	}
 	playlist := string(data)
 	for _, want := range []string{
 		"#EXT-X-PLAYLIST-TYPE:VOD",
-		"#EXT-X-MEDIA-SEQUENCE:11",
-		"#EXT-X-DISCONTINUITY",
-		"seg_00011.ts",
-		"seg_00012.ts",
-		"seg_00013.ts",
+		"#EXT-X-MEDIA-SEQUENCE:0",
+		"seg_00000.ts",
+		"#EXT-X-DISCONTINUITY\n#EXTINF:2.000000,\nseg_00002.ts",
+		"seg_00001.ts",
 		"#EXT-X-ENDLIST",
 	} {
 		if !strings.Contains(playlist, want) {
 			t.Fatalf("playlist missing %q: %s", want, playlist)
 		}
+	}
+	if strings.Count(playlist, "#EXT-X-DISCONTINUITY") != 1 {
+		t.Fatalf("expected exactly one discontinuity: %s", playlist)
 	}
 }
 
@@ -211,60 +212,9 @@ func TestComputeEqualLengthSegmentsUsesShortFinalSegment(t *testing.T) {
 	}
 }
 
-func TestPlaceholderFilmSequenceUsesLastCommonAdvertisedSegment(t *testing.T) {
-	dir := t.TempDir()
-	for _, media := range []string{"video", "audio"} {
-		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	video := "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4,\nseg_00000.ts\n#EXTINF:4,\nseg_00001.ts\n"
-	audio := video + "#EXTINF:4,\nseg_00002.ts\n"
-	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if got := placeholderFilmSequence(&generation{dir: dir}); got != 2 {
-		t.Fatalf("film sequence = %d, want 2", got)
-	}
-}
-
-func TestSynchronizedPlaceholderPlaylistUsesCommonWindow(t *testing.T) {
-	dir := t.TempDir()
-	for _, media := range []string{"video", "audio"} {
-		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	video := "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4,\nseg_00000.ts\n#EXTINF:4,\nseg_00001.ts\n"
-	audio := video + "#EXTINF:4,\nseg_00002.ts\n"
-	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
-		t.Fatal(err)
-	}
-	state := &playbackState{placeholder: &generation{dir: dir}}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-	job := &model.MuxJob{ID: "job"}
-	data, ok := mux.PlaceholderVideoPlaylist(job)
-	if !ok {
-		t.Fatal("PlaceholderVideoPlaylist() returned false")
-	}
-	playlist := string(data)
-	if strings.Contains(playlist, "seg_00002.ts") {
-		t.Fatalf("video playlist exposed audio-only segment: %s", playlist)
-	}
-	if !strings.Contains(playlist, "seg_00001.ts") {
-		t.Fatalf("video playlist omitted common segment: %s", playlist)
-	}
-}
-
 func TestIsForwardSeekDistinguishesBufferingFromSeek(t *testing.T) {
-	// Pre-buffering: max grows incrementally (2,3,4,5...), so a request just
-	// ahead of the max is NOT a seek — wait for the encoder.
+	// Pre-buffering: max grows incrementally, so a request just ahead of the
+	// max is NOT a seek — wait for the encoder.
 	if isForwardSeek(3, 11, 2, 0) {
 		t.Fatal("sequential pre-buffering must not be a forward seek")
 	}
@@ -307,121 +257,138 @@ func TestEstimatedBandwidthPrefersAdvertisedBitrate(t *testing.T) {
 	}
 }
 
-func TestMasterPlaylistAdvertisesActivePlanUnderItsIndex(t *testing.T) {
+func TestMasterPlaylistDeclaresAudioRenditionGroup(t *testing.T) {
 	state := &playbackState{
-		active:       &generation{dir: t.TempDir(), planIndex: 2},
-		variantPlans: make(map[int]int),
-	}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-	job := &model.MuxJob{
-		ID: "job",
-		Plans: []model.PlaybackPlan{
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}}},
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "1080p"}}},
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "720p"}}},
+		duration: 7200,
+		active: &generation{
+			dir:       t.TempDir(),
+			planIndex: 0,
+			plan: model.PlaybackPlan{
+				Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}},
+			},
+			prepared: &preparedPlan{
+				duration:     7200,
+				videoBitrate: 50_000_000,
+				videoWidth:   3840,
+				videoHeight:  2160,
+			},
 		},
 	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job", TargetLanguage: "Portuguese (Brazil)"}
+
 	data, ok := mux.MasterPlaylist(job)
 	if !ok {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	// The active plan (2) must be advertised as v0 (first variant), with its
-	// resolution visible. variantPlans must map v0 -> plan 2.
-	if !strings.Contains(playlist, "RESOLUTION=720p") || !strings.Contains(playlist, "v0/video/video.m3u8") {
-		t.Fatalf("master did not advertise active plan 2 as v0: %s", playlist)
+	// The audio rendition group is what makes the player load the audio
+	// playlist at all — without it every film plays silently.
+	if !strings.Contains(playlist, "#EXT-X-MEDIA:TYPE=AUDIO") || !strings.Contains(playlist, "URI=\"audio/audio.m3u8\"") {
+		t.Fatalf("master missing audio rendition group: %s", playlist)
 	}
-	if state.variantPlans[0] != 2 {
-		t.Fatalf("variantPlans[0] = %d, want 2", state.variantPlans[0])
+	if !strings.Contains(playlist, "AUDIO=\"aud\"") {
+		t.Fatalf("stream-inf missing audio group: %s", playlist)
 	}
-}
-
-func TestMasterPlaylistOmitsAlreadyFailedPlansAboveActive(t *testing.T) {
-	state := &playbackState{
-		active:       &generation{dir: t.TempDir(), planIndex: 0},
-		variantPlans: make(map[int]int),
-		failedPlans:  map[int]bool{1: true, 2: true},
+	if !strings.Contains(playlist, "RESOLUTION=3840x2160") {
+		t.Fatalf("master missing resolution: %s", playlist)
 	}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-	job := &model.MuxJob{
-		ID: "job",
-		Plans: []model.PlaybackPlan{
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}}},
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "1080p"}}},
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "720p"}}},
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "480p"}}},
-		},
-	}
-	data, ok := mux.MasterPlaylist(job)
-	if !ok {
-		t.Fatal("MasterPlaylist() returned false")
-	}
-	playlist := string(data)
-	// Active plan 0 (2160p) is v0; plans 1 and 2 failed validation and must
-	// be omitted; only plan 3 (480p) follows.
-	if !strings.Contains(playlist, "RESOLUTION=2160p") {
-		t.Fatalf("active plan 0 missing: %s", playlist)
-	}
-	if strings.Contains(playlist, "RESOLUTION=1080p") || strings.Contains(playlist, "RESOLUTION=720p") {
-		t.Fatalf("failed plans were advertised: %s", playlist)
-	}
-	if !strings.Contains(playlist, "RESOLUTION=480p") {
-		t.Fatalf("valid plan below active missing: %s", playlist)
+	if !strings.Contains(playlist, "video/video.m3u8") {
+		t.Fatalf("master missing video playlist URI: %s", playlist)
 	}
 }
 
-func TestMasterPlaylistAdvertisesVariants(t *testing.T) {
+func TestVodPlaylistServesFullDurationImmediately(t *testing.T) {
+	// A 2h film must expose 1800 segments from the very first request.
 	state := &playbackState{
-		active:       &generation{dir: t.TempDir(), planIndex: 0},
-		variantPlans: make(map[int]int),
-	}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-	job := &model.MuxJob{
-		ID: "job",
-		Plans: []model.PlaybackPlan{
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}}},
-			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "1080p"}}},
-		},
-	}
-	data, ok := mux.MasterPlaylist(job)
-	if !ok {
-		t.Fatal("MasterPlaylist() returned false")
-	}
-	playlist := string(data)
-	if !strings.Contains(playlist, "v0/video/video.m3u8") || !strings.Contains(playlist, "v1/video/video.m3u8") {
-		t.Fatalf("master missing variants: %s", playlist)
-	}
-}
-
-func TestFilmSequenceMapsCutoverAndRetainsEarlierPlaceholderSegments(t *testing.T) {
-	filmDir := t.TempDir()
-	placeholderDir := t.TempDir()
-	for _, dir := range []string{filmDir, placeholderDir} {
-		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	film := filepath.Join(filmDir, "video", "seg_00000.ts")
-	placeholder := filepath.Join(placeholderDir, "video", "seg_00001.ts")
-	if err := os.WriteFile(film, []byte("film"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(placeholder, []byte("placeholder"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	state := &playbackState{
-		active:             &generation{dir: filmDir},
-		retiredPlaceholder: &generation{dir: placeholderDir},
-		filmSequence:       2,
-		filmDuration:       120,
+		duration: 7200,
+		active:   &generation{dir: t.TempDir(), planIndex: 0},
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	if path := mux.SegmentPath(job, 2); path != film {
-		t.Fatalf("cutover segment path = %q, want %q", path, film)
+	data, ok := mux.VideoPlaylist(job)
+	if !ok {
+		t.Fatal("VideoPlaylist() returned false")
 	}
-	if path := mux.SegmentPath(job, 1); path != placeholder {
-		t.Fatalf("retired placeholder path = %q, want %q", path, placeholder)
+	playlist := string(data)
+	if !strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("playlist must be VOD (ENDLIST): %s", playlist[:200])
+	}
+	if !strings.Contains(playlist, "seg_01799.ts") {
+		t.Fatal("playlist missing final segment of a 2h film")
+	}
+	// Audio playlist exposes the same timeline.
+	audioData, ok := mux.AudioPlaylist(job)
+	if !ok {
+		t.Fatal("AudioPlaylist() returned false")
+	}
+	if len(audioData) != len(data) {
+		t.Fatal("audio and video playlists must expose the same timeline")
+	}
+}
+
+func TestSegmentPathSearchesGenerationsNewestFirst(t *testing.T) {
+	old := t.TempDir()
+	newest := t.TempDir()
+	for _, dir := range []string{old, newest} {
+		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	staleSeg := filepath.Join(old, "video", "seg_00005.ts")
+	freshSeg := filepath.Join(newest, "video", "seg_00005.ts")
+	if err := os.WriteFile(staleSeg, []byte("stale"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(freshSeg, []byte("fresh"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Only the old generation produced segment 3 (backward seek target).
+	if err := os.WriteFile(filepath.Join(old, "video", "seg_00003.ts"), []byte("back"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &playbackState{
+		duration: 120,
+		all:      []*generation{{dir: old}, {dir: newest}},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPath(job, 5); path != freshSeg {
+		t.Fatalf("segment 5 = %q, want newest generation %q", path, freshSeg)
+	}
+	if path := mux.SegmentPath(job, 3); !strings.HasSuffix(path, filepath.Join("video", "seg_00003.ts")) || !strings.Contains(path, old) {
+		t.Fatalf("segment 3 = %q, want old generation", path)
+	}
+	// Requests beyond the film duration return nothing.
+	if path := mux.SegmentPath(job, 60); path != "" {
+		t.Fatalf("segment beyond end = %q, want empty", path)
+	}
+}
+
+func TestPlayerTooSlowRequiresAllWindowsSlow(t *testing.T) {
+	now := time.Unix(1000, 0)
+	required := 10_000_000.0 // 10 Mbps
+	// 1 MB in 0.5s = 16 Mbps (fast).
+	fast := deliverySample{at: now, bytes: 1_000_000, seconds: 0.5}
+	// 1 MB in 2s = 4 Mbps (slow).
+	slow := deliverySample{at: now, bytes: 1_000_000, seconds: 2}
+
+	if playerTooSlow(nil, required) {
+		t.Fatal("no samples must not be slow")
+	}
+	if playerTooSlow([]deliverySample{slow, slow, slow}, required) {
+		t.Fatal("fewer than window samples must not decide")
+	}
+	if playerTooSlow([]deliverySample{slow, slow, slow, fast}, required) {
+		t.Fatal("one fast delivery in the window must veto the downgrade")
+	}
+	if !playerTooSlow([]deliverySample{slow, slow, slow, slow}, required) {
+		t.Fatal("all deliveries slow must downgrade")
+	}
+	if playerTooSlow([]deliverySample{slow, slow, slow, slow}, 0) {
+		t.Fatal("unknown required bitrate must not downgrade")
 	}
 }

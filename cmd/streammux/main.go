@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/streammux/streammux/internal/application/assets"
 	"github.com/streammux/streammux/internal/application/collector"
 	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/application/muxer"
@@ -56,29 +55,8 @@ func main() {
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
 
-	// Placeholder (intro) temporarily disabled: it was the source of most
-	// handoff bugs. Only enabled when explicitly configured via env var.
-	placeholderPath := envOr("PLACEHOLDER_VIDEO", "")
-	if placeholderPath == "" {
-		placeholderPath = envOr("PLACEHOLDER_INTRO", "")
-	}
-	if placeholderPath == "" {
-		placeholderPath = envOr("PLACEHOLDER_LOOP", "")
-	}
-	errorAssetsDir := ""
-	errorPath := envOr("ERROR_VIDEO", "")
-	if errorPath == "" {
-		var err error
-		errorPath, errorAssetsDir, err = assets.ErrorPath()
-		if err != nil {
-			log.Fatalf("error assets: %v", err)
-		}
-	}
-	mux := muxer.NewWithErrorPlaceholder(collector, planner, ff, res, store, baseURL, placeholderPath, errorPath)
+	mux := muxer.New(collector, planner, ff, res, store, baseURL)
 	store.SetOnDelete(mux.CleanupJob)
-	if errorAssetsDir != "" {
-		defer os.RemoveAll(errorAssetsDir)
-	}
 
 	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{
 		BaseURL: baseURL,

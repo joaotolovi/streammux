@@ -27,7 +27,6 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
-	StartSinglePlaceholderSession(context.Context, string, string) (*ffmpeg.Session, error)
 	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
 }
 
@@ -41,6 +40,7 @@ type Policy struct {
 	IdleTimeout       time.Duration
 	HealthWindow      time.Duration
 	RecoveryCooldown  time.Duration
+	RetryCooldown     time.Duration
 	MinRealtime       float64
 	MinPublishedAhead time.Duration
 	DurationTolerance float64
@@ -51,12 +51,13 @@ func defaultPolicy() Policy {
 		// The Stremio client tolerates roughly 60s before it gives up on
 		// starting playback, so startup can use a generous window. Lenient uses
 		// half of StartupTimeout and re-runs cached probes, so it stays fast.
-		StartupTimeout:    45 * time.Second,
-		AttemptTimeout:    20 * time.Second,
+		StartupTimeout:    50 * time.Second,
+		AttemptTimeout:    25 * time.Second,
 		SegmentTimeout:    30 * time.Second,
 		IdleTimeout:       90 * time.Second,
 		HealthWindow:      4 * time.Second,
 		RecoveryCooldown:  10 * time.Second,
+		RetryCooldown:     30 * time.Second,
 		MinRealtime:       1.0,
 		MinPublishedAhead: 12 * time.Second,
 		DurationTolerance: 0.002,
@@ -71,9 +72,6 @@ type Muxer struct {
 	store     ports.MuxStore
 	baseURL   string
 	policy    Policy
-
-	placeholderPath string
-	errorPath       string
 
 	httpClient *http.Client
 
@@ -96,39 +94,21 @@ type Result struct {
 }
 
 func New(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
-	return NewWithPlaceholder(col, pl, ff, res, store, baseURL, "", "")
-}
-
-func NewWithPlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, introPath, loopPath string) *Muxer {
-	path := introPath
-	if path == "" {
-		path = loopPath
-	}
-	return NewWithSinglePlaceholder(col, pl, ff, res, store, baseURL, path)
-}
-
-func NewWithSinglePlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath string) *Muxer {
-	return NewWithErrorPlaceholder(col, pl, ff, res, store, baseURL, placeholderPath, "")
-}
-
-func NewWithErrorPlaceholder(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath, errorPath string) *Muxer {
 	m := &Muxer{
-		collector:       col,
-		planner:         pl,
-		ffmpeg:          ff,
-		resolver:        res,
-		store:           store,
-		baseURL:         strings.TrimSuffix(baseURL, "/"),
-		policy:          defaultPolicy(),
-		placeholderPath: placeholderPath,
-		errorPath:       errorPath,
-		httpClient:      &http.Client{Timeout: 12 * time.Second},
-		states:          make(map[string]*playbackState),
-		resolved:        make(map[string]resolvedEntry),
-		resolveFlights:  make(map[string]*resolveFlight),
-		probes:          make(map[string]probeEntry),
-		probeFlights:    make(map[string]*probeFlight),
-		offsets:         make(map[string]time.Duration),
+		collector:      col,
+		planner:        pl,
+		ffmpeg:         ff,
+		resolver:       res,
+		store:          store,
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		policy:         defaultPolicy(),
+		httpClient:     &http.Client{Timeout: 15 * time.Second},
+		states:         make(map[string]*playbackState),
+		resolved:       make(map[string]resolvedEntry),
+		resolveFlights: make(map[string]*resolveFlight),
+		probes:         make(map[string]probeEntry),
+		probeFlights:   make(map[string]*probeFlight),
+		offsets:        make(map[string]time.Duration),
 	}
 	go m.reapIdleSessions()
 	return m

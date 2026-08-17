@@ -55,7 +55,11 @@ type preparedPlan struct {
 	duration        float64
 	// videoBitrate is the measured peak bitrate of the video source in bits/s
 	// (from ffprobe). Zero when the source does not report it.
-	videoBitrate     float64
+	videoBitrate float64
+	videoWidth   int
+	videoHeight  int
+	// videoAudioTracks are the audio tracks of the video source, used for A/V
+	// offset estimation on dual-source plans.
 	videoAudioTracks []ffmpeg.AudioTrack
 }
 
@@ -144,6 +148,10 @@ func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan mod
 	prepared.audioTrackIndex = trackIndex
 	prepared.duration = videoProbe.Duration
 	prepared.videoBitrate = videoProbe.VideoBitrate
+	if len(videoProbe.VideoStreams) > 0 {
+		prepared.videoWidth = videoProbe.VideoStreams[0].Width
+		prepared.videoHeight = videoProbe.VideoStreams[0].Height
+	}
 	prepared.videoAudioTracks = videoProbe.AudioTracks
 	for _, track := range audioProbe.AudioTracks {
 		if track.Index == trackIndex {
