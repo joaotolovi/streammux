@@ -547,6 +547,11 @@ func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantInd
 	// Resolve the variant index to the real plan index via the mapping
 	// established by MasterPlaylist.
 	state.mu.Lock()
+	if variantIndex == 0 && state.active != nil {
+		active := state.active
+		state.mu.Unlock()
+		return generationVideoPlaylistPath(active), nil
+	}
 	planIndex, ok := state.variantPlans[variantIndex]
 	if !ok {
 		// No mapping yet — EnsurePlaylist hasn't been called or the master
@@ -774,14 +779,11 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Build the list of plan indices to advertise, starting with the active
-	// plan (always v0), then only the plans BELOW it (higher index, lighter
-	// sources). Plans above the active one already failed during startup/
-	// recovery — re-advertising them would only retry sources that failed.
+	// Single-variant master until the variant segment mapping is proven
+	// stable for the placeholder handoff. Advertising multiple variants
+	// before that causes the player to fetch a failing variant (v1) and
+	// surface source error even though the primary (v0) is healthy.
 	planIndices := []int{activePlan}
-	for i := activePlan + 1; i < len(job.Plans) && len(planIndices) < 4; i++ {
-		planIndices = append(planIndices, i)
-	}
 
 	// Record the variant→plan mapping so EnsureVariant can resolve correctly.
 	state.mu.Lock()

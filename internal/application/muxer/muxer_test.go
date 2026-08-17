@@ -356,15 +356,9 @@ func TestMasterPlaylistOmitsAlreadyFailedPlansAboveActive(t *testing.T) {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	// Active plan 2 (720p) is v0; only plans below it (plan 3, 480p) follow.
-	if !strings.Contains(playlist, "RESOLUTION=720p") {
-		t.Fatalf("active plan 2 missing: %s", playlist)
-	}
-	if strings.Contains(playlist, "RESOLUTION=2160p") || strings.Contains(playlist, "RESOLUTION=1080p") {
-		t.Fatalf("failed plans above active were advertised: %s", playlist)
-	}
-	if !strings.Contains(playlist, "RESOLUTION=480p") {
-		t.Fatalf("plan below active missing: %s", playlist)
+	// Until the handoff is proven stable, only the active plan is advertised.
+	if !strings.Contains(playlist, "RESOLUTION=720p") || strings.Contains(playlist, "RESOLUTION=480p") {
+		t.Fatalf("master variant set invalid: %s", playlist)
 	}
 }
 
@@ -386,8 +380,8 @@ func TestMasterPlaylistAdvertisesVariants(t *testing.T) {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	if !strings.Contains(playlist, "v0/video/video.m3u8") || !strings.Contains(playlist, "v1/video/video.m3u8") {
-		t.Fatalf("master missing variants: %s", playlist)
+	if !strings.Contains(playlist, "v0/video/video.m3u8") {
+		t.Fatalf("master missing active variant: %s", playlist)
 	}
 }
 
