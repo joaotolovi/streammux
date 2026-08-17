@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,7 @@ type playbackState struct {
 	// stitched is true once the master has been rewritten to include both the
 	// placeholder prefix and the film suffix. Segment lookups must check it.
 	stitched bool
+	filmDuration float64
 	// placeholderStartedAt tracks when the placeholder master became ready;
 	// used to cap the handoff to what the player actually consumed.
 	placeholderStartedAt time.Time
@@ -264,8 +266,8 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		case <-placeholder.session.Done():
 		case <-time.After(2 * time.Second):
 		}
-		state.mu.Lock()
 		state.stitched = true
+		state.filmDuration = winner.prepared.duration
 		state.mu.Unlock()
 		state.mu.Lock()
 	}
@@ -1141,7 +1143,77 @@ func (m *Muxer) stitchedVideoPlaylistContent(state *playbackState) ([]byte, bool
 		}
 		out = append(out, l)
 	}
+	if state.filmDuration > 0 {
+		filmPublished := 0.0
+		for _, l := range filmLines {
+			if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
+				if d, err := parseExtInf(strings.TrimSpace(l)); err == nil {
+					filmPublished += d
+				}
+			}
+		}
+		remaining := state.filmDuration - filmPublished
+		if remaining > 0.5 {
+			avgSeg := ffmpeg.SegDuration()
+			if v := avgExtInf(filmLines); v > 0 {
+				avgSeg = v
+			}
+			virtualCount := int(math.Ceil(remaining / avgSeg))
+			if virtualCount < 1 {
+				virtualCount = 1
+			}
+			if virtualCount > 2000 {
+				virtualCount = 2000
+			}
+			for i := 0; i < virtualCount; i++ {
+				d := avgSeg
+				if i == virtualCount-1 {
+					d = remaining - float64(i)*avgSeg
+					if d <= 0 {
+						d = avgSeg
+					}
+					if d > avgSeg {
+						d = avgSeg
+					}
+				}
+				virtIdx := filmIndex + offset + i
+				out = append(out, fmt.Sprintf("#EXTINF:%.3f,", d))
+				out = append(out, fmt.Sprintf("seg_%05d.ts", virtIdx))
+			}
+		}
+	}
 	return []byte(strings.Join(out, "\n") + "\n"), true
+}
+
+func parseExtInf(line string) (float64, error) {
+	rest := strings.TrimPrefix(line, "#EXTINF:")
+	rest = strings.SplitN(rest, ",", 2)[0]
+	var v float64
+	_, err := fmt.Sscanf(strings.TrimSpace(rest), "%f", &v)
+	return v, err
+}
+
+func avgExtInf(lines []string) float64 {
+	var sum float64
+	var n int
+	for _, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
+			if v, err := func() (float64, error) {
+				rest := strings.TrimPrefix(strings.TrimSpace(l), "#EXTINF:")
+				rest = strings.SplitN(rest, ",", 2)[0]
+				var f float64
+				_, err := fmt.Sscanf(strings.TrimSpace(rest), "%f", &f)
+				return f, err
+			}(); err == nil && v > 0 {
+				sum += v
+				n++
+			}
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return sum / float64(n)
 }
 
 func (m *Muxer) stitchedAudioPlaylistContent(state *playbackState) ([]byte, bool) {
@@ -1263,6 +1335,45 @@ func (m *Muxer) stitchedAudioPlaylistContent(state *playbackState) ([]byte, bool
 			filmIndex++
 		}
 		out = append(out, l)
+	}
+	if state.filmDuration > 0 {
+		filmPublished := 0.0
+		for _, l := range filmLines {
+			if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
+				if d, err := parseExtInf(strings.TrimSpace(l)); err == nil {
+					filmPublished += d
+				}
+			}
+		}
+		remaining := state.filmDuration - filmPublished
+		if remaining > 0.5 {
+			avgSeg := ffmpeg.SegDuration()
+			if v := avgExtInf(filmLines); v > 0 {
+				avgSeg = v
+			}
+			virtualCount := int(math.Ceil(remaining / avgSeg))
+			if virtualCount < 1 {
+				virtualCount = 1
+			}
+			if virtualCount > 2000 {
+				virtualCount = 2000
+			}
+			for i := 0; i < virtualCount; i++ {
+				d := avgSeg
+				if i == virtualCount-1 {
+					d = remaining - float64(i)*avgSeg
+					if d <= 0 {
+						d = avgSeg
+					}
+					if d > avgSeg {
+						d = avgSeg
+					}
+				}
+				virtIdx := filmIndex + offset + i
+				out = append(out, fmt.Sprintf("#EXTINF:%.3f,", d))
+				out = append(out, fmt.Sprintf("seg_%05d.ts", virtIdx))
+			}
+		}
 	}
 	return []byte(strings.Join(out, "\n") + "\n"), true
 }
