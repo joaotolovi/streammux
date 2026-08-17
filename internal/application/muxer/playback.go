@@ -50,6 +50,7 @@ type playbackState struct {
 	nextGeneration uint64
 	nextPlan       int
 	lastRequested  int
+	maxRequested   int
 	lastAccess     time.Time
 	lastRecovery   time.Time
 	closed         bool
@@ -85,6 +86,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		cacheDir:      dir,
 		variants:      make(map[int]*generation),
 		lastRequested: -1,
+		maxRequested:  -1,
 		lastAccess:    time.Now(),
 	}
 	m.states[job.ID] = state
@@ -288,6 +290,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.filmDuration = winner.prepared.duration
 	state.filmSequence = filmSequence
 	state.lastRequested = -1
+	state.maxRequested = filmSequence - 1
 	state.retiredPlaceholder = placeholder
 	state.placeholder = nil
 	state.mu.Unlock()
@@ -1090,10 +1093,14 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 		placeholderActive := state.placeholder != nil && active == nil
 		if !placeholderActive {
 			state.lastRequested = physical
+			if physical > state.maxRequested {
+				state.maxRequested = physical
+			}
 		}
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		nextPlan := state.nextPlan
+		maxReq := state.maxRequested
 		state.mu.Unlock()
 
 		if placeholderActive {
@@ -1119,11 +1126,15 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
 				}
 			default:
-				// Only treat as a forward seek (requiring a new session at a
-				// different offset) when the request is far beyond what the
-				// FFmpeg has produced. A request within a reasonable window
-				// just means the encoder hasn't reached it yet — wait.
-				if highest >= active.startSegment && physical > highest+8 && !recovering {
+				// Distinguish pre-buffering from a real seek:
+				// Pre-buffering: player requests segments incrementally
+				//   (e.g. 2, 3, 4, 5, 6...). maxRequested grows gradually.
+				// Real seek: player jumps (e.g. from 5 to 600). The gap
+				//   between the previous max and the new request is large.
+				// Only restart the session at the new offset for a real
+				// seek — pre-buffering just waits for the encoder.
+				isSeek := maxReq >= 0 && physical > maxReq+20
+				if isSeek && highest >= active.startSegment && physical > highest+8 && !recovering {
 					m.ensureRecovery(job, state, physical, active.planIndex, "forward seek")
 				}
 			}
@@ -1173,6 +1184,9 @@ func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segme
 		placeholderActive := state.placeholder != nil && active == nil
 		if !placeholderActive {
 			state.lastRequested = physical
+			if physical > state.maxRequested {
+				state.maxRequested = physical
+			}
 		}
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
