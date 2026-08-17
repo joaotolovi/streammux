@@ -60,10 +60,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /mux/{jobId}/video/{segment}", s.handleHLSSegment)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
 	// ABR variant endpoints — per-plan media playlists and segments.
-	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/video/video.m3u8", s.handleHLSVariantVideoPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/audio/audio.m3u8", s.handleHLSVariantAudioPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/video/{segment}", s.handleHLSVariantSegment)
-	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/audio/{segment}", s.handleHLSVariantAudioSegment)
+	s.mux.HandleFunc("GET /mux/{jobId}/{variant}/video/video.m3u8", s.handleHLSVariantVideoPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/{variant}/audio/audio.m3u8", s.handleHLSVariantAudioPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/{variant}/video/{segment}", s.handleHLSVariantSegment)
+	s.mux.HandleFunc("GET /mux/{jobId}/{variant}/audio/{segment}", s.handleHLSVariantAudioSegment)
 
 	// API
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
@@ -355,7 +355,7 @@ func (s *Server) handleHLSAudioSegment(w http.ResponseWriter, r *http.Request) {
 // variant, starting its generation on demand.
 func (s *Server) handleHLSVariantVideoPlaylist(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
-	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	planIndex, err := parsePlanIndex(r.PathValue("variant"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid variant")
 		return
@@ -384,7 +384,7 @@ func (s *Server) handleHLSVariantVideoPlaylist(w http.ResponseWriter, r *http.Re
 // variant.
 func (s *Server) handleHLSVariantAudioPlaylist(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
-	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	planIndex, err := parsePlanIndex(r.PathValue("variant"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid variant")
 		return
@@ -413,7 +413,7 @@ func (s *Server) handleHLSVariantAudioPlaylist(w http.ResponseWriter, r *http.Re
 // handleHLSVariantSegment serves a video segment for an ABR variant.
 func (s *Server) handleHLSVariantSegment(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
-	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	planIndex, err := parsePlanIndex(r.PathValue("variant"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid variant")
 		return
@@ -447,7 +447,7 @@ func (s *Server) handleHLSVariantSegment(w http.ResponseWriter, r *http.Request)
 // handleHLSVariantAudioSegment serves an audio segment for an ABR variant.
 func (s *Server) handleHLSVariantAudioSegment(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
-	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	planIndex, err := parsePlanIndex(r.PathValue("variant"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid variant")
 		return
@@ -480,6 +480,8 @@ func (s *Server) handleHLSVariantAudioSegment(w http.ResponseWriter, r *http.Req
 }
 
 func parsePlanIndex(value string) (int, error) {
+	// Accept both "0" and "v0" (the master playlist emits "v%d" variant paths).
+	value = strings.TrimPrefix(value, "v")
 	var index int
 	if _, err := fmt.Sscanf(value, "%d", &index); err != nil {
 		return 0, err
