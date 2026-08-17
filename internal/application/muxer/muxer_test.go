@@ -1,6 +1,8 @@
 package muxer
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -206,5 +208,59 @@ func TestComputeEqualLengthSegmentsUsesShortFinalSegment(t *testing.T) {
 		if segments[i] != want[i] {
 			t.Fatalf("segments[%d] = %v, want %v", i, segments[i], want[i])
 		}
+	}
+}
+
+func TestPlaceholderFutureRequestDoesNotAdvanceHandoff(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "video", "seg_00000.ts"), []byte("segment"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := &playbackState{
+		placeholder:              &generation{dir: dir},
+		placeholderLastRequested: -1,
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPath(job, 1); path != "" {
+		t.Fatalf("future placeholder segment path = %q, want empty", path)
+	}
+	if state.placeholderLastRequested != -1 {
+		t.Fatalf("future request advanced handoff to %d", state.placeholderLastRequested)
+	}
+	if path := mux.SegmentPath(job, 0); path == "" {
+		t.Fatal("existing placeholder segment not found")
+	}
+	if state.placeholderLastRequested != 0 {
+		t.Fatalf("served request handoff = %d, want 0", state.placeholderLastRequested)
+	}
+}
+
+func TestFilmSequenceMapsFirstPublicSegmentToFilmStart(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	physical := filepath.Join(dir, "video", "seg_00000.ts")
+	if err := os.WriteFile(physical, []byte("film"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := &playbackState{
+		active:       &generation{dir: dir},
+		filmSequence: 3,
+		filmDuration: 120,
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPath(job, 3); path != physical {
+		t.Fatalf("first public film segment path = %q, want %q", path, physical)
+	}
+	if path := mux.SegmentPath(job, 2); path != "" {
+		t.Fatalf("pre-film public segment path = %q, want empty", path)
 	}
 }

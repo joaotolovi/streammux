@@ -680,16 +680,18 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 		}
 		return ""
 	}
-	if segment > state.placeholderLastRequested {
-		state.placeholderLastRequested = segment
-	}
 	placeholder := state.placeholder
-	state.mu.Unlock()
 	if placeholder != nil {
-		if path := generationAudioSegmentPath(placeholder, segment); fileExists(path) {
+		path := generationAudioSegmentPath(placeholder, segment)
+		if fileExists(path) {
+			if segment > state.placeholderLastRequested {
+				state.placeholderLastRequested = segment
+			}
+			state.mu.Unlock()
 			return path
 		}
 	}
+	state.mu.Unlock()
 	return ""
 }
 
@@ -713,16 +715,18 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 		}
 		return ""
 	}
-	if segment > state.placeholderLastRequested {
-		state.placeholderLastRequested = segment
-	}
 	placeholder := state.placeholder
-	state.mu.Unlock()
 	if placeholder != nil {
-		if path := generationSegmentPath(placeholder, segment); fileExists(path) {
+		path := generationSegmentPath(placeholder, segment)
+		if fileExists(path) {
+			if segment > state.placeholderLastRequested {
+				state.placeholderLastRequested = segment
+			}
+			state.mu.Unlock()
 			return path
 		}
 	}
+	state.mu.Unlock()
 	return ""
 }
 
@@ -760,13 +764,24 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 		state.mu.Lock()
 		state.lastAccess = time.Now()
 		physical := segment - state.filmSequence
-		state.lastRequested = physical
 		active := state.active
+		placeholderActive := state.placeholder != nil && active == nil
+		if !placeholderActive {
+			state.lastRequested = physical
+		}
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		nextPlan := state.nextPlan
 		state.mu.Unlock()
 
+		if placeholderActive {
+			select {
+			case <-deadlineCtx.Done():
+				return "", fmt.Errorf("timeout waiting for placeholder segment %d: %w", segment, deadlineCtx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
+		}
 		if physical < 0 {
 			return "", fmt.Errorf("segment %d precedes film sequence", segment)
 		}
@@ -828,13 +843,24 @@ func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segme
 		state.mu.Lock()
 		state.lastAccess = time.Now()
 		physical := segment - state.filmSequence
-		state.lastRequested = physical
 		active := state.active
+		placeholderActive := state.placeholder != nil && active == nil
+		if !placeholderActive {
+			state.lastRequested = physical
+		}
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		nextPlan := state.nextPlan
 		state.mu.Unlock()
 
+		if placeholderActive {
+			select {
+			case <-deadlineCtx.Done():
+				return "", fmt.Errorf("timeout waiting for placeholder audio segment %d: %w", segment, deadlineCtx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+			continue
+		}
 		if physical < 0 {
 			return "", fmt.Errorf("audio segment %d precedes film sequence", segment)
 		}

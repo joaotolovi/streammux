@@ -90,7 +90,7 @@ func TestBuildPlaceholderArgsProduceNonSeekableLivePlaylist(t *testing.T) {
 		{"-readrate", "1", "-readrate_initial_burst", "4", "-i", "/tmp/placeholder.mp4"},
 		{"-map", "0:v:0"},
 		{"-map", "0:a:0"},
-		{"-hls_list_size", "1"},
+		{"-hls_list_size", "3"},
 		{"-hls_allow_cache", "0"},
 		{"-hls_flags", "independent_segments+temp_file+omit_endlist"},
 		{"-hls_flags", "independent_segments+temp_file+split_by_time+omit_endlist"},
