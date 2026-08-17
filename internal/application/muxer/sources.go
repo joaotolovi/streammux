@@ -53,6 +53,9 @@ type preparedPlan struct {
 	audioTrackIndex int
 	audioMode       ffmpeg.AudioMode
 	duration        float64
+	// videoIdx/audioIdx identify the composer candidates used, for logging.
+	videoIdx int
+	audioIdx int
 	// videoBitrate is the measured peak bitrate of the video source in bits/s
 	// (from ffprobe). Zero when the source does not report it.
 	videoBitrate float64

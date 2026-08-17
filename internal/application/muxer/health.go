@@ -91,11 +91,10 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 		requested := state.lastRequested
 		ahead := time.Duration(highest-requested) * time.Duration(ffmpeg.SegDuration()*float64(time.Second))
 		cooldownElapsed := time.Since(state.lastRecovery) >= m.policy.RecoveryCooldown
-		nextPlan := state.nextPlan
 		alreadyRecovering := state.recovering
 		state.mu.Unlock()
 
-		if requested < 0 || ahead >= m.policy.MinPublishedAhead || !cooldownElapsed || alreadyRecovering || nextPlan >= len(job.Plans) {
+		if requested < 0 || ahead >= m.policy.MinPublishedAhead || !cooldownElapsed || alreadyRecovering {
 			continue
 		}
 		startSegment := highest + 1
@@ -103,13 +102,11 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 			startSegment = requested + 1
 		}
 		log.Printf(
-			"mux: plan %d is unsustainable at %.2fx with %s buffered; trying plan %d",
-			generation.planIndex,
+			"mux: plan is unsustainable at %.2fx with %s buffered; trying lighter sources",
 			decision.realtime,
 			ahead.Round(time.Second),
-			nextPlan,
 		)
-		m.ensureRecovery(job, state, startSegment, nextPlan, "measured FFmpeg throughput")
+		m.ensureRecovery(job, state, startSegment, "measured FFmpeg throughput")
 	}
 
 	<-generation.session.Done()
@@ -119,14 +116,13 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 
 	state.mu.Lock()
 	requested := state.lastRequested
-	nextPlan := state.nextPlan
 	recovering := state.recovering
 	state.mu.Unlock()
 	if requested < 0 {
 		requested = highestCompleteSegment(generation.dir) + 1
 	}
 	if !recovering {
-		m.ensureRecovery(job, state, requested, nextPlan, "active FFmpeg session failed")
+		m.ensureRecovery(job, state, requested, "active FFmpeg session failed")
 	}
 }
 

@@ -69,7 +69,9 @@ type playbackState struct {
 	recoveryErr  error
 
 	nextGeneration uint64
-	nextPlan       int
+
+	// composer assembles source compositions dynamically; created lazily.
+	composer *composer
 
 	duration      float64 // film duration in seconds (from probe)
 	lastRequested int
@@ -145,7 +147,8 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		state.mu.Unlock()
 		return &DirectFallbackError{URL: direct, Err: cause}
 	}
-	// Allow one retry per cooldown window; retries resume from nextPlan so
+	// Allow one retry per cooldown window; retries resume from the remaining
+	// (not yet failed) sources in the composer ledger.
 	// the user's second click tries fresh sources instead of repeating.
 	if state.startErr != nil && time.Since(state.lastStart) > m.policy.RetryCooldown {
 		state.starting = false
@@ -343,27 +346,38 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	log.Printf("mux: placeholder playing")
 }
 
-// runStartup prepares film sources (resolve + probe + A/V sync estimate) and
-// launches the winning session. With a placeholder playing, the film is
-// numbered from the placeholder's last common segment so the handoff is a
-// single DISCONTINUITY on an otherwise static timeline.
+// runStartup walks the composer's source compositions until one launches.
+// With a placeholder playing, the film is numbered from the placeholder's
+// last common segment so the handoff is a single DISCONTINUITY on an
+// otherwise static timeline.
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	deadline := time.Now().Add(m.policy.StartupTimeout)
+	comp := m.composerFor(job, state)
 
 	var winner *generation
 	var lastErr error
 	for {
 		state.mu.Lock()
-		startPlan := state.nextPlan
+		candidate := comp.acquire()
 		state.mu.Unlock()
-		if startPlan < 0 {
-			startPlan = 0
+		if candidate == nil {
+			lastErr = errors.New("all source combinations exhausted")
+			break
 		}
 
-		prepared, planIndex, err := m.prepareBestPlan(job, state, startPlan, time.Until(deadline))
+		prepCtx, prepCancel := context.WithTimeout(state.ctx, time.Until(deadline))
+		prepared, cls, err := m.prepareComposition(prepCtx, job, candidate)
+		prepCancel()
 		if err != nil {
 			lastErr = err
-			break
+			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.idx, candidate.audio.idx, err)
+			state.mu.Lock()
+			comp.fail(candidate, cls, err)
+			state.mu.Unlock()
+			if time.Now().After(deadline) {
+				break
+			}
+			continue
 		}
 
 		// Keep the placeholder playing for its minimum time even when the
@@ -395,17 +409,15 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		state.filmBase = base
 		state.mu.Unlock()
 
-		gen, err := m.launchGeneration(job, state, planIndex, prepared, base, 0)
+		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, base, 0)
 		if err == nil {
 			winner = gen
 			break
 		}
 		lastErr = err
-		log.Printf("mux: plan %d launch failed: %v", planIndex, err)
+		log.Printf("mux: composition %d launch failed: %v", candidate.ordinal, err)
 		state.mu.Lock()
-		if planIndex+1 > state.nextPlan {
-			state.nextPlan = planIndex + 1
-		}
+		comp.fail(candidate, failLaunch, err)
 		state.mu.Unlock()
 		if time.Now().After(deadline) {
 			break
@@ -435,7 +447,6 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.retiredPlaceholder = placeholder
 	state.active = winner
 	state.all = append(state.all, winner)
-	state.nextPlan = winner.planIndex + 1
 	state.starting = false
 	state.startErr = nil
 	state.directURL = ""
@@ -459,7 +470,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	if wait != nil {
 		close(wait)
 	}
-	log.Printf("mux: startup selected plan %d/%d %s (%s) at segment %d", winner.planIndex+1, len(job.Plans), winner.plan.Kind, winner.plan.Video.Parsed.Resolution, base)
+	log.Printf("mux: startup selected video#%d audio#%d %s (%s) at segment %d", winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, winner.plan.Video.Parsed.Resolution, base)
 	go m.monitorGeneration(job, state, winner)
 }
 
@@ -508,7 +519,7 @@ func (m *Muxer) startupFailed(job *model.MuxJob, state *playbackState, cause err
 			close(phWait)
 		}
 	}
-	log.Printf("mux: startup failed (next retry from plan %d): %v", state.nextPlan, cause)
+	log.Printf("mux: startup failed (retry after cooldown resumes from remaining sources): %v", cause)
 }
 
 // startErrorGeneration launches the local error video continuing the current
@@ -606,98 +617,6 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 	return gen
 }
 
-// prepareBestPlan prepares plans sequentially (strict, then lenient) without
-// launching any session, returning the first plan that validates.
-func (m *Muxer) prepareBestPlan(job *model.MuxJob, state *playbackState, startPlan int, budget time.Duration) (*preparedPlan, int, error) {
-	if startPlan >= len(job.Plans) {
-		return nil, 0, fmt.Errorf("no playback plans remain")
-	}
-	if budget <= 0 {
-		budget = time.Second
-	}
-
-	lenientBudget := budget / 2
-	if lenientBudget < 5*time.Second {
-		lenientBudget = 5 * time.Second
-	}
-
-	strictCtx, strictCancel := context.WithTimeout(state.ctx, budget)
-	strictCancelFn := strictCancel
-	prepared, planIndex, strictErr := m.preparePlans(strictCtx, job, state, startPlan, false)
-	strictCancelFn()
-	if prepared != nil {
-		return prepared, planIndex, nil
-	}
-
-	lenientCtx, lenientCancel := context.WithTimeout(state.ctx, lenientBudget)
-	prepared, planIndex, lenientErr := m.preparePlans(lenientCtx, job, state, startPlan, true)
-	lenientCancel()
-	if prepared != nil {
-		return prepared, planIndex, nil
-	}
-	return nil, 0, errors.Join(strictErr, lenientErr)
-}
-
-func (m *Muxer) preparePlans(ctx context.Context, job *model.MuxJob, state *playbackState, startPlan int, lenient bool) (*preparedPlan, int, error) {
-	var failures []error
-	for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
-		select {
-		case <-ctx.Done():
-			failures = append(failures, ctx.Err())
-			return nil, 0, errors.Join(failures...)
-		default:
-		}
-		if !job.Plans[planIndex].HasTargetAudio {
-			continue
-		}
-		prepared, err := m.prepareAttempt(ctx, job, state, planIndex, lenient)
-		if err == nil {
-			return prepared, planIndex, nil
-		}
-		failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
-		log.Printf("mux: plan %d failed: %v", planIndex, err)
-		state.mu.Lock()
-		if planIndex+1 > state.nextPlan {
-			state.nextPlan = planIndex + 1
-		}
-		state.mu.Unlock()
-	}
-	return nil, 0, errors.Join(failures...)
-}
-
-// prepareAttempt resolves and probes a plan and estimates the A/V offset.
-func (m *Muxer) prepareAttempt(ctx context.Context, job *model.MuxJob, state *playbackState, planIndex int, lenient bool) (*preparedPlan, error) {
-	plan := job.Plans[planIndex]
-	prepared, err := m.preparePlanMode(ctx, job, plan, lenient)
-	if err != nil {
-		return nil, err
-	}
-	if prepared.duration <= 0 {
-		return nil, fmt.Errorf("plan has no probeable duration")
-	}
-
-	dualSource := strings.TrimSpace(prepared.audioURL) != "" && prepared.audioURL != prepared.videoURL
-	if !dualSource {
-		return prepared, nil
-	}
-	if _, ok := m.audioOffsetFor(plan); ok {
-		return prepared, nil
-	}
-	lag, track, confidence, err := m.detectOffset(prepared)
-	if err != nil {
-		log.Printf("mux: audio offset estimation failed (continuing without): %v", err)
-		return prepared, nil
-	}
-	if confidence < ffmpeg.SyncMinConfidence {
-		log.Printf("mux: audio offset inconclusive (conf %.1f, continuing without): video track a:%d", confidence, track)
-		return prepared, nil
-	}
-	offset := -lag
-	m.cacheAudioOffset(plan, offset)
-	log.Printf("mux: estimated audio offset %s from video track a:%d (conf %.1f)", offset, track, confidence)
-	return prepared, nil
-}
-
 // launchGeneration starts the ffmpeg session for a prepared plan and waits
 // for its first segment. startNumber is the first public segment written;
 // startTime is the content offset in seconds (0 for a fresh start).
@@ -782,33 +701,13 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 	}
 }
 
-// coordinateAttempts prepares and launches plans sequentially until one
-// produces its first segment. Used by recovery and seek paths where no
-// placeholder handoff is involved; startTime derives from filmBase.
-func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, startPlan, startSegment int, timeout time.Duration) (*generation, error) {
-	if startPlan >= len(job.Plans) {
-		return nil, fmt.Errorf("no playback plans remain")
-	}
-
+// coordinateRecovery walks the composer until one composition launches.
+// prefer (when set) reuses the previous generation's prepared sources first —
+// a seek keeps the same sources, only the offset changes.
+func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, prefer *generation, startSegment int, timeout time.Duration) (*generation, error) {
 	deadline := time.Now().Add(timeout)
-	var failures []error
-	for planIndex := startPlan; planIndex < len(job.Plans); planIndex++ {
-		if !job.Plans[planIndex].HasTargetAudio {
-			continue
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		prepared, err := m.prepareAttempt(state.ctx, job, state, planIndex, false)
-		if err != nil {
-			failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
-			state.mu.Lock()
-			if planIndex+1 > state.nextPlan {
-				state.nextPlan = planIndex + 1
-			}
-			state.mu.Unlock()
-			continue
-		}
+
+	if prefer != nil && prefer.prepared != nil {
 		state.mu.Lock()
 		base := state.filmBase
 		state.mu.Unlock()
@@ -816,17 +715,73 @@ func (m *Muxer) coordinateAttempts(job *model.MuxJob, state *playbackState, star
 		if startTime < 0 {
 			startTime = 0
 		}
-		gen, err := m.launchGeneration(job, state, planIndex, prepared, startSegment, startTime)
+		if gen, err := m.launchGeneration(job, state, prefer.planIndex, prefer.prepared, startSegment, startTime); err == nil {
+			return gen, nil
+		} else {
+			// Same sources failed to relaunch: drop them from the ledger.
+			log.Printf("mux: preferred sources failed to relaunch: %v", err)
+			m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
+		}
+	}
+
+	comp := m.composerFor(job, state)
+	var failures []error
+	for {
+		if time.Now().After(deadline) {
+			break
+		}
+		state.mu.Lock()
+		candidate := comp.acquire()
+		state.mu.Unlock()
+		if candidate == nil {
+			break
+		}
+
+		prepCtx, prepCancel := context.WithTimeout(state.ctx, time.Until(deadline))
+		prepared, cls, err := m.prepareComposition(prepCtx, job, candidate)
+		prepCancel()
+		if err != nil {
+			failures = append(failures, fmt.Errorf("video#%d/audio#%d: %w", candidate.video.idx, candidate.audio.idx, err))
+			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.idx, candidate.audio.idx, err)
+			state.mu.Lock()
+			comp.fail(candidate, cls, err)
+			state.mu.Unlock()
+			continue
+		}
+
+		state.mu.Lock()
+		base := state.filmBase
+		state.mu.Unlock()
+		startTime := float64(startSegment-base) * ffmpeg.SegDuration()
+		if startTime < 0 {
+			startTime = 0
+		}
+		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, startSegment, startTime)
 		if err == nil {
 			return gen, nil
 		}
-		failures = append(failures, fmt.Errorf("plan %d: %w", planIndex, err))
-		log.Printf("mux: plan %d failed: %v", planIndex, err)
+		failures = append(failures, fmt.Errorf("video#%d/audio#%d launch: %w", candidate.video.idx, candidate.audio.idx, err))
+		log.Printf("mux: composition %d launch failed: %v", candidate.ordinal, err)
+		state.mu.Lock()
+		comp.fail(candidate, failLaunch, err)
+		state.mu.Unlock()
 	}
 	if len(failures) == 0 {
-		return nil, fmt.Errorf("no playback plans remain")
+		return nil, fmt.Errorf("no playback sources remain")
 	}
 	return nil, errors.Join(failures...)
+}
+
+// markComposerFailed flags a source as unusable in the composer ledger.
+func (m *Muxer) markComposerFailed(state *playbackState, sourceKey string) {
+	if sourceKey == "" {
+		return
+	}
+	state.mu.Lock()
+	if state.composer != nil {
+		state.composer.markFailed(sourceKey)
+	}
+	state.mu.Unlock()
 }
 
 func cleanupFailedGeneration(generation *generation) {
@@ -1237,7 +1192,6 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		recoveryErr := state.recoveryErr
-		nextPlan := state.nextPlan
 		if !placeholderActive {
 			state.lastRequested = segment
 			if segment > state.maxRequested {
@@ -1264,18 +1218,18 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			case recoveryErr != nil:
 				return "", recoveryErr
 			default:
-				m.ensureRecovery(job, state, segment, nextPlan, "no active session")
+				m.ensureRecovery(job, state, segment, "no active session")
 			}
 		} else if !active.isError {
 			highest := highestCompleteSegment(active.dir)
 			select {
 			case <-active.session.Done():
 				if !recovering {
-					m.ensureRecovery(job, state, segment, nextPlan, "session ended")
+					m.ensureRecovery(job, state, segment, "session ended")
 				}
 			default:
 				if (segment < active.startSegment || isForwardSeek(maxReq, segment, highest, active.startSegment)) && !recovering {
-					m.ensureRecovery(job, state, segment, active.planIndex, "seek")
+					m.ensureRecovery(job, state, segment, "seek")
 				}
 			}
 		} else {
@@ -1303,35 +1257,40 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	}
 }
 
-func (m *Muxer) ensureRecovery(job *model.MuxJob, state *playbackState, startSegment, startPlan int, reason string) {
+func (m *Muxer) ensureRecovery(job *model.MuxJob, state *playbackState, startSegment int, reason string) {
 	state.mu.Lock()
 	if state.closed || state.recovering || state.errorGeneration != nil {
 		state.mu.Unlock()
-		return
-	}
-	if startPlan >= len(job.Plans) {
-		state.recoveryErr = fmt.Errorf("fallback exhausted after %s", reason)
-		state.mu.Unlock()
-		// Every plan failed mid-playback: serve the error video from here.
-		if errGen := m.startErrorGeneration(state, startSegment); errGen != nil {
-			state.mu.Lock()
-			state.active = errGen
-			state.errorGeneration = errGen
-			state.recoveryErr = nil
-			state.mu.Unlock()
-			log.Printf("mux: recovery exhausted after %s; serving error video at segment %d", reason, startSegment)
-		}
 		return
 	}
 	state.recovering = true
 	state.recoveryWait = make(chan struct{})
 	state.recoveryErr = nil
 	state.mu.Unlock()
-	go m.runRecovery(job, state, startSegment, startPlan, reason)
+	go m.runRecovery(job, state, startSegment, reason)
 }
 
-func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegment, startPlan int, reason string) {
-	winner, err := m.coordinateAttempts(job, state, startPlan, startSegment, m.policy.StartupTimeout)
+func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegment int, reason string) {
+	// A seek keeps the same sources (only the offset changes); a dead or
+	// unsustainable session must reconsider its sources.
+	state.mu.Lock()
+	prefer := state.active
+	if prefer != nil && prefer.isLocal {
+		prefer = nil
+	}
+	state.mu.Unlock()
+	if prefer != nil && reason != "seek" {
+		m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
+	}
+	if reason == "no active session" {
+		state.mu.Lock()
+		if state.composer != nil {
+			state.composer.reset()
+		}
+		state.mu.Unlock()
+	}
+
+	winner, err := m.coordinateRecovery(job, state, prefer, startSegment, m.policy.StartupTimeout)
 
 	state.mu.Lock()
 	wait := state.recoveryWait
@@ -1339,9 +1298,6 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	if err == nil && !state.closed {
 		state.active = winner
 		state.all = append(state.all, winner)
-		if winner.planIndex+1 > state.nextPlan {
-			state.nextPlan = winner.planIndex + 1
-		}
 		// Mark the cutover when the source changes so players reset their
 		// decoders (resolution/HDR can differ between plans).
 		if old != nil && old != winner && old.planIndex != winner.planIndex {
@@ -1361,12 +1317,28 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	}
 	if err != nil {
 		log.Printf("mux: recovery after %s failed: %v", reason, err)
+		// Everything failed mid-playback: serve the error video from here.
+		if m.errorPath != "" && state.composer != nil {
+			state.mu.Lock()
+			exhausted := state.composer.exhausted()
+			state.mu.Unlock()
+			if exhausted {
+				if errGen := m.startErrorGeneration(state, startSegment); errGen != nil {
+					state.mu.Lock()
+					state.active = errGen
+					state.errorGeneration = errGen
+					state.recoveryErr = nil
+					state.mu.Unlock()
+					log.Printf("mux: recovery exhausted after %s; serving error video at segment %d", reason, startSegment)
+				}
+			}
+		}
 		return
 	}
 	if old != nil && old != winner {
 		old.session.Cancel()
 	}
-	log.Printf("mux: switched at segment %d to plan %d (%s) after %s", startSegment, winner.planIndex, winner.plan.Kind, reason)
+	log.Printf("mux: switched at segment %d to video#%d audio#%d (%s) after %s", startSegment, winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, reason)
 	go m.monitorGeneration(job, state, winner)
 }
 

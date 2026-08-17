@@ -1,6 +1,7 @@
 package muxer
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -556,5 +557,120 @@ func TestPlayerTooSlowRequiresAllWindowsSlow(t *testing.T) {
 	}
 	if playerTooSlow([]deliverySample{slow, slow, slow, slow}, 0) {
 		t.Fatal("unknown required bitrate must not downgrade")
+	}
+}
+
+func composerJobFixture() *model.MuxJob {
+	video := func(id string, res string) model.CollectedStream {
+		s := model.CollectedStream{Parsed: model.ParsedFile{Resolution: res}}
+		s.Stream.URL = "https://" + id + ".test/file.mkv"
+		return s
+	}
+	audio := func(id string) model.CollectedStream {
+		s := model.CollectedStream{IsDubbed: true, Language: "Portuguese (Brazil)"}
+		s.Stream.URL = "https://" + id + ".test/file.mkv"
+		return s
+	}
+	mk := func(v, a model.CollectedStream, single bool) model.PlaybackPlan {
+		p := model.PlaybackPlan{Video: v, Audio: a, HasTargetAudio: true, Kind: model.PlanDualSource}
+		if single {
+			p.Kind = model.PlanSingleSource
+		}
+		return p
+	}
+	return &model.MuxJob{
+		ID:             "job",
+		TargetLanguage: "Portuguese (Brazil)",
+		Plans: []model.PlaybackPlan{
+			mk(video("v-2160", "2160p"), audio("a-best"), false),
+			mk(video("v-1080", "1080p"), audio("a-best"), false),
+			mk(video("v-720", "720p"), audio("a-best"), false),
+			mk(video("a-best", "1080p"), audio("a-best"), true),
+			mk(video("v-2160", "2160p"), audio("a-second"), false),
+		},
+	}
+}
+
+func TestComposerOrdersQueuesAndStartsWithBestPair(t *testing.T) {
+	comp := newComposer(composerJobFixture())
+	if len(comp.videos) < 3 || len(comp.audios) < 2 {
+		t.Fatalf("queues not derived: %d videos, %d audios", len(comp.videos), len(comp.audios))
+	}
+	// Best video first, best audio first.
+	if !strings.Contains(comp.videos[0].stream.Stream.URL, "v-2160") {
+		t.Fatalf("first video = %s, want v-2160", comp.videos[0].stream.Stream.URL)
+	}
+	if !strings.Contains(comp.audios[0].stream.Stream.URL, "a-best") {
+		t.Fatalf("first audio = %s, want a-best", comp.audios[0].stream.Stream.URL)
+	}
+}
+
+func TestComposerFailAudioKeepsVideoAndAdvancesAudio(t *testing.T) {
+	comp := newComposer(composerJobFixture())
+	first := comp.acquire()
+	if first == nil {
+		t.Fatal("acquire() returned nil")
+	}
+	if !strings.Contains(first.video.stream.Stream.URL, "v-2160") || !strings.Contains(first.audio.stream.Stream.URL, "a-best") {
+		t.Fatalf("first composition = video %s + audio %s", first.video.stream.Stream.URL, first.audio.stream.Stream.URL)
+	}
+	// The audio source died: the video stays, next audio is used.
+	comp.fail(first, failAudio, errors.New("audio 404"))
+	second := comp.acquire()
+	if second == nil {
+		t.Fatal("acquire() after audio failure returned nil")
+	}
+	if second.video != first.video {
+		t.Fatal("video must be kept when only the audio failed")
+	}
+	if second.audio == first.audio {
+		t.Fatal("audio must advance after audio failure")
+	}
+}
+
+func TestComposerFailVideoKeepsAudioAndAdvancesVideo(t *testing.T) {
+	comp := newComposer(composerJobFixture())
+	first := comp.acquire()
+	comp.fail(first, failVideo, errors.New("video 404"))
+	second := comp.acquire()
+	if second == nil {
+		t.Fatal("acquire() after video failure returned nil")
+	}
+	if second.video == first.video {
+		t.Fatal("video must advance after video failure")
+	}
+}
+
+func TestComposerExhaustsAndLenientPass(t *testing.T) {
+	comp := newComposer(composerJobFixture())
+	count := 0
+	for {
+		c := comp.acquire()
+		if c == nil {
+			break
+		}
+		count++
+		if count > 50 {
+			t.Fatal("composer did not terminate")
+		}
+	}
+	if count < 2 {
+		t.Fatalf("expected several compositions, got %d", count)
+	}
+	if !comp.exhausted() {
+		t.Fatal("composer must be exhausted after acquire() returns nil")
+	}
+}
+
+func TestComposerMarkFailedSkipsSourceInBothQueues(t *testing.T) {
+	comp := newComposer(composerJobFixture())
+	first := comp.acquire()
+	comp.markFailed(first.video.stream.SourceKey())
+	next := comp.acquire()
+	if next == nil {
+		t.Fatal("acquire() after markFailed returned nil")
+	}
+	if next.video == first.video {
+		t.Fatal("marked source must be skipped as video")
 	}
 }

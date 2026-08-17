@@ -63,17 +63,16 @@ func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Dura
 	tooSlow := playerTooSlow(samples, required)
 
 	segment := state.lastRequested
-	nextPlan := state.nextPlan
 	recovering := state.recovering
 	cooldown := time.Since(state.lastRecovery) >= m.policy.RecoveryCooldown
 	state.mu.Unlock()
 
-	if !tooSlow || recovering || !cooldown || nextPlan >= len(job.Plans) || segment < 0 {
+	if !tooSlow || recovering || !cooldown || segment < 0 {
 		return
 	}
-	log.Printf("mux: player throughput below %.1f Mbps sustained; downgrading to plan %d at segment %d",
-		required/1e6, nextPlan, segment)
-	m.ensureRecovery(job, state, segment, nextPlan, "player throughput")
+	log.Printf("mux: player throughput below %.1f Mbps sustained; downgrading to lighter sources at segment %d",
+		required/1e6, segment)
+	m.ensureRecovery(job, state, segment, "player throughput")
 }
 
 // playerTooSlow reports whether every recent delivery was slower than the
