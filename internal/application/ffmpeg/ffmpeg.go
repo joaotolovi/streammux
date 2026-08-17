@@ -380,6 +380,39 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 	return m.StartSinglePlaceholderSession(ctx, path, outputDir)
 }
 
+func buildPlaceholderArgs(placeholderPath, outputDir string) []string {
+	return []string{
+		"-nostdin",
+		"-hide_banner",
+		"-nostats",
+		"-readrate", "1",
+		"-readrate_initial_burst", fmtDuration(segDuration),
+		"-i", placeholderPath,
+		"-map", "0:v:0",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
+		"-force_key_frames", "expr:gte(t,n_forced*4)",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "1",
+		"-hls_allow_cache", "0",
+		"-hls_flags", "independent_segments+temp_file+omit_endlist",
+		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "video", "video.m3u8"),
+		"-map", "0:a:0",
+		"-c:a", "aac", "-b:a", "128k",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "1",
+		"-hls_allow_cache", "0",
+		"-hls_flags", "independent_segments+temp_file+split_by_time+omit_endlist",
+		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "audio", "audio.m3u8"),
+	}
+}
+
 func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, placeholderPath, outputDir string) (*Session, error) {
 	if strings.TrimSpace(placeholderPath) == "" {
 		return nil, fmt.Errorf("placeholder session: no placeholder video provided")
@@ -397,30 +430,7 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, placeholderPa
 		return nil, err
 	}
 
-	args := []string{
-		"-nostdin",
-		"-hide_banner",
-		"-nostats",
-		"-i", placeholderPath,
-		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
-		"-force_key_frames", "expr:gte(t,n_forced*4)",
-		"-f", "hls",
-		"-hls_time", fmtDuration(segDuration),
-		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments+temp_file",
-		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
-		"-start_number", "0",
-		filepath.Join(outputDir, "video", "video.m3u8"),
-		"-c:a", "aac", "-b:a", "128k",
-		"-f", "hls",
-		"-hls_time", fmtDuration(segDuration),
-		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments+temp_file+split_by_time",
-		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
-		"-start_number", "0",
-		filepath.Join(outputDir, "audio", "audio.m3u8"),
-	}
+	args := buildPlaceholderArgs(placeholderPath, outputDir)
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
@@ -466,5 +476,3 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, placeholderPa
 
 	return s, nil
 }
-
-
