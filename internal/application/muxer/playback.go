@@ -1119,7 +1119,11 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment in
 					m.ensureRecovery(job, state, physical, nextPlan, "session ended")
 				}
 			default:
-				if highest >= active.startSegment && physical > highest+3 && !recovering {
+				// Only treat as a forward seek (requiring a new session at a
+				// different offset) when the request is far beyond what the
+				// FFmpeg has produced. A request within a reasonable window
+				// just means the encoder hasn't reached it yet — wait.
+				if highest >= active.startSegment && physical > highest+8 && !recovering {
 					m.ensureRecovery(job, state, physical, active.planIndex, "forward seek")
 				}
 			}
