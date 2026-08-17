@@ -70,6 +70,7 @@ func (c *Collector) CollectStreams(ctx context.Context, addons []model.Addon, co
 				Stream:        s,
 				Parsed:        parsed,
 				Size:          size,
+				VideoBitrate:  extractBitrate(parseSource),
 				IsDubbed:      dubbed,
 				Language:      lang,
 			})
@@ -147,6 +148,22 @@ func addonLanguageFor(addonLanguage, parsedLang string) string {
 }
 
 var sizeRe = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)\s*(GB|MB|TB|GiB|MiB|TiB)`)
+
+var bitrateRe = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)\s*Mbps`)
+
+// extractBitrate parses the advertised peak bitrate (e.g. "📊 62.4 Mbps") into
+// bits per second. Returns 0 when the description does not advertise it.
+func extractBitrate(s string) int64 {
+	m := bitrateRe.FindStringSubmatch(s)
+	if len(m) < 2 {
+		return 0
+	}
+	val, err := strconv.ParseFloat(m[1], 64)
+	if err != nil || val <= 0 {
+		return 0
+	}
+	return int64(val * 1_000_000)
+}
 
 // extractSize parses a human-readable size (e.g. "📦 191 GB") into bytes.
 func extractSize(s string) int64 {

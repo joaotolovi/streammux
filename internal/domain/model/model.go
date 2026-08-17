@@ -54,8 +54,11 @@ type CollectedStream struct {
 	Stream        Stream     `json:"stream"`
 	Parsed        ParsedFile `json:"parsed"`
 	Size          int64      `json:"size"`
-	IsDubbed      bool       `json:"isDubbed"`
-	Language      string     `json:"language"`
+	// VideoBitrate is the peak video bitrate in bits/s when the source
+	// description advertises it (e.g. "📊 62.4 Mbps"). Zero when unknown.
+	VideoBitrate int64  `json:"videoBitrate,omitempty"`
+	IsDubbed     bool   `json:"isDubbed"`
+	Language     string `json:"language"`
 }
 
 // SourceKey identifies the underlying media without resolving it. It is stable
@@ -118,6 +121,12 @@ type PlaybackPlan struct {
 // derived from resolution and encode type; the actual bitrate is unknown until
 // the source is probed, so this is a conservative upper bound.
 func (p PlaybackPlan) EstimatedBandwidth() int {
+	// Prefer the real bitrate advertised by the source description (e.g.
+	// "📊 62.4 Mbps") — it is far more accurate than a resolution-based guess
+	// (two 2160p sources can be 62 Mbps vs 6 Mbps).
+	if p.Video.VideoBitrate > 0 {
+		return int(p.Video.VideoBitrate)
+	}
 	res := p.Video.Parsed.Resolution
 	encode := p.Video.Parsed.Encode
 	base := 0

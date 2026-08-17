@@ -275,6 +275,46 @@ func TestEstimatedBandwidthScalesWithResolution(t *testing.T) {
 	}
 }
 
+func TestEstimatedBandwidthPrefersAdvertisedBitrate(t *testing.T) {
+	plan := model.PlaybackPlan{
+		Video: model.CollectedStream{
+			Parsed:       model.ParsedFile{Resolution: "2160p", Encode: "HEVC"},
+			VideoBitrate: 62_400_000,
+		},
+	}
+	if got := plan.EstimatedBandwidth(); got != 62_400_000 {
+		t.Fatalf("advertised bitrate not preferred: got %d, want 62400000", got)
+	}
+}
+
+func TestMasterPlaylistLeadsWithActivePlanAfterRecovery(t *testing.T) {
+	state := &playbackState{active: &generation{dir: t.TempDir(), planIndex: 2}}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{
+		ID: "job",
+		Plans: []model.PlaybackPlan{
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}}},
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "1080p"}}},
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "720p"}}},
+		},
+	}
+	data, ok := mux.MasterPlaylist(job)
+	if !ok {
+		t.Fatal("MasterPlaylist() returned false")
+	}
+	playlist := string(data)
+	// After recovery to plan 2, v0 must advertise plan 2's resolution (720p)
+	// and point to v0, not the original plan 0.
+	if !strings.Contains(playlist, "RESOLUTION=720p") {
+		t.Fatalf("master did not lead with active plan 2: %s", playlist)
+	}
+	firstVariant := strings.Index(playlist, "v0/video/video.m3u8")
+	secondVariant := strings.Index(playlist, "v1/video/video.m3u8")
+	if firstVariant < 0 || secondVariant < firstVariant {
+		t.Fatalf("master variant ordering invalid: %s", playlist)
+	}
+}
+
 func TestMasterPlaylistAdvertisesVariants(t *testing.T) {
 	state := &playbackState{active: &generation{dir: t.TempDir()}}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}

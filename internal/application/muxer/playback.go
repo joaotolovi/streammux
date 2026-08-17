@@ -547,13 +547,12 @@ func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, planIndex 
 			return path, nil
 		}
 	}
-	// The primary plan is already running as state.active; reuse it.
-	if planIndex == 0 {
+	// If this plan is the currently active generation (the primary or a
+	// recovery target), reuse it instead of starting a duplicate session.
+	if state.active != nil && state.active.planIndex == planIndex {
 		active := state.active
 		state.mu.Unlock()
-		if active != nil {
-			return generationVideoPlaylistPath(active), nil
-		}
+		return generationVideoPlaylistPath(active), nil
 	}
 	state.mu.Unlock()
 
@@ -742,7 +741,16 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	}
 	state.mu.Lock()
 	state.lastAccess = time.Now()
-	ready := state.active != nil
+	active := state.active
+	activePlan := -1
+	activeBitrate := 0.0
+	if active != nil {
+		activePlan = active.planIndex
+		if active.prepared != nil {
+			activeBitrate = active.prepared.videoBitrate
+		}
+	}
+	ready := active != nil
 	state.mu.Unlock()
 	if !ready {
 		return nil, false
@@ -751,17 +759,31 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
-	// Cap the number of advertised variants to keep the master small and avoid
-	// starting too many concurrent sessions.
-	maxVariants := 4
-	if len(job.Plans) < maxVariants {
-		maxVariants = len(job.Plans)
+
+	// The active plan is always advertised first (v0) with its real measured
+	// bitrate; remaining variants follow, ordered by their plan index, so the
+	// master stays consistent even after an internal recovery switches source.
+	type variant struct {
+		index int
+		plan  model.PlaybackPlan
 	}
-	for i := 0; i < maxVariants; i++ {
-		plan := job.Plans[i]
-		bw := plan.EstimatedBandwidth()
-		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, plan.Video.Parsed.Resolution))
-		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", i))
+	variants := []variant{{index: 0, plan: job.Plans[activePlan]}}
+	for i, plan := range job.Plans {
+		if i == activePlan {
+			continue
+		}
+		if len(variants) >= 4 {
+			break
+		}
+		variants = append(variants, variant{index: len(variants), plan: plan})
+	}
+	for _, v := range variants {
+		bw := int64(v.plan.EstimatedBandwidth())
+		if v.index == 0 && activeBitrate > 0 {
+			bw = int64(activeBitrate)
+		}
+		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, v.plan.Video.Parsed.Resolution))
+		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", v.index))
 	}
 	return []byte(b.String()), true
 }
