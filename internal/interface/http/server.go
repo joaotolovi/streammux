@@ -245,6 +245,12 @@ func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadGateway, "playlist not ready")
 		return
 	}
+	if data, ok := s.muxer.StitchedVideoPlaylist(job); ok {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
+		return
+	}
 	path := s.muxer.VideoPlaylistPath(job)
 	if path == "" {
 		writeError(w, http.StatusInternalServerError, "video playlist not ready")
@@ -265,6 +271,12 @@ func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
 		writeError(w, http.StatusBadGateway, "playlist not ready")
+		return
+	}
+	if data, ok := s.muxer.StitchedAudioPlaylist(job); ok {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
 		return
 	}
 	path := s.muxer.AudioPlaylistPath(job)
