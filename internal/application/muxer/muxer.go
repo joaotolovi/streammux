@@ -46,6 +46,9 @@ type Policy struct {
 	MinRealtime       float64
 	MinPublishedAhead time.Duration
 	DurationTolerance float64
+	// PlaceholderMinTime is how long the placeholder must play before the
+	// film takes over, even when the film is ready sooner.
+	PlaceholderMinTime time.Duration
 }
 
 func defaultPolicy() Policy {
@@ -53,16 +56,17 @@ func defaultPolicy() Policy {
 		// The Stremio client tolerates roughly 60s before it gives up on
 		// starting playback, so startup can use a generous window. Lenient uses
 		// half of StartupTimeout and re-runs cached probes, so it stays fast.
-		StartupTimeout:    50 * time.Second,
-		AttemptTimeout:    25 * time.Second,
-		SegmentTimeout:    30 * time.Second,
-		IdleTimeout:       90 * time.Second,
-		HealthWindow:      4 * time.Second,
-		RecoveryCooldown:  10 * time.Second,
-		RetryCooldown:     30 * time.Second,
-		MinRealtime:       1.0,
-		MinPublishedAhead: 12 * time.Second,
-		DurationTolerance: 0.002,
+		StartupTimeout:     50 * time.Second,
+		AttemptTimeout:     25 * time.Second,
+		SegmentTimeout:     30 * time.Second,
+		IdleTimeout:        90 * time.Second,
+		HealthWindow:       4 * time.Second,
+		RecoveryCooldown:   10 * time.Second,
+		RetryCooldown:      30 * time.Second,
+		MinRealtime:        1.0,
+		MinPublishedAhead:  12 * time.Second,
+		DurationTolerance:  0.002,
+		PlaceholderMinTime: 8 * time.Second,
 	}
 }
 
@@ -129,6 +133,13 @@ func NewWithVideos(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Mux
 	}
 	go m.reapIdleSessions()
 	return m
+}
+
+// SetPlaceholderMinTime overrides the minimum placeholder play time.
+func (m *Muxer) SetPlaceholderMinTime(d time.Duration) {
+	if d >= 0 {
+		m.policy.PlaceholderMinTime = d
+	}
 }
 
 // errorSegmentCount returns how many HLS segments the error video spans,

@@ -366,12 +366,25 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 			break
 		}
 
+		// Keep the placeholder playing for its minimum time even when the
+		// film is ready sooner: cutting too early feels like a glitch.
+		state.mu.Lock()
+		ph := state.placeholder
+		state.mu.Unlock()
+		if ph != nil && m.policy.PlaceholderMinTime > 0 {
+			if remaining := m.policy.PlaceholderMinTime - time.Since(ph.startedAt); remaining > 0 {
+				select {
+				case <-time.After(remaining):
+				case <-state.ctx.Done():
+				}
+			}
+		}
+
 		// Handoff point: freeze the advertised placeholder window at its
 		// last common segment. The session keeps running until the film
 		// takes over (rendering caps at filmBase-1), so the media sequence
 		// can only move forward — players reject sequence regression.
 		state.mu.Lock()
-		ph := state.placeholder
 		base := 0
 		if ph != nil {
 			if common := lastCommonSegment(ph); common >= 0 {
