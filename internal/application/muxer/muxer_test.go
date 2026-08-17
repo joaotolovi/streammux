@@ -308,7 +308,10 @@ func TestEstimatedBandwidthPrefersAdvertisedBitrate(t *testing.T) {
 }
 
 func TestMasterPlaylistAdvertisesActivePlanUnderItsIndex(t *testing.T) {
-	state := &playbackState{active: &generation{dir: t.TempDir(), planIndex: 2}}
+	state := &playbackState{
+		active:       &generation{dir: t.TempDir(), planIndex: 2},
+		variantPlans: make(map[int]int),
+	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{
 		ID: "job",
@@ -323,15 +326,21 @@ func TestMasterPlaylistAdvertisesActivePlanUnderItsIndex(t *testing.T) {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	// After recovery to plan 2, the active plan must be advertised under its
-	// real index (v2), so EnsureVariant(2) reuses the running session.
-	if !strings.Contains(playlist, "RESOLUTION=720p") || !strings.Contains(playlist, "v2/video/video.m3u8") {
-		t.Fatalf("master did not advertise active plan 2 under v2: %s", playlist)
+	// The active plan (2) must be advertised as v0 (first variant), with its
+	// resolution visible. variantPlans must map v0 -> plan 2.
+	if !strings.Contains(playlist, "RESOLUTION=720p") || !strings.Contains(playlist, "v0/video/video.m3u8") {
+		t.Fatalf("master did not advertise active plan 2 as v0: %s", playlist)
+	}
+	if state.variantPlans[0] != 2 {
+		t.Fatalf("variantPlans[0] = %d, want 2", state.variantPlans[0])
 	}
 }
 
 func TestMasterPlaylistAdvertisesVariants(t *testing.T) {
-	state := &playbackState{active: &generation{dir: t.TempDir()}}
+	state := &playbackState{
+		active:       &generation{dir: t.TempDir(), planIndex: 0},
+		variantPlans: make(map[int]int),
+	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{
 		ID: "job",

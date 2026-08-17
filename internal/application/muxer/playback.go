@@ -28,11 +28,12 @@ type playbackState struct {
 	// variants holds a generation per plan index, started on demand when the
 	// player requests that ABR variant. active is the primary (plan 0) used by
 	// the health monitor and recovery; variants are additional renditions.
-	variants  map[int]*generation
-	starting  bool
-	startWait chan struct{}
-	startErr  error
-	directURL string
+	variants     map[int]*generation
+	variantPlans map[int]int
+	starting     bool
+	startWait    chan struct{}
+	startErr     error
+	directURL    string
 
 	placeholder        *generation
 	errorGeneration    *generation
@@ -84,6 +85,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		cancel:        cancel,
 		cacheDir:      dir,
 		variants:      make(map[int]*generation),
+		variantPlans:  make(map[int]int),
 		lastRequested: -1,
 		maxRequested:  -1,
 		lastAccess:    time.Now(),
@@ -533,30 +535,44 @@ func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playback
 // variant. It returns the generation's video playlist path once the first
 // segment exists. The primary plan (0) is started by runStartup; variants are
 // started lazily here.
-func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, planIndex int) (string, error) {
-	if planIndex < 0 || planIndex >= len(job.Plans) {
-		return "", fmt.Errorf("variant plan %d out of range", planIndex)
+func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, variantIndex int) (string, error) {
+	if variantIndex < 0 {
+		return "", fmt.Errorf("variant %d out of range", variantIndex)
 	}
 	state, err := m.stateFor(job)
 	if err != nil {
 		return "", err
 	}
+
+	// Resolve the variant index to the real plan index via the mapping
+	// established by MasterPlaylist.
 	state.mu.Lock()
+	planIndex, ok := state.variantPlans[variantIndex]
+	if !ok {
+		// No mapping yet — EnsurePlaylist hasn't been called or the master
+		// hasn't been rendered. Fall back to variantIndex == planIndex.
+		planIndex = variantIndex
+	}
+	if planIndex < 0 || planIndex >= len(job.Plans) {
+		state.mu.Unlock()
+		return "", fmt.Errorf("variant %d maps to plan %d out of range", variantIndex, planIndex)
+	}
+	// Reuse the active generation if it is the plan we need.
+	if state.active != nil && state.active.planIndex == planIndex {
+		active := state.active
+		state.mu.Unlock()
+		return generationVideoPlaylistPath(active), nil
+	}
+	// Reuse an already-started variant generation.
 	if gen, ok := state.variants[planIndex]; ok {
 		path := generationVideoPlaylistPath(gen)
 		state.mu.Unlock()
 		if fileExists(path) {
 			return path, nil
 		}
-	}
-	// If this plan is the currently active generation (the primary or a
-	// recovery target), reuse it instead of starting a duplicate session.
-	if state.active != nil && state.active.planIndex == planIndex {
-		active := state.active
+	} else {
 		state.mu.Unlock()
-		return generationVideoPlaylistPath(active), nil
 	}
-	state.mu.Unlock()
 
 	gen, err := m.startAttempt(ctx, job, state, planIndex, 0, false)
 	if err != nil {
@@ -758,31 +774,37 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return nil, false
 	}
 
+	// Build the list of plan indices to advertise, starting with the active
+	// plan (always v0), then remaining plans in order, capped at 4.
+	planIndices := []int{activePlan}
+	for i := range job.Plans {
+		if i == activePlan {
+			continue
+		}
+		if len(planIndices) >= 4 {
+			break
+		}
+		planIndices = append(planIndices, i)
+	}
+
+	// Record the variant→plan mapping so EnsureVariant can resolve correctly.
+	state.mu.Lock()
+	for vIdx, pIdx := range planIndices {
+		state.variantPlans[vIdx] = pIdx
+	}
+	state.mu.Unlock()
+
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
-
-	// Advertise variants under their real plan index (v{planIndex}). This
-	// keeps the master consistent with EnsureVariant, which reuses the active
-	// generation when active.planIndex == requested index — so after an
-	// internal recovery to plan N, the player requesting vN gets the running
-	// session instead of a fresh (failing) start.
-	activeIndex := 0
-	if activePlan >= 0 {
-		activeIndex = activePlan
-	}
-	count := 0
-	for i, plan := range job.Plans {
-		if count >= 4 {
-			break
-		}
+	for vIdx, pIdx := range planIndices {
+		plan := job.Plans[pIdx]
 		bw := int64(plan.EstimatedBandwidth())
-		if i == activeIndex && activeBitrate > 0 {
+		if pIdx == activePlan && activeBitrate > 0 {
 			bw = int64(activeBitrate)
 		}
 		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, plan.Video.Parsed.Resolution))
-		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", i))
-		count++
+		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", vIdx))
 	}
 	return []byte(b.String()), true
 }
