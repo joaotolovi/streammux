@@ -416,7 +416,7 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, placeholderPa
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
 		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments+temp_file",
+		"-hls_flags", "independent_segments+temp_file+split_by_time",
 		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
 		"-start_number", "0",
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
