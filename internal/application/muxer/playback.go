@@ -623,6 +623,21 @@ func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
 	return generationAudioPlaylistPath(state.active)
 }
 
+func (m *Muxer) IsVodReady(job *model.MuxJob) bool {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.active == nil || state.filmDuration <= 0 {
+		return false
+	}
+	highest := highestCompleteSegment(state.active.dir)
+	segs := int(math.Ceil(state.filmDuration / ffmpeg.SegDuration()))
+	return highest >= 0 && highest+1 >= segs-1
+}
+
 func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
@@ -632,6 +647,9 @@ func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
 	if state.active == nil || state.filmDuration <= 0 {
+		return nil, false
+	}
+	if !IsVodReadyLocked(state) {
 		return nil, false
 	}
 	return buildVodPlaylist(state.filmDuration)
@@ -646,6 +664,9 @@ func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
 	if state.active == nil || state.filmDuration <= 0 {
+		return nil, false
+	}
+	if !IsVodReadyLocked(state) {
 		return nil, false
 	}
 	return buildVodPlaylist(state.filmDuration)
@@ -663,6 +684,15 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	if state.active != nil {
+		if IsVodReadyLocked(state) {
+			state.mu.Unlock()
+			if segment < vodSegmentCount(state.filmDuration) {
+				if path := generationAudioSegmentPath(state.active, segment); fileExists(path) {
+					return path
+				}
+			}
+			return ""
+		}
 		if path := generationAudioSegmentPath(state.active, segment); fileExists(path) {
 			state.mu.Unlock()
 			return path
@@ -688,6 +718,15 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	if state.active != nil {
+		if IsVodReadyLocked(state) {
+			state.mu.Unlock()
+			if segment < vodSegmentCount(state.filmDuration) {
+				if path := generationSegmentPath(state.active, segment); fileExists(path) {
+					return path
+				}
+			}
+			return ""
+		}
 		if path := generationSegmentPath(state.active, segment); fileExists(path) {
 			state.mu.Unlock()
 			return path
@@ -703,6 +742,26 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 		}
 	}
 	return ""
+}
+
+func IsVodReadyLocked(state *playbackState) bool {
+	if state.active == nil || state.filmDuration <= 0 {
+		return false
+	}
+	highest := highestCompleteSegment(state.active.dir)
+	segs := vodSegmentCount(state.filmDuration)
+	return highest >= 0 && highest+1 >= segs
+}
+
+func vodSegmentCount(filmDuration float64) int {
+	if filmDuration <= 0 {
+		return 0
+	}
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4.0
+	}
+	return int(math.Ceil(filmDuration / segDur))
 }
 
 func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
@@ -954,13 +1013,9 @@ func buildVodPlaylist(filmDuration float64) ([]byte, bool) {
 	if filmDuration <= 0 {
 		return nil, false
 	}
-	// Don't pad to full duration: film is still encoding and virtual
-	// segments would 404 when the player tries to fetch them. Return
-	// the live playlist and let the timeline grow as segments arrive.
-	return raw, true
-	_ = filmDuration
-	if filmDuration <= 0 {
-		return raw, true
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4.0
 	}
 	segs := computeEqualLengthSegments(segDur, filmDuration)
 	if len(segs) == 0 {
