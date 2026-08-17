@@ -31,22 +31,10 @@ type playbackState struct {
 	startErr  error
 	directURL string
 
-	// placeholder is the generation playing the local intro/loop video while
-	// the film is prepared. placeholderStarted guards one-shot startup.
 	placeholder        *generation
 	placeholderStarted bool
 	placeholderWait    chan struct{}
-	// placeholderHighest is the last segment index known to have been produced
-	// by the placeholder; used to stitch the film's HLS at the handoff so the
-	// player never sees a discontinuity or reused segment numbers.
-	placeholderHighest int
-	// stitched is true once the master has been rewritten to include both the
-	// placeholder prefix and the film suffix. Segment lookups must check it.
-	stitched bool
-	filmDuration float64
-	// placeholderStartedAt tracks when the placeholder master became ready;
-	// used to cap the handoff to what the player actually consumed.
-	placeholderStartedAt time.Time
+	filmDuration       float64
 
 	recovering   bool
 	recoveryWait chan struct{}
@@ -69,13 +57,7 @@ type generation struct {
 	session      *ffmpeg.Session
 	startSegment int
 	startedAt    time.Time
-	// isPlaceholder marks a generation that plays a local intro/loop video
-	// while the real film is being prepared in the background.
 	isPlaceholder bool
-	// handoffAt is set on a film generation that was stitched after a
-	// placeholder: segments [0..handoffAt] live in placeholder.dir, the
-	// remainder in dir with renumbered filenames.
-	handoffAt int
 }
 
 func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
@@ -200,9 +182,6 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 }
 
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
-	// Film always starts at segment 0 on disk. The stitched playlist
-	// virtually renumbers film segments to placeholderHighest+1.., so the
-	// physical offset is resolved at serve time (SegmentPath + Stitched*).
 	winner, err := m.coordinateAttempts(job, state, 0, 0, m.policy.StartupTimeout)
 	if err != nil {
 		direct := m.resolveDirectFallback(job, state)
@@ -238,43 +217,23 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.startErr = nil
 	state.directURL = ""
 	state.lastRecovery = time.Now()
+	state.filmDuration = winner.prepared.duration
 	placeholder := state.placeholder
-	// Capture the handoff capped to what the player actually consumed.
-	// The placeholder never stops (concat loop), so disk highest = total
-	// buffered (~handoff=558 after 34s in the bug report). The player
-	// only consumed elapsed/segDuration segments (e.g. 34/4 ≈ 8).
-	// Stitching at 558 forces a ~936-entry playlist the player rejects.
+	state.mu.Unlock()
+
 	if placeholder != nil {
-		startedAt := state.placeholderStartedAt
-		state.mu.Unlock()
-		h := highestCompleteSegment(placeholder.dir)
-		state.mu.Lock()
-		if h >= 0 {
-			// Cap to elapsed: player buffered ~ elapsed/4 segments.
-			if !startedAt.IsZero() {
-				elapsed := time.Since(startedAt).Seconds()
-				consumed := int(elapsed / ffmpeg.SegDuration())
-				if consumed < h {
-					h = consumed
-				}
-			}
-			state.placeholderHighest = h
-		}
-		state.mu.Unlock()
 		placeholder.session.Cancel()
 		select {
 		case <-placeholder.session.Done():
 		case <-time.After(2 * time.Second):
 		}
 		state.mu.Lock()
-		state.stitched = true
-		state.filmDuration = winner.prepared.duration
+		state.placeholder = nil
 		state.mu.Unlock()
-		state.mu.Lock()
 	}
+
+	state.mu.Lock()
 	wait := state.startWait
-	ho := state.placeholderHighest
-	stitched := state.stitched && placeholder != nil
 	state.mu.Unlock()
 
 	job.Duration = winner.prepared.duration
@@ -282,11 +241,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	if wait != nil {
 		close(wait)
 	}
-	if stitched {
-		log.Printf("mux: startup selected plan %d/%d %s (%s) stitched handoff=%d film start=%d", winner.planIndex+1, len(job.Plans), winner.plan.Kind, winner.plan.Video.Parsed.Resolution, ho, winner.startSegment)
-	} else {
-		log.Printf("mux: startup selected plan %d/%d %s (%s)", winner.planIndex+1, len(job.Plans), winner.plan.Kind, winner.plan.Video.Parsed.Resolution)
-	}
+	log.Printf("mux: startup selected plan %d/%d %s (%s)", winner.planIndex+1, len(job.Plans), winner.plan.Kind, winner.plan.Video.Parsed.Resolution)
 	go m.monitorGeneration(job, state, winner)
 }
 
@@ -377,8 +332,20 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	}
 
 	state.mu.Lock()
+	if state.active != nil {
+		gen.session.Cancel()
+		state.mu.Unlock()
+		_ = os.RemoveAll(dir)
+		if wait := state.placeholderWait; wait != nil {
+			select {
+			case <-wait:
+			default:
+				close(wait)
+			}
+		}
+		return
+	}
 	state.placeholder = gen
-	state.placeholderStartedAt = time.Now()
 	wait := state.placeholderWait
 	state.mu.Unlock()
 	if wait != nil {
@@ -656,7 +623,7 @@ func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
 	return generationAudioPlaylistPath(state.active)
 }
 
-func (m *Muxer) StitchedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
+func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return nil, false
@@ -664,10 +631,13 @@ func (m *Muxer) StitchedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
-	return m.stitchedVideoPlaylistContent(state)
+	if state.active == nil {
+		return nil, false
+	}
+	return paddedFilmPlaylist(filepath.Join(state.active.dir, "video", "video.m3u8"), state.filmDuration)
 }
 
-func (m *Muxer) StitchedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
+func (m *Muxer) PaddedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return nil, false
@@ -675,11 +645,16 @@ func (m *Muxer) StitchedAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
-	return m.stitchedAudioPlaylistContent(state)
+	if state.active == nil {
+		return nil, false
+	}
+	return paddedFilmPlaylist(filepath.Join(state.active.dir, "audio", "audio.m3u8"), state.filmDuration)
 }
 
-// AudioSegmentPath returns the audio segment path for the given index, if it
-// exists in any generation.
+func (m *Muxer) StitchedVideoPlaylist(job *model.MuxJob) ([]byte, bool) { return nil, false }
+
+func (m *Muxer) StitchedAudioPlaylist(job *model.MuxJob) ([]byte, bool) { return nil, false }
+
 func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	state := m.lookupState(job.ID)
 	if state == nil {
@@ -687,36 +662,17 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	}
 	state.mu.Lock()
 	state.lastAccess = time.Now()
-	if state.stitched && state.active != nil && state.placeholder != nil {
-		if segment <= state.placeholderHighest {
-			path := generationAudioSegmentPath(state.placeholder, segment)
-			if fileExists(path) {
-				state.mu.Unlock()
-				return path
-			}
-		} else {
-			filmIndex := segment - (state.placeholderHighest + 1) + state.active.startSegment
-			path := generationAudioSegmentPath(state.active, filmIndex)
-			if fileExists(path) {
-				state.mu.Unlock()
-				return path
-			}
+	if state.active != nil {
+		if path := generationAudioSegmentPath(state.active, segment); fileExists(path) {
+			state.mu.Unlock()
+			return path
 		}
 		state.mu.Unlock()
 		return ""
 	}
-	generations := append([]*generation(nil), state.all...)
-	hasPlaceholder := state.placeholder != nil
 	placeholder := state.placeholder
 	state.mu.Unlock()
-
-	for index := len(generations) - 1; index >= 0; index-- {
-		path := generationAudioSegmentPath(generations[index], segment)
-		if fileExists(path) {
-			return path
-		}
-	}
-	if hasPlaceholder {
+	if placeholder != nil {
 		if path := generationAudioSegmentPath(placeholder, segment); fileExists(path) {
 			return path
 		}
@@ -731,36 +687,17 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	}
 	state.mu.Lock()
 	state.lastAccess = time.Now()
-	if state.stitched && state.active != nil && state.placeholder != nil {
-		if segment <= state.placeholderHighest {
-			path := generationSegmentPath(state.placeholder, segment)
-			if fileExists(path) {
-				state.mu.Unlock()
-				return path
-			}
-		} else {
-			filmIndex := segment - (state.placeholderHighest + 1) + state.active.startSegment
-			path := generationSegmentPath(state.active, filmIndex)
-			if fileExists(path) {
-				state.mu.Unlock()
-				return path
-			}
+	if state.active != nil {
+		if path := generationSegmentPath(state.active, segment); fileExists(path) {
+			state.mu.Unlock()
+			return path
 		}
 		state.mu.Unlock()
 		return ""
 	}
-	generations := append([]*generation(nil), state.all...)
-	hasPlaceholder := state.placeholder != nil
 	placeholder := state.placeholder
 	state.mu.Unlock()
-
-	for index := len(generations) - 1; index >= 0; index-- {
-		path := generationSegmentPath(generations[index], segment)
-		if fileExists(path) {
-			return path
-		}
-	}
-	if hasPlaceholder {
+	if placeholder != nil {
 		if path := generationSegmentPath(placeholder, segment); fileExists(path) {
 			return path
 		}
@@ -1013,175 +950,64 @@ func highestCompleteSegment(dir string) int {
 
 
 
-func rewriteStitchedPlaylists(placeholder, film *generation) error {
-	return nil
-}
-
-func (m *Muxer) stitchedVideoPlaylistContent(state *playbackState) ([]byte, bool) {
-	if !state.stitched || state.placeholder == nil || state.active == nil {
+func paddedFilmPlaylist(playlistPath string, filmDuration float64) ([]byte, bool) {
+	raw, err := os.ReadFile(playlistPath)
+	if err != nil {
 		return nil, false
 	}
-	phPath := filepath.Join(state.placeholder.dir, "video", "video.m3u8")
-	phRaw, err1 := os.ReadFile(phPath)
-	if err1 != nil {
-		return nil, false
+	if filmDuration <= 0 {
+		return raw, true
 	}
-	filmPath := filepath.Join(state.active.dir, "video", "video.m3u8")
-	filmRaw, err2 := os.ReadFile(filmPath)
-	if err2 != nil {
-		phLines := strings.Split(strings.TrimRight(string(phRaw), "\n"), "\n")
-		var out []string
-		for _, l := range phLines {
-			if strings.TrimSpace(l) == "#EXT-X-ENDLIST" {
-				continue
-			}
-			out = append(out, l)
-		}
-		return []byte(strings.Join(out, "\n") + "\n"), true
-	}
-	phLines := strings.Split(strings.TrimRight(string(phRaw), "\n"), "\n")
-	filmLines := strings.Split(strings.TrimRight(string(filmRaw), "\n"), "\n")
-	// Compute max TARGETDURATION so stitched EXTINF never exceeds it.
-	maxTarget := 0
-	for _, lines := range [][]string{phLines, filmLines} {
-		for _, l := range lines {
-			if strings.HasPrefix(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:") {
-				var v int
-				if _, err := fmt.Sscanf(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:%d", &v); err == nil && v > maxTarget {
-					maxTarget = v
-				}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	published := 0.0
+	for _, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
+			if d, err := parseExtInf(strings.TrimSpace(l)); err == nil {
+				published += d
 			}
 		}
 	}
-	limit := state.placeholderHighest + 1
-	if limit < 0 {
-		limit = 0
+	remaining := filmDuration - published
+	if remaining <= 0.5 {
+		return raw, true
+	}
+	avgSeg := ffmpeg.SegDuration()
+	if v := avgExtInf(lines); v > 0 {
+		avgSeg = v
+	}
+	virtualCount := int(math.Ceil(remaining / avgSeg))
+	if virtualCount < 1 {
+		virtualCount = 1
+	}
+	if virtualCount > 2000 {
+		virtualCount = 2000
+	}
+	filmSegs := 0
+	for _, l := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(l), "#") && strings.TrimSpace(l) != "" {
+			filmSegs++
+		}
 	}
 	var out []string
-	headerDone := false
-	phSegs := 0
-	for _, l := range phLines {
-		trim := strings.TrimSpace(l)
-		isSegFile := trim != "" && !strings.HasPrefix(trim, "#")
-		if !headerDone {
-			if strings.HasPrefix(trim, "#EXTINF:") || isSegFile {
-				headerDone = true
-			}
-		}
-		if headerDone && strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
-			continue
-		}
-		// Rewrite TARGETDURATION to max so film segments with larger EXTINF are valid.
-		if strings.HasPrefix(trim, "#EXT-X-TARGETDURATION:") && maxTarget > 0 {
-			l = fmt.Sprintf("#EXT-X-TARGETDURATION:%d", maxTarget)
-		}
-		// After header, count segments and truncate to handoff.
-		if headerDone && isSegFile {
-			if phSegs >= limit {
-				// Skip this segment file; the preceding EXTINF was already
-				// added and must be removed. The previous iteration added
-				// EXTINF for this segment — drop it.
-				if len(out) > 0 && strings.HasPrefix(strings.TrimSpace(out[len(out)-1]), "#EXTINF:") {
-					out = out[:len(out)-1]
-				}
-				continue
-			}
-			phSegs++
-		}
-		// Keep header lines and segments within limit; drop extra placeholder segments.
-		if !headerDone {
-			out = append(out, l)
-			if strings.HasPrefix(trim, "#EXTINF:") {
-				headerDone = true
-			}
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "#EXT-X-ENDLIST" {
 			continue
 		}
 		out = append(out, l)
-		if strings.HasPrefix(trim, "#EXTINF:") {
-			headerDone = true
-		}
 	}
-	hasFilmSeg := false
-	for _, l := range filmLines {
-		if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
-			hasFilmSeg = true
-			break
-		}
-	}
-	if hasFilmSeg {
-		needsDisc := true
-		for _, l := range out {
-			if strings.TrimSpace(l) == "#EXT-X-DISCONTINUITY" {
-				needsDisc = false
-				break
+	for i := 0; i < virtualCount; i++ {
+		d := avgSeg
+		if i == virtualCount-1 {
+			d = remaining - float64(i)*avgSeg
+			if d <= 0 {
+				d = avgSeg
+			}
+			if d > avgSeg {
+				d = avgSeg
 			}
 		}
-		if needsDisc {
-			out = append(out, "#EXT-X-DISCONTINUITY")
-		}
-	}
-	offset := state.placeholderHighest + 1 - state.active.startSegment
-	filmIndex := 0
-	inHeader := true
-	for _, l := range filmLines {
-		trim := strings.TrimSpace(l)
-		if inHeader {
-			if strings.HasPrefix(trim, "#EXTM3U") || strings.HasPrefix(trim, "#EXT-X-VERSION") || strings.HasPrefix(trim, "#EXT-X-TARGETDURATION") || strings.HasPrefix(trim, "#EXT-X-MEDIA-SEQUENCE") || strings.HasPrefix(trim, "#EXT-X-PLAYLIST-TYPE") || strings.HasPrefix(trim, "#EXT-X-INDEPENDENT-SEGMENTS") {
-				continue
-			}
-			if strings.HasPrefix(trim, "#EXTINF:") || (trim != "" && !strings.HasPrefix(trim, "#")) {
-				inHeader = false
-			} else {
-				continue
-			}
-		}
-		if strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
-			continue
-		}
-		if trim != "" && !strings.HasPrefix(trim, "#") {
-			l = fmt.Sprintf("seg_%05d.ts", filmIndex+offset)
-			filmIndex++
-		}
-		out = append(out, l)
-	}
-	if state.filmDuration > 0 {
-		filmPublished := 0.0
-		for _, l := range filmLines {
-			if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
-				if d, err := parseExtInf(strings.TrimSpace(l)); err == nil {
-					filmPublished += d
-				}
-			}
-		}
-		remaining := state.filmDuration - filmPublished
-		if remaining > 0.5 {
-			avgSeg := ffmpeg.SegDuration()
-			if v := avgExtInf(filmLines); v > 0 {
-				avgSeg = v
-			}
-			virtualCount := int(math.Ceil(remaining / avgSeg))
-			if virtualCount < 1 {
-				virtualCount = 1
-			}
-			if virtualCount > 2000 {
-				virtualCount = 2000
-			}
-			for i := 0; i < virtualCount; i++ {
-				d := avgSeg
-				if i == virtualCount-1 {
-					d = remaining - float64(i)*avgSeg
-					if d <= 0 {
-						d = avgSeg
-					}
-					if d > avgSeg {
-						d = avgSeg
-					}
-				}
-				virtIdx := filmIndex + offset + i
-				out = append(out, fmt.Sprintf("#EXTINF:%.3f,", d))
-				out = append(out, fmt.Sprintf("seg_%05d.ts", virtIdx))
-			}
-		}
+		out = append(out, fmt.Sprintf("#EXTINF:%.3f,", d))
+		out = append(out, fmt.Sprintf("seg_%05d.ts", filmSegs+i))
 	}
 	return []byte(strings.Join(out, "\n") + "\n"), true
 }
@@ -1215,168 +1041,6 @@ func avgExtInf(lines []string) float64 {
 		return 0
 	}
 	return sum / float64(n)
-}
-
-func (m *Muxer) stitchedAudioPlaylistContent(state *playbackState) ([]byte, bool) {
-	if !state.stitched || state.placeholder == nil || state.active == nil {
-		return nil, false
-	}
-	phPath := filepath.Join(state.placeholder.dir, "audio", "audio.m3u8")
-	phRaw, err1 := os.ReadFile(phPath)
-	if err1 != nil {
-		return nil, false
-	}
-	filmPath := filepath.Join(state.active.dir, "audio", "audio.m3u8")
-	filmRaw, err2 := os.ReadFile(filmPath)
-	if err2 != nil {
-		phLines := strings.Split(strings.TrimRight(string(phRaw), "\n"), "\n")
-		var out []string
-		for _, l := range phLines {
-			if strings.TrimSpace(l) == "#EXT-X-ENDLIST" {
-				continue
-			}
-			out = append(out, l)
-		}
-		return []byte(strings.Join(out, "\n") + "\n"), true
-	}
-	phLines := strings.Split(strings.TrimRight(string(phRaw), "\n"), "\n")
-	filmLines := strings.Split(strings.TrimRight(string(filmRaw), "\n"), "\n")
-	maxTarget := 0
-	for _, lines := range [][]string{phLines, filmLines} {
-		for _, l := range lines {
-			if strings.HasPrefix(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:") {
-				var v int
-				if _, err := fmt.Sscanf(strings.TrimSpace(l), "#EXT-X-TARGETDURATION:%d", &v); err == nil && v > maxTarget {
-					maxTarget = v
-				}
-			}
-		}
-	}
-	limit := state.placeholderHighest + 1
-	if limit < 0 {
-		limit = 0
-	}
-	var out []string
-	headerDone := false
-	phSegs := 0
-	for _, l := range phLines {
-		trim := strings.TrimSpace(l)
-		isSegFile := trim != "" && !strings.HasPrefix(trim, "#")
-		if !headerDone {
-			if strings.HasPrefix(trim, "#EXTINF:") || isSegFile {
-				headerDone = true
-			}
-		}
-		if headerDone && strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
-			continue
-		}
-		if strings.HasPrefix(trim, "#EXT-X-TARGETDURATION:") && maxTarget > 0 {
-			l = fmt.Sprintf("#EXT-X-TARGETDURATION:%d", maxTarget)
-		}
-		if headerDone && isSegFile {
-			if phSegs >= limit {
-				if len(out) > 0 && strings.HasPrefix(strings.TrimSpace(out[len(out)-1]), "#EXTINF:") {
-					out = out[:len(out)-1]
-				}
-				continue
-			}
-			phSegs++
-		}
-		if !headerDone {
-			out = append(out, l)
-			if strings.HasPrefix(trim, "#EXTINF:") {
-				headerDone = true
-			}
-			continue
-		}
-		out = append(out, l)
-		if strings.HasPrefix(trim, "#EXTINF:") {
-			headerDone = true
-		}
-	}
-	hasFilmSeg := false
-	for _, l := range filmLines {
-		if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
-			hasFilmSeg = true
-			break
-		}
-	}
-	if hasFilmSeg {
-		needsDisc := true
-		for _, l := range out {
-			if strings.TrimSpace(l) == "#EXT-X-DISCONTINUITY" {
-				needsDisc = false
-				break
-			}
-		}
-		if needsDisc {
-			out = append(out, "#EXT-X-DISCONTINUITY")
-		}
-	}
-	offset := state.placeholderHighest + 1 - state.active.startSegment
-	filmIndex := 0
-	inHeader := true
-	for _, l := range filmLines {
-		trim := strings.TrimSpace(l)
-		if inHeader {
-			if strings.HasPrefix(trim, "#EXTM3U") || strings.HasPrefix(trim, "#EXT-X-VERSION") || strings.HasPrefix(trim, "#EXT-X-TARGETDURATION") || strings.HasPrefix(trim, "#EXT-X-MEDIA-SEQUENCE") || strings.HasPrefix(trim, "#EXT-X-PLAYLIST-TYPE") || strings.HasPrefix(trim, "#EXT-X-INDEPENDENT-SEGMENTS") {
-				continue
-			}
-			if strings.HasPrefix(trim, "#EXTINF:") || (trim != "" && !strings.HasPrefix(trim, "#")) {
-				inHeader = false
-			} else {
-				continue
-			}
-		}
-		if strings.HasPrefix(trim, "#EXT-X-ENDLIST") {
-			continue
-		}
-		if trim != "" && !strings.HasPrefix(trim, "#") {
-			l = fmt.Sprintf("seg_%05d.ts", filmIndex+offset)
-			filmIndex++
-		}
-		out = append(out, l)
-	}
-	if state.filmDuration > 0 {
-		filmPublished := 0.0
-		for _, l := range filmLines {
-			if strings.HasPrefix(strings.TrimSpace(l), "#EXTINF:") {
-				if d, err := parseExtInf(strings.TrimSpace(l)); err == nil {
-					filmPublished += d
-				}
-			}
-		}
-		remaining := state.filmDuration - filmPublished
-		if remaining > 0.5 {
-			avgSeg := ffmpeg.SegDuration()
-			if v := avgExtInf(filmLines); v > 0 {
-				avgSeg = v
-			}
-			virtualCount := int(math.Ceil(remaining / avgSeg))
-			if virtualCount < 1 {
-				virtualCount = 1
-			}
-			if virtualCount > 2000 {
-				virtualCount = 2000
-			}
-			for i := 0; i < virtualCount; i++ {
-				d := avgSeg
-				if i == virtualCount-1 {
-					d = remaining - float64(i)*avgSeg
-					if d <= 0 {
-						d = avgSeg
-					}
-					if d > avgSeg {
-						d = avgSeg
-					}
-				}
-				virtIdx := filmIndex + offset + i
-				out = append(out, fmt.Sprintf("#EXTINF:%.3f,", d))
-				out = append(out, fmt.Sprintf("seg_%05d.ts", virtIdx))
-			}
-		}
-	}
-	return []byte(strings.Join(out, "\n") + "\n"), true
 }
 
 func (m *Muxer) reapIdleSessions() {

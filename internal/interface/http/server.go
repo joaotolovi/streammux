@@ -233,7 +233,6 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, segPath)
 }
 
-// handleHLSVideoPlaylist serves the video-only media playlist.
 func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	job, ok := s.store.Get(jobID)
@@ -245,7 +244,7 @@ func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadGateway, "playlist not ready")
 		return
 	}
-	if data, ok := s.muxer.StitchedVideoPlaylist(job); ok {
+	if data, ok := s.muxer.PaddedVideoPlaylist(job); ok {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
@@ -261,7 +260,6 @@ func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) 
 	http.ServeFile(w, r, path)
 }
 
-// handleHLSAudioPlaylist serves the audio-only media playlist.
 func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobId")
 	job, ok := s.store.Get(jobID)
@@ -273,7 +271,7 @@ func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadGateway, "playlist not ready")
 		return
 	}
-	if data, ok := s.muxer.StitchedAudioPlaylist(job); ok {
+	if data, ok := s.muxer.PaddedAudioPlaylist(job); ok {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)
