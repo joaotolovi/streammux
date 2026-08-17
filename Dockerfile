@@ -20,11 +20,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /streammux ./cmd/streammux
 
-# Runtime stage — includes ffmpeg (and ffprobe) for remuxing.
-FROM debian:bookworm-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Runtime stage — includes current stable ffmpeg and ffprobe for remuxing.
+FROM alpine:3.23
+RUN apk add --no-cache ffmpeg ca-certificates
 COPY --from=builder /streammux /usr/local/bin/streammux
 
 ENV PORT=3001
