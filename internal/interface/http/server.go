@@ -250,6 +250,12 @@ func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) 
 		w.Write(data)
 		return
 	}
+	if data, ok := s.muxer.PlaceholderVideoPlaylist(job); ok {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
+		return
+	}
 	path := s.muxer.VideoPlaylistPath(job)
 	if path == "" {
 		writeError(w, http.StatusInternalServerError, "video playlist not ready")
@@ -272,6 +278,12 @@ func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if data, ok := s.muxer.PaddedAudioPlaylist(job); ok {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
+		return
+	}
+	if data, ok := s.muxer.PlaceholderAudioPlaylist(job); ok {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Write(data)

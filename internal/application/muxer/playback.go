@@ -31,12 +31,12 @@ type playbackState struct {
 	startErr  error
 	directURL string
 
-	placeholder              *generation
-	placeholderStarted       bool
-	placeholderWait          chan struct{}
-	placeholderLastRequested int
-	filmDuration             float64
-	filmSequence             int
+	placeholder        *generation
+	retiredPlaceholder *generation
+	placeholderStarted bool
+	placeholderWait    chan struct{}
+	filmDuration       float64
+	filmSequence       int
 
 	recovering   bool
 	recoveryWait chan struct{}
@@ -75,12 +75,11 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &playbackState{
-		ctx:                      ctx,
-		cancel:                   cancel,
-		cacheDir:                 dir,
-		placeholderLastRequested: -1,
-		lastRequested:            -1,
-		lastAccess:               time.Now(),
+		ctx:           ctx,
+		cancel:        cancel,
+		cacheDir:      dir,
+		lastRequested: -1,
+		lastAccess:    time.Now(),
 	}
 	m.states[job.ID] = state
 	job.CacheDir = dir
@@ -184,6 +183,40 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	return fmt.Errorf("playback startup finished without a playable source")
 }
 
+func placeholderFilmSequence(placeholder *generation) int {
+	if placeholder == nil {
+		return 0
+	}
+	videoLast := lastPlaylistSegment(generationVideoPlaylistPath(placeholder))
+	audioLast := lastPlaylistSegment(generationAudioPlaylistPath(placeholder))
+	if videoLast < 0 || audioLast < 0 {
+		return 0
+	}
+	if audioLast < videoLast {
+		videoLast = audioLast
+	}
+	return videoLast + 1
+}
+
+func lastPlaylistSegment(path string) int {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return -1
+	}
+	last := -1
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var segment int
+		if _, err := fmt.Sscanf(line, "seg_%05d.ts", &segment); err == nil && segment > last {
+			last = segment
+		}
+	}
+	return last
+}
+
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	winner, err := m.coordinateAttempts(job, state, 0, 0, m.policy.StartupTimeout)
 	if err != nil {
@@ -213,9 +246,14 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		}
 		return
 	}
-	filmSequence := state.placeholderLastRequested + 1
-	if filmSequence < 0 {
-		filmSequence = 0
+	placeholder := state.placeholder
+	state.mu.Unlock()
+	filmSequence := placeholderFilmSequence(placeholder)
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		winner.session.Cancel()
+		return
 	}
 	state.active = winner
 	state.all = append(state.all, winner)
@@ -227,7 +265,8 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.filmDuration = winner.prepared.duration
 	state.filmSequence = filmSequence
 	state.lastRequested = -1
-	placeholder := state.placeholder
+	state.retiredPlaceholder = placeholder
+	state.placeholder = nil
 	state.mu.Unlock()
 
 	if placeholder != nil {
@@ -236,9 +275,6 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		case <-placeholder.session.Done():
 		case <-time.After(2 * time.Second):
 		}
-		state.mu.Lock()
-		state.placeholder = nil
-		state.mu.Unlock()
 	}
 
 	state.mu.Lock()
@@ -632,6 +668,118 @@ func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
 	return generationAudioPlaylistPath(state.active)
 }
 
+func (m *Muxer) PlaceholderVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
+	return m.synchronizedPlaceholderPlaylist(job, true)
+}
+
+func (m *Muxer) PlaceholderAudioPlaylist(job *model.MuxJob) ([]byte, bool) {
+	return m.synchronizedPlaceholderPlaylist(job, false)
+}
+
+func (m *Muxer) synchronizedPlaceholderPlaylist(job *model.MuxJob, video bool) ([]byte, bool) {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return nil, false
+	}
+	state.mu.Lock()
+	if state.active != nil || state.placeholder == nil {
+		state.mu.Unlock()
+		return nil, false
+	}
+	placeholder := state.placeholder
+	state.lastAccess = time.Now()
+	state.mu.Unlock()
+
+	videoPlaylist, err := readLivePlaylist(generationVideoPlaylistPath(placeholder))
+	if err != nil {
+		return nil, false
+	}
+	audioPlaylist, err := readLivePlaylist(generationAudioPlaylistPath(placeholder))
+	if err != nil {
+		return nil, false
+	}
+	first := videoPlaylist.first
+	if audioPlaylist.first > first {
+		first = audioPlaylist.first
+	}
+	last := videoPlaylist.last
+	if audioPlaylist.last < last {
+		last = audioPlaylist.last
+	}
+	if first < 0 || last < first {
+		return nil, false
+	}
+	playlist := videoPlaylist
+	if !video {
+		playlist = audioPlaylist
+	}
+	return playlist.render(first, last), true
+}
+
+type livePlaylist struct {
+	header   []string
+	segments map[int][]string
+	first    int
+	last     int
+}
+
+func readLivePlaylist(path string) (livePlaylist, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return livePlaylist{}, err
+	}
+	playlist := livePlaylist{segments: make(map[int][]string), first: -1, last: -1}
+	var pending []string
+	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "#EXT-X-MEDIA-SEQUENCE:"):
+			continue
+		case strings.HasPrefix(trimmed, "#EXTINF:"):
+			pending = append(pending[:0], line)
+		case trimmed != "" && !strings.HasPrefix(trimmed, "#"):
+			var segment int
+			if _, err := fmt.Sscanf(trimmed, "seg_%05d.ts", &segment); err != nil {
+				continue
+			}
+			lines := append([]string(nil), pending...)
+			lines = append(lines, line)
+			playlist.segments[segment] = lines
+			if playlist.first < 0 || segment < playlist.first {
+				playlist.first = segment
+			}
+			if segment > playlist.last {
+				playlist.last = segment
+			}
+			pending = pending[:0]
+		case len(pending) == 0:
+			playlist.header = append(playlist.header, line)
+		default:
+			pending = append(pending, line)
+		}
+	}
+	return playlist, nil
+}
+
+func (p livePlaylist) render(first, last int) []byte {
+	var out []string
+	insertedSequence := false
+	for _, line := range p.header {
+		out = append(out, line)
+		if strings.HasPrefix(strings.TrimSpace(line), "#EXT-X-TARGETDURATION:") {
+			out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", first))
+			insertedSequence = true
+		}
+	}
+	if !insertedSequence {
+		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", first))
+	}
+	for segment := first; segment <= last; segment++ {
+		out = append(out, p.segments[segment]...)
+	}
+	return []byte(strings.Join(out, "\n") + "\n")
+}
+
 func (m *Muxer) PaddedVideoPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
@@ -670,9 +818,18 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	if state.active != nil {
 		physical := segment - state.filmSequence
 		active := state.active
+		retired := state.retiredPlaceholder
 		duration := state.filmDuration
 		state.mu.Unlock()
-		if physical < 0 || physical >= vodSegmentCount(duration) {
+		if physical < 0 {
+			if retired != nil {
+				if path := generationAudioSegmentPath(retired, segment); fileExists(path) {
+					return path
+				}
+			}
+			return ""
+		}
+		if physical >= vodSegmentCount(duration) {
 			return ""
 		}
 		if path := generationAudioSegmentPath(active, physical); fileExists(path) {
@@ -684,9 +841,6 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	if placeholder != nil {
 		path := generationAudioSegmentPath(placeholder, segment)
 		if fileExists(path) {
-			if segment > state.placeholderLastRequested {
-				state.placeholderLastRequested = segment
-			}
 			state.mu.Unlock()
 			return path
 		}
@@ -705,9 +859,18 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	if state.active != nil {
 		physical := segment - state.filmSequence
 		active := state.active
+		retired := state.retiredPlaceholder
 		duration := state.filmDuration
 		state.mu.Unlock()
-		if physical < 0 || physical >= vodSegmentCount(duration) {
+		if physical < 0 {
+			if retired != nil {
+				if path := generationSegmentPath(retired, segment); fileExists(path) {
+					return path
+				}
+			}
+			return ""
+		}
+		if physical >= vodSegmentCount(duration) {
 			return ""
 		}
 		if path := generationSegmentPath(active, physical); fileExists(path) {
@@ -719,9 +882,6 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	if placeholder != nil {
 		path := generationSegmentPath(placeholder, segment)
 		if fileExists(path) {
-			if segment > state.placeholderLastRequested {
-				state.placeholderLastRequested = segment
-			}
 			state.mu.Unlock()
 			return path
 		}

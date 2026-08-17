@@ -211,56 +211,86 @@ func TestComputeEqualLengthSegmentsUsesShortFinalSegment(t *testing.T) {
 	}
 }
 
-func TestPlaceholderFutureRequestDoesNotAdvanceHandoff(t *testing.T) {
+func TestPlaceholderFilmSequenceUsesLastCommonAdvertisedSegment(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	video := "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4,\nseg_00000.ts\n#EXTINF:4,\nseg_00001.ts\n"
+	audio := video + "#EXTINF:4,\nseg_00002.ts\n"
+	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "video", "seg_00000.ts"), []byte("segment"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
 		t.Fatal(err)
 	}
-	state := &playbackState{
-		placeholder:              &generation{dir: dir},
-		placeholderLastRequested: -1,
-	}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-	job := &model.MuxJob{ID: "job"}
-
-	if path := mux.SegmentPath(job, 1); path != "" {
-		t.Fatalf("future placeholder segment path = %q, want empty", path)
-	}
-	if state.placeholderLastRequested != -1 {
-		t.Fatalf("future request advanced handoff to %d", state.placeholderLastRequested)
-	}
-	if path := mux.SegmentPath(job, 0); path == "" {
-		t.Fatal("existing placeholder segment not found")
-	}
-	if state.placeholderLastRequested != 0 {
-		t.Fatalf("served request handoff = %d, want 0", state.placeholderLastRequested)
+	if got := placeholderFilmSequence(&generation{dir: dir}); got != 2 {
+		t.Fatalf("film sequence = %d, want 2", got)
 	}
 }
 
-func TestFilmSequenceMapsFirstPublicSegmentToFilmStart(t *testing.T) {
+func TestSynchronizedPlaceholderPlaylistUsesCommonWindow(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	video := "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:4,\nseg_00000.ts\n#EXTINF:4,\nseg_00001.ts\n"
+	audio := video + "#EXTINF:4,\nseg_00002.ts\n"
+	if err := os.WriteFile(filepath.Join(dir, "video", "video.m3u8"), []byte(video), 0644); err != nil {
 		t.Fatal(err)
 	}
-	physical := filepath.Join(dir, "video", "seg_00000.ts")
-	if err := os.WriteFile(physical, []byte("film"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "audio", "audio.m3u8"), []byte(audio), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := &playbackState{placeholder: &generation{dir: dir}}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+	data, ok := mux.PlaceholderVideoPlaylist(job)
+	if !ok {
+		t.Fatal("PlaceholderVideoPlaylist() returned false")
+	}
+	playlist := string(data)
+	if strings.Contains(playlist, "seg_00002.ts") {
+		t.Fatalf("video playlist exposed audio-only segment: %s", playlist)
+	}
+	if !strings.Contains(playlist, "seg_00001.ts") {
+		t.Fatalf("video playlist omitted common segment: %s", playlist)
+	}
+}
+
+func TestFilmSequenceMapsCutoverAndRetainsEarlierPlaceholderSegments(t *testing.T) {
+	filmDir := t.TempDir()
+	placeholderDir := t.TempDir()
+	for _, dir := range []string{filmDir, placeholderDir} {
+		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	film := filepath.Join(filmDir, "video", "seg_00000.ts")
+	placeholder := filepath.Join(placeholderDir, "video", "seg_00001.ts")
+	if err := os.WriteFile(film, []byte("film"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(placeholder, []byte("placeholder"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	state := &playbackState{
-		active:       &generation{dir: dir},
-		filmSequence: 3,
-		filmDuration: 120,
+		active:             &generation{dir: filmDir},
+		retiredPlaceholder: &generation{dir: placeholderDir},
+		filmSequence:       2,
+		filmDuration:       120,
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	if path := mux.SegmentPath(job, 3); path != physical {
-		t.Fatalf("first public film segment path = %q, want %q", path, physical)
+	if path := mux.SegmentPath(job, 2); path != film {
+		t.Fatalf("cutover segment path = %q, want %q", path, film)
 	}
-	if path := mux.SegmentPath(job, 2); path != "" {
-		t.Fatalf("pre-film public segment path = %q, want empty", path)
+	if path := mux.SegmentPath(job, 1); path != placeholder {
+		t.Fatalf("retired placeholder path = %q, want %q", path, placeholder)
 	}
 }
