@@ -394,8 +394,12 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 		return nil, err
 	}
 
-	// Build the input list and the concat filter. The intro (if any) is input 0
-	// and plays once; the loop video (if any) is the last input and loops.
+	// Placeholder is a finite 120s video: intro (once) + loop repeated to
+	// fill the remaining time. No infinite loop — the playlist is a fixed
+	// 120s (~30 segments of 4s) so the player sees a normal VOD timeline
+	// that stalls at the end instead of looping forever. This keeps the
+	// stitched handoff bounded and simple.
+	const placeholderDuration = 120.0
 	args := []string{
 		"-nostdin",
 		"-hide_banner",
@@ -408,8 +412,35 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 		inputs = append(inputs, "0")
 	}
 	if loopPath != "" {
-		args = append(args, "-stream_loop", "-1", "-i", loopPath)
-		inputs = append(inputs, strconv.Itoa(len(inputs)))
+		loopDur := fileDuration(loopPath)
+		if loopDur <= 0 {
+			loopDur = 8.0
+		}
+		introDur := 0.0
+		if introPath != "" {
+			introDur = fileDuration(introPath)
+			if introDur <= 0 {
+				introDur = 10.0
+			}
+		}
+		remaining := placeholderDuration - introDur
+		if remaining < loopDur {
+			remaining = loopDur
+		}
+		loops := int(remaining / loopDur)
+		if remaining-float64(loops)*loopDur > 0.01 {
+			loops++
+		}
+		if loops < 1 {
+			loops = 1
+		}
+		if loops > 30 {
+			loops = 30
+		}
+		for i := 0; i < loops; i++ {
+			args = append(args, "-i", loopPath)
+			inputs = append(inputs, strconv.Itoa(len(inputs)))
+		}
 	}
 	// Build concat filter: [0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[v][a]
 	for _, in := range inputs {
@@ -418,8 +449,11 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 	filter += "concat=n=" + strconv.Itoa(len(inputs)) + ":v=1:a=1[v][a]"
 	args = append(args, "-filter_complex", filter)
 
+	// Trim the concatenated stream to exactly placeholderDuration (120s)
+	// so we don't depend on exact loop multiples.
 	args = append(args,
 		"-map", "[v]",
+		"-t", fmtDuration(placeholderDuration),
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
@@ -431,6 +465,7 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 		"-start_number", "0",
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "[a]",
+		"-t", fmtDuration(placeholderDuration),
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
@@ -484,4 +519,17 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath
 	}()
 
 	return s, nil
+}
+
+func fileDuration(path string) float64 {
+	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if v <= 0 || v > 1e6 {
+		return 0
+	}
+	return v
 }
