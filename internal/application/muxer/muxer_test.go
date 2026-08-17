@@ -262,6 +262,39 @@ func TestSynchronizedPlaceholderPlaylistUsesCommonWindow(t *testing.T) {
 	}
 }
 
+func TestEstimatedBandwidthScalesWithResolution(t *testing.T) {
+	plan := model.PlaybackPlan{
+		Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p", Encode: "HEVC"}},
+	}
+	if got := plan.EstimatedBandwidth(); got != 16_666_666 {
+		t.Fatalf("2160p HEVC bandwidth = %d, want 16666666", got)
+	}
+	plan.Video.Parsed = model.ParsedFile{Resolution: "1080p", Encode: "AVC"}
+	if got := plan.EstimatedBandwidth(); got != 8_000_000 {
+		t.Fatalf("1080p AVC bandwidth = %d, want 8000000", got)
+	}
+}
+
+func TestMasterPlaylistAdvertisesVariants(t *testing.T) {
+	state := &playbackState{active: &generation{dir: t.TempDir()}}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{
+		ID: "job",
+		Plans: []model.PlaybackPlan{
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}}},
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "1080p"}}},
+		},
+	}
+	data, ok := mux.MasterPlaylist(job)
+	if !ok {
+		t.Fatal("MasterPlaylist() returned false")
+	}
+	playlist := string(data)
+	if !strings.Contains(playlist, "v0/video/video.m3u8") || !strings.Contains(playlist, "v1/video/video.m3u8") {
+		t.Fatalf("master missing variants: %s", playlist)
+	}
+}
+
 func TestFilmSequenceMapsCutoverAndRetainsEarlierPlaceholderSegments(t *testing.T) {
 	filmDir := t.TempDir()
 	placeholderDir := t.TempDir()

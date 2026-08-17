@@ -113,6 +113,38 @@ type PlaybackPlan struct {
 	AudioScore     int
 }
 
+// EstimatedBandwidth returns a rough peak bitrate (bits/s) for the plan's
+// video source, used to advertise ABR variants in the master playlist. It is
+// derived from resolution and encode type; the actual bitrate is unknown until
+// the source is probed, so this is a conservative upper bound.
+func (p PlaybackPlan) EstimatedBandwidth() int {
+	res := p.Video.Parsed.Resolution
+	encode := p.Video.Parsed.Encode
+	base := 0
+	switch res {
+	case "2160p":
+		base = 25_000_000
+	case "1440p":
+		base = 15_000_000
+	case "1080p":
+		base = 8_000_000
+	case "720p":
+		base = 4_000_000
+	case "576p":
+		base = 2_500_000
+	case "480p":
+		base = 1_500_000
+	default:
+		base = 1_000_000
+	}
+	// HEVC/AV1 deliver the same quality at roughly half the bitrate of AVC.
+	switch encode {
+	case "HEVC", "AV1":
+		base = base * 2 / 3
+	}
+	return base
+}
+
 func (p PlaybackPlan) VideoURL() string { return p.Video.Stream.URL }
 
 func (p PlaybackPlan) AudioURL() string {

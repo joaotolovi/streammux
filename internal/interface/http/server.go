@@ -59,6 +59,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/audio.m3u8", s.handleHLSAudioPlaylist)
 	s.mux.HandleFunc("GET /mux/{jobId}/video/{segment}", s.handleHLSSegment)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
+	// ABR variant endpoints — per-plan media playlists and segments.
+	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/video/video.m3u8", s.handleHLSVariantVideoPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/audio/audio.m3u8", s.handleHLSVariantAudioPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/video/{segment}", s.handleHLSVariantSegment)
+	s.mux.HandleFunc("GET /mux/{jobId}/v{planIndex}/audio/{segment}", s.handleHLSVariantAudioSegment)
 
 	// API
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
@@ -176,6 +181,14 @@ func (s *Server) handleHLSPlaylist(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("mux playlist: %v", err)
 		writeError(w, http.StatusBadGateway, "no playable source started in time")
+		return
+	}
+
+	// Serve the ABR master playlist with all variants.
+	if data, ok := s.muxer.MasterPlaylist(job); ok {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(data)
 		return
 	}
 
@@ -336,6 +349,145 @@ func (s *Server) handleHLSAudioSegment(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, segPath)
+}
+
+// handleHLSVariantVideoPlaylist serves the video media playlist for an ABR
+// variant, starting its generation on demand.
+func (s *Server) handleHLSVariantVideoPlaylist(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid variant")
+		return
+	}
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "playlist not ready")
+		return
+	}
+	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	if err != nil {
+		log.Printf("mux variant %d: %v", planIndex, err)
+		writeError(w, http.StatusBadGateway, "variant source unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, path)
+}
+
+// handleHLSVariantAudioPlaylist serves the audio media playlist for an ABR
+// variant.
+func (s *Server) handleHLSVariantAudioPlaylist(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid variant")
+		return
+	}
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "playlist not ready")
+		return
+	}
+	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	if err != nil {
+		log.Printf("mux variant %d: %v", planIndex, err)
+		writeError(w, http.StatusBadGateway, "variant source unavailable")
+		return
+	}
+	audioPath := filepath.Join(filepath.Dir(filepath.Dir(path)), "audio", "audio.m3u8")
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, audioPath)
+}
+
+// handleHLSVariantSegment serves a video segment for an ABR variant.
+func (s *Server) handleHLSVariantSegment(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid variant")
+		return
+	}
+	segment := filepath.Base(r.PathValue("segment"))
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	var segIndex int
+	if _, err := fmt.Sscanf(segment, "seg_%05d.ts", &segIndex); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid segment")
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
+		return
+	}
+	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	if err != nil {
+		log.Printf("mux variant %d segment: %v", planIndex, err)
+		writeError(w, http.StatusBadGateway, "variant source unavailable")
+		return
+	}
+	segPath := filepath.Join(filepath.Dir(path), fmt.Sprintf("seg_%05d.ts", segIndex))
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, segPath)
+}
+
+// handleHLSVariantAudioSegment serves an audio segment for an ABR variant.
+func (s *Server) handleHLSVariantAudioSegment(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	planIndex, err := parsePlanIndex(r.PathValue("planIndex"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid variant")
+		return
+	}
+	segment := filepath.Base(r.PathValue("segment"))
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	var segIndex int
+	if _, err := fmt.Sscanf(segment, "seg_%05d.ts", &segIndex); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid segment")
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
+		return
+	}
+	path, err := s.muxer.EnsureVariant(r.Context(), job, planIndex)
+	if err != nil {
+		log.Printf("mux variant %d audio segment: %v", planIndex, err)
+		writeError(w, http.StatusBadGateway, "variant source unavailable")
+		return
+	}
+	audioDir := filepath.Join(filepath.Dir(filepath.Dir(path)), "audio")
+	segPath := filepath.Join(audioDir, fmt.Sprintf("seg_%05d.ts", segIndex))
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, segPath)
+}
+
+func parsePlanIndex(value string) (int, error) {
+	var index int
+	if _, err := fmt.Sscanf(value, "%d", &index); err != nil {
+		return 0, err
+	}
+	if index < 0 {
+		return 0, fmt.Errorf("negative plan index")
+	}
+	return index, nil
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

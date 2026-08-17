@@ -25,6 +25,10 @@ type playbackState struct {
 	cacheDir string
 	active   *generation
 	all      []*generation
+	// variants holds a generation per plan index, started on demand when the
+	// player requests that ABR variant. active is the primary (plan 0) used by
+	// the health monitor and recovery; variants are additional renditions.
+	variants map[int]*generation
 
 	starting  bool
 	startWait chan struct{}
@@ -79,6 +83,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		ctx:           ctx,
 		cancel:        cancel,
 		cacheDir:      dir,
+		variants:      make(map[int]*generation),
 		lastRequested: -1,
 		lastAccess:    time.Now(),
 	}
@@ -521,6 +526,48 @@ func (m *Muxer) tryPlans(ctx context.Context, job *model.MuxJob, state *playback
 	return nil, errors.Join(failures...)
 }
 
+// EnsureVariant starts (or reuses) the generation for the given plan index,
+// used by the ABR master playlist when the player requests a non-primary
+// variant. It returns the generation's video playlist path once the first
+// segment exists. The primary plan (0) is started by runStartup; variants are
+// started lazily here.
+func (m *Muxer) EnsureVariant(ctx context.Context, job *model.MuxJob, planIndex int) (string, error) {
+	if planIndex < 0 || planIndex >= len(job.Plans) {
+		return "", fmt.Errorf("variant plan %d out of range", planIndex)
+	}
+	state, err := m.stateFor(job)
+	if err != nil {
+		return "", err
+	}
+	state.mu.Lock()
+	if gen, ok := state.variants[planIndex]; ok {
+		path := generationVideoPlaylistPath(gen)
+		state.mu.Unlock()
+		if fileExists(path) {
+			return path, nil
+		}
+	}
+	// The primary plan is already running as state.active; reuse it.
+	if planIndex == 0 {
+		active := state.active
+		state.mu.Unlock()
+		if active != nil {
+			return generationVideoPlaylistPath(active), nil
+		}
+	}
+	state.mu.Unlock()
+
+	gen, err := m.startAttempt(ctx, job, state, planIndex, 0, false)
+	if err != nil {
+		return "", err
+	}
+	state.mu.Lock()
+	state.variants[planIndex] = gen
+	state.mu.Unlock()
+	go m.monitorGeneration(job, state, gen)
+	return generationVideoPlaylistPath(gen), nil
+}
+
 func (m *Muxer) startAttempt(parent context.Context, job *model.MuxJob, state *playbackState, planIndex, startSegment int, lenient bool) (*generation, error) {
 	plan := job.Plans[planIndex]
 	prepared, err := m.preparePlanMode(parent, job, plan, lenient)
@@ -683,6 +730,40 @@ func (m *Muxer) PlaylistPath(job *model.MuxJob) string {
 		return ""
 	}
 	return path
+}
+
+// MasterPlaylist returns the ABR master playlist advertising the top plans as
+// variants. Each variant points to a per-plan media playlist that is generated
+// on demand when the player requests it. The primary plan (0) is the default.
+func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return nil, false
+	}
+	state.mu.Lock()
+	state.lastAccess = time.Now()
+	ready := state.active != nil
+	state.mu.Unlock()
+	if !ready {
+		return nil, false
+	}
+
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:6\n")
+	// Cap the number of advertised variants to keep the master small and avoid
+	// starting too many concurrent sessions.
+	maxVariants := 4
+	if len(job.Plans) < maxVariants {
+		maxVariants = len(job.Plans)
+	}
+	for i := 0; i < maxVariants; i++ {
+		plan := job.Plans[i]
+		bw := plan.EstimatedBandwidth()
+		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, plan.Video.Parsed.Resolution))
+		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", i))
+	}
+	return []byte(b.String()), true
 }
 
 // VideoPlaylistPath returns the video-only media playlist path.
