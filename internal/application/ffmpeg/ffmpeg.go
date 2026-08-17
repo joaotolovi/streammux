@@ -366,6 +366,10 @@ func tail(s string, n int) string {
 // timeline open for the placeholder (the film takes over); the error video
 // ends naturally with ENDLIST so playback stops after it.
 func buildPlaceholderArgs(path, outputDir string, omitEndlist bool) []string {
+	preset := "veryfast"
+	if !omitEndlist {
+		preset = "ultrafast"
+	}
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
 	if omitEndlist {
@@ -380,7 +384,7 @@ func buildPlaceholderArgs(path, outputDir string, omitEndlist bool) []string {
 		"-readrate_initial_burst", fmtDuration(segDuration),
 		"-i", path,
 		"-map", "0:v:0",
-		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-c:v", "libx264", "-preset", preset, "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls",
@@ -406,7 +410,8 @@ func buildPlaceholderArgs(path, outputDir string, omitEndlist bool) []string {
 
 // StartSinglePlaceholderSession launches a local video as a live-window HLS
 // session. omitEndlist=true keeps the timeline open (placeholder handoff);
-// false lets the stream end with ENDLIST (error video).
+// false lets the stream end with ENDLIST (error video). The error video uses
+// ultrafast so it starts even under CPU contention.
 func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, omitEndlist bool) (*Session, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("placeholder session: no video provided")

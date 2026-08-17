@@ -513,6 +513,8 @@ func (m *Muxer) startupFailed(job *model.MuxJob, state *playbackState, cause err
 
 // startErrorGeneration launches the local error video continuing the current
 // timeline. atSeg < 0 continues after the live placeholder (or from 0).
+// The error video is the last resort — it is a local file, so it gets a
+// generous deadline, a second attempt, and failure logging.
 func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generation {
 	if m.errorPath == "" {
 		return nil
@@ -539,44 +541,69 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 		}
 	}
 
-	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-	session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.errorPath, dir, false)
-	if err != nil {
+	var gen *generation
+	for attempt := 0; attempt < 2; attempt++ {
+		dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
+		session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.errorPath, dir, false)
+		if err != nil {
+			log.Printf("mux: error video start (attempt %d): %v", attempt+1, err)
+			_ = os.RemoveAll(dir)
+			state.mu.Lock()
+			state.nextGeneration++
+			generationID = state.nextGeneration
+			state.mu.Unlock()
+			continue
+		}
+		candidate := &generation{
+			id:           generationID,
+			dir:          dir,
+			session:      session,
+			startSegment: start,
+			startedAt:    time.Now(),
+			isLocal:      true,
+			isError:      true,
+		}
+
+		ticker := time.NewTicker(75 * time.Millisecond)
+		deadline := time.After(20 * time.Second)
+		produced := false
+	waitLoop:
+		for {
+			if fileExists(generationSegmentPath(candidate, start)) && fileExists(generationAudioSegmentPath(candidate, start)) {
+				produced = true
+				break waitLoop
+			}
+			select {
+			case <-session.Done():
+				log.Printf("mux: error video ended before first segment (attempt %d): %v", attempt+1, session.Err())
+				break waitLoop
+			case <-deadline:
+				session.Cancel()
+				log.Printf("mux: error video timed out before first segment (attempt %d)", attempt+1)
+				break waitLoop
+			case <-ticker.C:
+			}
+		}
+		ticker.Stop()
+		if produced {
+			gen = candidate
+			break
+		}
 		_ = os.RemoveAll(dir)
+		state.mu.Lock()
+		state.nextGeneration++
+		generationID = state.nextGeneration
+		state.mu.Unlock()
+	}
+	if gen == nil {
 		return nil
 	}
-	gen := &generation{
-		id:           generationID,
-		dir:          dir,
-		session:      session,
-		startSegment: start,
-		startedAt:    time.Now(),
-		isLocal:      true,
-		isError:      true,
-	}
 
-	ticker := time.NewTicker(75 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.After(10 * time.Second)
-	for {
-		if fileExists(generationSegmentPath(gen, start)) && fileExists(generationAudioSegmentPath(gen, start)) {
-			state.mu.Lock()
-			state.all = append(state.all, gen)
-			state.errorStart = start
-			state.mu.Unlock()
-			return gen
-		}
-		select {
-		case <-session.Done():
-			_ = os.RemoveAll(dir)
-			return nil
-		case <-deadline:
-			session.Cancel()
-			_ = os.RemoveAll(dir)
-			return nil
-		case <-ticker.C:
-		}
-	}
+	state.mu.Lock()
+	state.all = append(state.all, gen)
+	state.errorStart = start
+	state.mu.Unlock()
+	return gen
 }
 
 // prepareBestPlan prepares plans sequentially (strict, then lenient) without
