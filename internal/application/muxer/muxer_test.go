@@ -336,6 +336,38 @@ func TestMasterPlaylistAdvertisesActivePlanUnderItsIndex(t *testing.T) {
 	}
 }
 
+func TestMasterPlaylistOmitsAlreadyFailedPlansAboveActive(t *testing.T) {
+	state := &playbackState{
+		active:       &generation{dir: t.TempDir(), planIndex: 2},
+		variantPlans: make(map[int]int),
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{
+		ID: "job",
+		Plans: []model.PlaybackPlan{
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "2160p"}}},
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "1080p"}}},
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "720p"}}},
+			{Video: model.CollectedStream{Parsed: model.ParsedFile{Resolution: "480p"}}},
+		},
+	}
+	data, ok := mux.MasterPlaylist(job)
+	if !ok {
+		t.Fatal("MasterPlaylist() returned false")
+	}
+	playlist := string(data)
+	// Active plan 2 (720p) is v0; only plans below it (plan 3, 480p) follow.
+	if !strings.Contains(playlist, "RESOLUTION=720p") {
+		t.Fatalf("active plan 2 missing: %s", playlist)
+	}
+	if strings.Contains(playlist, "RESOLUTION=2160p") || strings.Contains(playlist, "RESOLUTION=1080p") {
+		t.Fatalf("failed plans above active were advertised: %s", playlist)
+	}
+	if !strings.Contains(playlist, "RESOLUTION=480p") {
+		t.Fatalf("plan below active missing: %s", playlist)
+	}
+}
+
 func TestMasterPlaylistAdvertisesVariants(t *testing.T) {
 	state := &playbackState{
 		active:       &generation{dir: t.TempDir(), planIndex: 0},

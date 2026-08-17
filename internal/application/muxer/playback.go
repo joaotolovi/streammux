@@ -775,15 +775,11 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	}
 
 	// Build the list of plan indices to advertise, starting with the active
-	// plan (always v0), then remaining plans in order, capped at 4.
+	// plan (always v0), then only the plans BELOW it (higher index, lighter
+	// sources). Plans above the active one already failed during startup/
+	// recovery — re-advertising them would only retry sources that failed.
 	planIndices := []int{activePlan}
-	for i := range job.Plans {
-		if i == activePlan {
-			continue
-		}
-		if len(planIndices) >= 4 {
-			break
-		}
+	for i := activePlan + 1; i < len(job.Plans) && len(planIndices) < 4; i++ {
 		planIndices = append(planIndices, i)
 	}
 
