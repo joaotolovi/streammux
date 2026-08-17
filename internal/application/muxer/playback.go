@@ -266,6 +266,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		case <-placeholder.session.Done():
 		case <-time.After(2 * time.Second):
 		}
+		state.mu.Lock()
 		state.stitched = true
 		state.filmDuration = winner.prepared.duration
 		state.mu.Unlock()
