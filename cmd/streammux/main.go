@@ -54,7 +54,10 @@ func main() {
 	planner := planner.New()
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
-	mux := muxer.New(collector, planner, ff, res, store, baseURL)
+	mux := muxer.NewWithPlaceholder(collector, planner, ff, res, store, baseURL,
+		envOr("PLACEHOLDER_INTRO", ""),
+		envOr("PLACEHOLDER_LOOP", ""),
+	)
 	store.SetOnDelete(mux.CleanupJob)
 
 	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{

@@ -371,3 +371,115 @@ func writeMasterPlaylist(outputDir string) error {
 		"video/video.m3u8\n"
 	return os.WriteFile(filepath.Join(outputDir, "master.m3u8"), []byte(master), 0644)
 }
+
+// StartPlaceholderSession launches FFmpeg to produce a looping HLS from local
+// placeholder videos. introPath plays once, then loopPath loops forever
+// (-stream_loop -1), so the player gets immediate playback while the real film
+// is being prepared in the background. Either path may be empty; if both are
+// empty the session is not started.
+func (m *Muxer) StartPlaceholderSession(ctx context.Context, introPath, loopPath, outputDir string) (*Session, error) {
+	if strings.TrimSpace(introPath) == "" && strings.TrimSpace(loopPath) == "" {
+		return nil, fmt.Errorf("placeholder session: no placeholder video provided")
+	}
+	if strings.TrimSpace(outputDir) == "" {
+		return nil, fmt.Errorf("placeholder session: output directory is required")
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "video"), 0755); err != nil {
+		return nil, fmt.Errorf("placeholder session: video dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outputDir, "audio"), 0755); err != nil {
+		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
+	}
+	if err := writeMasterPlaylist(outputDir); err != nil {
+		return nil, err
+	}
+
+	// Build the input list and the concat filter. The intro (if any) is input 0
+	// and plays once; the loop video (if any) is the last input and loops.
+	args := []string{
+		"-nostdin",
+		"-hide_banner",
+		"-nostats",
+	}
+	inputs := []string{}
+	filter := ""
+	if introPath != "" {
+		args = append(args, "-i", introPath)
+		inputs = append(inputs, "0")
+	}
+	if loopPath != "" {
+		args = append(args, "-stream_loop", "-1", "-i", loopPath)
+		inputs = append(inputs, strconv.Itoa(len(inputs)))
+	}
+	// Build concat filter: [0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[v][a]
+	for _, in := range inputs {
+		filter += "[" + in + ":v][" + in + ":a]"
+	}
+	filter += "concat=n=" + strconv.Itoa(len(inputs)) + ":v=1:a=1[v][a]"
+	args = append(args, "-filter_complex", filter)
+
+	args = append(args,
+		"-map", "[v]",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_playlist_type", "event",
+		"-hls_flags", "independent_segments+temp_file",
+		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "video", "video.m3u8"),
+		"-map", "[a]",
+		"-c:a", "aac", "-b:a", "128k",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_playlist_type", "event",
+		"-hls_flags", "independent_segments+temp_file",
+		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "audio", "audio.m3u8"),
+	)
+
+	sessCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
+	stderr := newTailBuffer(stderrTailSize)
+	cmd.Stderr = stderr
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("placeholder progress pipe: %w", err)
+	}
+
+	s := &Session{
+		cancel:   cancel,
+		done:     make(chan struct{}),
+		progress: make(chan ProgressSample, 1),
+		startN:   0,
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("placeholder start: %w", err)
+	}
+
+	go func() {
+		parseErr := parseProgress(stdout, s.progress, time.Now)
+		if parseErr != nil {
+			_, _ = io.Copy(io.Discard, stdout)
+		}
+		waitErr := cmd.Wait()
+		if waitErr != nil {
+			if ctxErr := sessCtx.Err(); ctxErr != nil {
+				waitErr = ctxErr
+			}
+			s.setErr(ffmpegRunError(waitErr, stderr.String()))
+		} else if parseErr != nil {
+			s.setErr(ffmpegRunError(fmt.Errorf("read progress: %w", parseErr), stderr.String()))
+		}
+		cancel()
+		close(s.progress)
+		close(s.done)
+	}()
+
+	return s, nil
+}

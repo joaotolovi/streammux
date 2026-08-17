@@ -30,6 +30,12 @@ type playbackState struct {
 	startErr  error
 	directURL string
 
+	// placeholder is the generation playing the local intro/loop video while
+	// the film is prepared. placeholderStarted guards one-shot startup.
+	placeholder        *generation
+	placeholderStarted bool
+	placeholderWait    chan struct{}
+
 	recovering   bool
 	recoveryWait chan struct{}
 	recoveryErr  error
@@ -51,6 +57,9 @@ type generation struct {
 	session      *ffmpeg.Session
 	startSegment int
 	startedAt    time.Time
+	// isPlaceholder marks a generation that plays a local intro/loop video
+	// while the real film is being prepared in the background.
+	isPlaceholder bool
 }
 
 func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
@@ -77,15 +86,17 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	return state, nil
 }
 
-// EnsurePlaylist starts the bounded startup race on first access and waits only
-// for a real FFmpeg playlist containing a complete first segment.
+// EnsurePlaylist returns as soon as a playable playlist exists. If a local
+// placeholder video is configured and the real film is not ready yet, it
+// starts the placeholder immediately (so the player gets instant playback) and
+// prepares the film in the background. When the film becomes ready, the active
+// generation switches to it and the same master URL starts serving the film.
 func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	state, err := m.stateFor(job)
 	if err != nil {
 		return err
 	}
 
-	start := false
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	if state.active != nil && fileExists(generationPlaylistPath(state.active)) {
@@ -98,6 +109,49 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		state.mu.Unlock()
 		return &DirectFallbackError{URL: direct, Err: cause}
 	}
+
+	// If a placeholder is available and the film is not ready, start the
+	// placeholder now and kick off film preparation in the background.
+	if m.placeholderIntroPath != "" || m.placeholderLoopPath != "" {
+		if !state.placeholderStarted {
+			state.placeholderStarted = true
+			state.placeholderWait = make(chan struct{})
+			go m.runPlaceholder(job, state)
+		}
+		if !state.starting {
+			state.starting = true
+			state.startWait = make(chan struct{})
+			state.startErr = nil
+			go m.runStartup(job, state)
+		}
+		wait := state.placeholderWait
+		state.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wait:
+		}
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.placeholder != nil && fileExists(generationPlaylistPath(state.placeholder)) {
+			return nil
+		}
+		// Placeholder failed to start; fall through to waiting for the film.
+		if state.active != nil && fileExists(generationPlaylistPath(state.active)) {
+			return nil
+		}
+		if state.directURL != "" {
+			return &DirectFallbackError{URL: state.directURL, Err: state.startErr}
+		}
+		if state.startErr != nil {
+			return state.startErr
+		}
+		return fmt.Errorf("playback startup finished without a playable source")
+	}
+
+	// No placeholder: block until the film is ready (original behavior).
+	start := false
 	if !state.starting {
 		state.starting = true
 		state.startWait = make(chan struct{})
@@ -167,6 +221,11 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.startErr = nil
 	state.directURL = ""
 	state.lastRecovery = time.Now()
+	// If a placeholder is playing, stop it now that the film is ready.
+	if state.placeholder != nil {
+		state.placeholder.session.Cancel()
+		state.placeholder = nil
+	}
 	wait := state.startWait
 	state.mu.Unlock()
 
@@ -177,6 +236,99 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	}
 	log.Printf("mux: startup selected plan %d/%d %s (%s)", winner.planIndex+1, len(job.Plans), winner.plan.Kind, winner.plan.Video.Parsed.Resolution)
 	go m.monitorGeneration(job, state, winner)
+}
+
+// runPlaceholder starts the local intro/loop video session so the player gets
+// immediate playback while the film is prepared in the background. It writes
+// into a dedicated generation directory and closes placeholderWait once the
+// placeholder master is ready.
+func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
+	state.mu.Lock()
+	state.nextGeneration++
+	generationID := state.nextGeneration
+	state.mu.Unlock()
+
+	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		state.mu.Lock()
+		state.placeholderStarted = false
+		wait := state.placeholderWait
+		state.mu.Unlock()
+		if wait != nil {
+			close(wait)
+		}
+		log.Printf("mux: placeholder dir: %v", err)
+		return
+	}
+
+	session, err := m.ffmpeg.StartPlaceholderSession(state.ctx, m.placeholderIntroPath, m.placeholderLoopPath, dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		state.mu.Lock()
+		state.placeholderStarted = false
+		wait := state.placeholderWait
+		state.mu.Unlock()
+		if wait != nil {
+			close(wait)
+		}
+		log.Printf("mux: placeholder start: %v", err)
+		return
+	}
+
+	gen := &generation{
+		id:            generationID,
+		dir:           dir,
+		session:       session,
+		startSegment:  0,
+		startedAt:     time.Now(),
+		isPlaceholder: true,
+	}
+
+	// Wait for the first video segment to be produced before exposing it.
+	segmentPath := generationSegmentPath(gen, 0)
+	ticker := time.NewTicker(75 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(10 * time.Second)
+	for {
+		if fileExists(segmentPath) {
+			break
+		}
+		select {
+		case <-session.Done():
+			_ = os.RemoveAll(dir)
+			state.mu.Lock()
+			state.placeholderStarted = false
+			wait := state.placeholderWait
+			state.mu.Unlock()
+			if wait != nil {
+				close(wait)
+			}
+			log.Printf("mux: placeholder ended before first segment: %v", session.Err())
+			return
+		case <-deadline:
+			session.Cancel()
+			_ = os.RemoveAll(dir)
+			state.mu.Lock()
+			state.placeholderStarted = false
+			wait := state.placeholderWait
+			state.mu.Unlock()
+			if wait != nil {
+				close(wait)
+			}
+			log.Printf("mux: placeholder timed out before first segment")
+			return
+		case <-ticker.C:
+		}
+	}
+
+	state.mu.Lock()
+	state.placeholder = gen
+	wait := state.placeholderWait
+	state.mu.Unlock()
+	if wait != nil {
+		close(wait)
+	}
+	log.Printf("mux: placeholder playing (intro=%v loop=%v)", m.placeholderIntroPath != "", m.placeholderLoopPath != "")
 }
 
 // coordinateAttempts tries playback plans sequentially, one at a time, until
@@ -390,6 +542,13 @@ func (m *Muxer) PlaylistPath(job *model.MuxJob) string {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
+	// Prefer the placeholder while the film is still being prepared.
+	if state.placeholder != nil {
+		path := generationPlaylistPath(state.placeholder)
+		if fileExists(path) {
+			return path
+		}
+	}
 	if state.active == nil {
 		return ""
 	}
@@ -409,10 +568,14 @@ func (m *Muxer) VideoPlaylistPath(job *model.MuxJob) string {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
-	if state.active == nil {
+	gen := state.placeholder
+	if gen == nil {
+		gen = state.active
+	}
+	if gen == nil {
 		return ""
 	}
-	path := generationVideoPlaylistPath(state.active)
+	path := generationVideoPlaylistPath(gen)
 	if !fileExists(path) {
 		return ""
 	}
@@ -428,10 +591,14 @@ func (m *Muxer) AudioPlaylistPath(job *model.MuxJob) string {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.lastAccess = time.Now()
-	if state.active == nil {
+	gen := state.placeholder
+	if gen == nil {
+		gen = state.active
+	}
+	if gen == nil {
 		return ""
 	}
-	path := generationAudioPlaylistPath(state.active)
+	path := generationAudioPlaylistPath(gen)
 	if !fileExists(path) {
 		return ""
 	}
@@ -448,6 +615,9 @@ func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	generations := append([]*generation(nil), state.all...)
+	if state.placeholder != nil {
+		generations = append(generations, state.placeholder)
+	}
 	state.mu.Unlock()
 
 	for index := len(generations) - 1; index >= 0; index-- {
@@ -467,6 +637,9 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	generations := append([]*generation(nil), state.all...)
+	if state.placeholder != nil {
+		generations = append(generations, state.placeholder)
+	}
 	state.mu.Unlock()
 
 	for index := len(generations) - 1; index >= 0; index-- {
