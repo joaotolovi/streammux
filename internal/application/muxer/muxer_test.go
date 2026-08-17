@@ -307,7 +307,7 @@ func TestEstimatedBandwidthPrefersAdvertisedBitrate(t *testing.T) {
 	}
 }
 
-func TestMasterPlaylistLeadsWithActivePlanAfterRecovery(t *testing.T) {
+func TestMasterPlaylistAdvertisesActivePlanUnderItsIndex(t *testing.T) {
 	state := &playbackState{active: &generation{dir: t.TempDir(), planIndex: 2}}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{
@@ -323,15 +323,10 @@ func TestMasterPlaylistLeadsWithActivePlanAfterRecovery(t *testing.T) {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	// After recovery to plan 2, v0 must advertise plan 2's resolution (720p)
-	// and point to v0, not the original plan 0.
-	if !strings.Contains(playlist, "RESOLUTION=720p") {
-		t.Fatalf("master did not lead with active plan 2: %s", playlist)
-	}
-	firstVariant := strings.Index(playlist, "v0/video/video.m3u8")
-	secondVariant := strings.Index(playlist, "v1/video/video.m3u8")
-	if firstVariant < 0 || secondVariant < firstVariant {
-		t.Fatalf("master variant ordering invalid: %s", playlist)
+	// After recovery to plan 2, the active plan must be advertised under its
+	// real index (v2), so EnsureVariant(2) reuses the running session.
+	if !strings.Contains(playlist, "RESOLUTION=720p") || !strings.Contains(playlist, "v2/video/video.m3u8") {
+		t.Fatalf("master did not advertise active plan 2 under v2: %s", playlist)
 	}
 }
 

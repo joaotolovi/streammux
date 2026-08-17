@@ -28,8 +28,7 @@ type playbackState struct {
 	// variants holds a generation per plan index, started on demand when the
 	// player requests that ABR variant. active is the primary (plan 0) used by
 	// the health monitor and recovery; variants are additional renditions.
-	variants map[int]*generation
-
+	variants  map[int]*generation
 	starting  bool
 	startWait chan struct{}
 	startErr  error
@@ -763,30 +762,27 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
 
-	// The active plan is always advertised first (v0) with its real measured
-	// bitrate; remaining variants follow, ordered by their plan index, so the
-	// master stays consistent even after an internal recovery switches source.
-	type variant struct {
-		index int
-		plan  model.PlaybackPlan
+	// Advertise variants under their real plan index (v{planIndex}). This
+	// keeps the master consistent with EnsureVariant, which reuses the active
+	// generation when active.planIndex == requested index — so after an
+	// internal recovery to plan N, the player requesting vN gets the running
+	// session instead of a fresh (failing) start.
+	activeIndex := 0
+	if activePlan >= 0 {
+		activeIndex = activePlan
 	}
-	variants := []variant{{index: 0, plan: job.Plans[activePlan]}}
+	count := 0
 	for i, plan := range job.Plans {
-		if i == activePlan {
-			continue
-		}
-		if len(variants) >= 4 {
+		if count >= 4 {
 			break
 		}
-		variants = append(variants, variant{index: len(variants), plan: plan})
-	}
-	for _, v := range variants {
-		bw := int64(v.plan.EstimatedBandwidth())
-		if v.index == 0 && activeBitrate > 0 {
+		bw := int64(plan.EstimatedBandwidth())
+		if i == activeIndex && activeBitrate > 0 {
 			bw = int64(activeBitrate)
 		}
-		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, v.plan.Video.Parsed.Resolution))
-		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", v.index))
+		b.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%s\n", bw, plan.Video.Parsed.Resolution))
+		b.WriteString(fmt.Sprintf("v%d/video/video.m3u8\n", i))
+		count++
 	}
 	return []byte(b.String()), true
 }
