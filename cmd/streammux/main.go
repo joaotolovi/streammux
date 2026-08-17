@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/streammux/streammux/internal/application/assets"
 	"github.com/streammux/streammux/internal/application/collector"
 	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/application/muxer"
@@ -54,11 +55,23 @@ func main() {
 	planner := planner.New()
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
-	mux := muxer.NewWithPlaceholder(collector, planner, ff, res, store, baseURL,
-		envOr("PLACEHOLDER_INTRO", ""),
-		envOr("PLACEHOLDER_LOOP", ""),
-	)
+
+	// Placeholder videos: env vars override the embedded defaults.
+	introPath := envOr("PLACEHOLDER_INTRO", "")
+	loopPath := envOr("PLACEHOLDER_LOOP", "")
+	assetsDir := ""
+	if introPath == "" && loopPath == "" {
+		var err error
+		introPath, loopPath, assetsDir, err = assets.PlaceholderPaths()
+		if err != nil {
+			log.Fatalf("placeholder assets: %v", err)
+		}
+	}
+	mux := muxer.NewWithPlaceholder(collector, planner, ff, res, store, baseURL, introPath, loopPath)
 	store.SetOnDelete(mux.CleanupJob)
+	if assetsDir != "" {
+		defer os.RemoveAll(assetsDir)
+	}
 
 	srv := streammuxhttp.New(users, store, mux, streammuxhttp.Options{
 		BaseURL: baseURL,
