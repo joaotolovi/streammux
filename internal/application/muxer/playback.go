@@ -954,9 +954,13 @@ func buildVodPlaylist(filmDuration float64) ([]byte, bool) {
 	if filmDuration <= 0 {
 		return nil, false
 	}
-	segDur := ffmpeg.SegDuration()
-	if segDur <= 0 {
-		segDur = 4.0
+	// Don't pad to full duration: film is still encoding and virtual
+	// segments would 404 when the player tries to fetch them. Return
+	// the live playlist and let the timeline grow as segments arrive.
+	return raw, true
+	_ = filmDuration
+	if filmDuration <= 0 {
+		return raw, true
 	}
 	segs := computeEqualLengthSegments(segDur, filmDuration)
 	if len(segs) == 0 {
