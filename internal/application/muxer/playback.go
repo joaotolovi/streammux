@@ -721,31 +721,27 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 		}
 	}
 
-	// Wait for a minimum buffer before handing off from the placeholder, so
-	// the first bandwidth dip doesn't immediately stall playback. Skipped on
-	// seeks/recovery: the player is already waiting on a loading screen and
-	// the first segment must go out as soon as it exists.
+	// Wait for a minimum buffer before handing off, so the first bandwidth
+	// dip doesn't immediately stall playback.
 	segDur := ffmpeg.SegDuration()
 	if segDur <= 0 {
 		segDur = 4.0
 	}
-	if m.placeholderPath != "" && state.placeholder != nil {
-		minSegs := int(math.Ceil(m.policy.MinHandoffBuffer.Seconds() / segDur))
-		for produced := 1; produced < minSegs; {
-			highest := highestCompleteSegment(generation.dir)
-			if highest >= 0 && highest-startNumber+1 >= minSegs {
-				break
-			}
-			select {
-			case <-attemptCtx.Done():
-				// Timeout while buffering: proceed with what we have rather than
-				// killing the session — some content is better than none.
-				return generation, nil
-			case <-session.Done():
-				// Session ended while buffering: proceed with what we have.
-				return generation, nil
-			case <-ticker.C:
-			}
+	minSegs := int(math.Ceil(m.policy.MinHandoffBuffer.Seconds() / segDur))
+	for produced := 1; produced < minSegs; {
+		highest := highestCompleteSegment(generation.dir)
+		if highest >= 0 && highest-startNumber+1 >= minSegs {
+			break
+		}
+		select {
+		case <-attemptCtx.Done():
+			// Timeout while buffering: proceed with what we have rather than
+			// killing the session — some content is better than none.
+			return generation, nil
+		case <-session.Done():
+			// Session ended while buffering: proceed with what we have.
+			return generation, nil
+		case <-ticker.C:
 		}
 	}
 
