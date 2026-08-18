@@ -389,7 +389,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		prepCancel()
 		if err != nil {
 			lastErr = err
-			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.idx, candidate.audio.idx, err)
+			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.videoPos, candidate.audio.audioPos, err)
 			state.mu.Lock()
 			comp.fail(candidate, cls, err)
 			state.mu.Unlock()
@@ -755,8 +755,8 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		prepared, cls, err := m.prepareComposition(prepCtx, job, candidate)
 		prepCancel()
 		if err != nil {
-			failures = append(failures, fmt.Errorf("video#%d/audio#%d: %w", candidate.video.idx, candidate.audio.idx, err))
-			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.idx, candidate.audio.idx, err)
+			failures = append(failures, fmt.Errorf("video#%d/audio#%d: %w", candidate.video.videoPos, candidate.audio.audioPos, err))
+			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.videoPos, candidate.audio.audioPos, err)
 			state.mu.Lock()
 			comp.fail(candidate, cls, err)
 			state.mu.Unlock()
@@ -774,7 +774,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		if err == nil {
 			return gen, nil
 		}
-		failures = append(failures, fmt.Errorf("video#%d/audio#%d launch: %w", candidate.video.idx, candidate.audio.idx, err))
+		failures = append(failures, fmt.Errorf("video#%d/audio#%d launch: %w", candidate.video.videoPos, candidate.audio.audioPos, err))
 		log.Printf("mux: composition %d launch failed: %v", candidate.ordinal, err)
 		state.mu.Lock()
 		comp.fail(candidate, failLaunch, err)

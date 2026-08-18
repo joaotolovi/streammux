@@ -22,7 +22,10 @@ import (
 
 type sourceState struct {
 	stream model.CollectedStream
-	idx    int // position in its queue, used for logging
+	// Positions in each queue (a source can appear in both via the shared
+	// ledger, so they are tracked separately).
+	videoPos int
+	audioPos int
 
 	url       string
 	probe     *ffmpeg.ProbeResult
@@ -134,18 +137,13 @@ func newComposer(job *model.MuxJob) *composer {
 		}
 		return audioRoleRank(a.AddonRole) < audioRoleRank(b.AddonRole)
 	})
-	for i, s := range c.videos {
-		s.idx = i
+	// Set positions separately for each queue — a source can appear in both
+	// (shared ledger) so a single idx field would be overwritten.
+	for i := range c.videos {
+		c.videos[i].videoPos = i
 	}
-	for i, s := range c.audios {
-		s.idx = i
-	}
-	log.Printf("mux: composer videos=%d audios=%d", len(c.videos), len(c.audios))
-	for i, s := range c.videos {
-		s.idx = i
-	}
-	for i, s := range c.audios {
-		s.idx = i
+	for i := range c.audios {
+		c.audios[i].audioPos = i
 	}
 	log.Printf("mux: composer videos=%d audios=%d", len(c.videos), len(c.audios))
 	for i, s := range c.videos {
@@ -272,7 +270,7 @@ func (c *composer) acquire() *composition {
 		}
 		c.lastKey = key
 		c.nextOrd++
-		log.Printf("mux: acquire vi=%d ai=%d -> video#%d(score=%d) audio#%d(score=%d) single=%v key=%s", c.vi, c.ai, v.idx, analyzer.VideoScore(v.stream), a.idx, analyzer.AudioScore(a.stream), a == v, key[:min(60, len(key))])
+		log.Printf("mux: acquire vi=%d ai=%d -> video#%d(score=%d) audio#%d(score=%d) single=%v key=%s", c.vi, c.ai, v.videoPos, analyzer.VideoScore(v.stream), a.audioPos, analyzer.AudioScore(a.stream), a == v, key[:min(60, len(key))])
 		return &composition{video: v, audio: a, single: false, lenient: c.lenient, ordinal: c.nextOrd}
 	}
 }
@@ -408,8 +406,8 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 		audioMode:       ffmpeg.AudioModeCopy,
 		duration:        comp.video.probe.Duration,
 		videoBitrate:    comp.video.probe.VideoBitrate,
-		videoIdx:        comp.video.idx,
-		audioIdx:        comp.audio.idx,
+		videoIdx:        comp.video.videoPos,
+		audioIdx:        comp.audio.audioPos,
 	}
 	if len(comp.video.probe.VideoStreams) > 0 {
 		prepared.videoWidth = comp.video.probe.VideoStreams[0].Width
@@ -453,7 +451,7 @@ func (m *Muxer) ensureVideoSource(ctx context.Context, job *model.MuxJob, s *sou
 		if err != nil {
 			s.failed = true
 			s.failErr = err
-			log.Printf("mux: video source resolve failed (video#%d): %v", s.idx, err)
+			log.Printf("mux: video source resolve failed (video#%d): %v", s.videoPos, err)
 			return err
 		}
 		s.url = url
@@ -463,7 +461,7 @@ func (m *Muxer) ensureVideoSource(ctx context.Context, job *model.MuxJob, s *sou
 		if err != nil {
 			s.failed = true
 			s.failErr = err
-			log.Printf("mux: video source probe failed (video#%d): %v", s.idx, err)
+			log.Printf("mux: video source probe failed (video#%d): %v", s.videoPos, err)
 			return err
 		}
 		s.probe = probe
