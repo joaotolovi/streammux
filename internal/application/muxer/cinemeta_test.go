@@ -57,3 +57,45 @@ func TestFetchPosterRequiresContentTypeAndID(t *testing.T) {
 		t.Error("expected error for missing content id")
 	}
 }
+
+func TestFetchPosterStripsEpisodeSuffixForSeries(t *testing.T) {
+	var receivedPath string
+	posterData := []byte("fake-poster")
+
+	posterServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(posterData)
+	}))
+	defer posterServer.Close()
+
+	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"meta":{"poster":"` + posterServer.URL + `/poster.jpg"}}`))
+	}))
+	defer metaServer.Close()
+
+	oldBase := cinemetaBaseURL
+	cinemetaBaseURL = metaServer.URL
+	defer func() { cinemetaBaseURL = oldBase }()
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "poster.jpg")
+
+	// Use a series episode ID with :season:episode suffix.
+	if err := fetchPoster(context.Background(), metaServer.Client(), "series", "tt14681924:1:1", dest); err != nil {
+		t.Fatalf("fetchPoster() error = %v", err)
+	}
+
+	// The Cinemeta URL should use just the IMDB ID without the episode suffix.
+	if receivedPath != "/meta/series/tt14681924.json" {
+		t.Fatalf("expected /meta/series/tt14681924.json, got %s", receivedPath)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("poster file not written: %v", err)
+	}
+	if string(got) != string(posterData) {
+		t.Fatalf("poster data mismatch")
+	}
+}

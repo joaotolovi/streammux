@@ -28,16 +28,26 @@ type cinemetaMeta struct {
 // simply check whether the file was created.
 func fetchPoster(ctx context.Context, client *http.Client, contentType, contentID, destPath string) error {
 	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+		client = &http.Client{Timeout: 10 * time.Second}
 	}
 
 	if contentType == "" || contentID == "" {
 		return fmt.Errorf("missing content type or id")
 	}
 
-	url := fmt.Sprintf("%s/meta/%s/%s.json", cinemetaBaseURL, contentType, contentID)
+	// For series episodes the Stremio content ID includes :season:episode
+	// (e.g. tt14681924:1:1), but the Cinemeta meta API only knows the show
+	// level. Strip the episode suffix so we query the series poster.
+	cinemetaID := contentID
+	if contentType == "series" {
+		if idx := strings.Index(cinemetaID, ":"); idx > 0 {
+			cinemetaID = cinemetaID[:idx]
+		}
+	}
 
-	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	url := fmt.Sprintf("%s/meta/%s/%s.json", cinemetaBaseURL, contentType, cinemetaID)
+
+	reqCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
