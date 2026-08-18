@@ -207,25 +207,36 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		audioInput = 1
 	}
 
-	hlsFlags := "independent_segments+temp_file"
-	if spec.StartSegment > 0 {
-		hlsFlags += "+discont_start"
+	// Video-only rendition. After a seek (-ss > 0) the video is split by time
+	// as well: with stream copy the first segment would otherwise stretch to
+	// the next keyframe (a whole GOP, ~10s) while audio splits exactly at
+	// hls_time, permanently misaligning the two renditions. split_by_time
+	// keeps both renditions on the same 4s grid; the first post-seek segment
+	// may start mid-GOP (players decode from its first keyframe).
+	videoFlags := "independent_segments+temp_file"
+	if spec.StartTime > 0 {
+		videoFlags = "temp_file+split_by_time+discont_start"
+	} else if spec.StartSegment > 0 {
+		videoFlags += "+discont_start"
 	}
-
-	// Video-only rendition.
 	args = append(args,
 		"-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex),
 		"-c:v", "copy",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
 		"-hls_playlist_type", "event",
-		"-hls_flags", hlsFlags,
+		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "video", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),
 		filepath.Join(spec.OutputDir, "video", "video.m3u8"),
 	)
 
-	// Audio-only rendition.
+	// Audio-only rendition: split_by_time keeps it on the exact 4s grid
+	// (audio frames are dense, cutting anywhere is safe).
+	audioFlags := "independent_segments+temp_file+split_by_time"
+	if spec.StartSegment > 0 {
+		audioFlags += "+discont_start"
+	}
 	args = append(args,
 		"-map", fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex),
 		"-c:a", string(audioMode),
@@ -243,7 +254,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
 		"-hls_playlist_type", "event",
-		"-hls_flags", hlsFlags,
+		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),
 		filepath.Join(spec.OutputDir, "audio", "audio.m3u8"),

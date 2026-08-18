@@ -37,7 +37,7 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		{"-metadata:s:a:0", "language=por"},
 		{"-disposition:a:0", "default"},
 		{"-metadata:s:a:0", "title=Português"},
-		{"-hls_flags", "independent_segments+temp_file+discont_start"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start"},
 		{"-hls_segment_filename", "/tmp/session/video/seg_%05d.ts"},
 		{"-hls_segment_filename", "/tmp/session/audio/seg_%05d.ts"},
 		{"/tmp/session/video/video.m3u8"},
@@ -76,7 +76,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
 		{"-c:a", "aac"},
-		{"-hls_flags", "independent_segments+temp_file+discont_start"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start"},
 		{"/tmp/dual/video/video.m3u8"},
 		{"/tmp/dual/audio/audio.m3u8"},
 	} {
@@ -141,4 +141,44 @@ func containsArguments(args, sequence []string) bool {
 		}
 	}
 	return false
+}
+
+func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
+	// StartTime 0 = fresh start: the video keeps independent_segments (split
+	// on keyframes); only seeks switch to split_by_time.
+	spec := SessionSpec{
+		VideoURL:        "https://example.test/media.mkv",
+		VideoTrackIndex: 0,
+		AudioTrackIndex: 0,
+		OutputDir:       "/tmp/fresh",
+	}
+	got, err := buildSessionArgs(spec)
+	if err != nil {
+		t.Fatalf("buildSessionArgs() error = %v", err)
+	}
+	videoFlags := flagsFor(got, "/tmp/fresh/video/video.m3u8")
+	audioFlags := flagsFor(got, "/tmp/fresh/audio/audio.m3u8")
+	if videoFlags != "independent_segments+temp_file" {
+		t.Fatalf("fresh video flags = %q, want independent_segments+temp_file", videoFlags)
+	}
+	if audioFlags != "independent_segments+temp_file+split_by_time" {
+		t.Fatalf("audio flags = %q, want split_by_time grid", audioFlags)
+	}
+}
+
+func flagsFor(args []string, playlist string) string {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "-hls_flags" {
+			// associate flags with the following playlist path
+			for j := i + 2; j < len(args); j++ {
+				if args[j] == playlist {
+					return args[i+1]
+				}
+				if args[j] == "-hls_flags" {
+					break
+				}
+			}
+		}
+	}
+	return ""
 }
