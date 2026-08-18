@@ -272,6 +272,7 @@ func (c *composer) acquire() *composition {
 		}
 		c.lastKey = key
 		c.nextOrd++
+		log.Printf("mux: acquire vi=%d ai=%d -> video#%d audio#%d single=%v", c.vi, c.ai, v.idx, a.idx, a == v)
 		return &composition{video: v, audio: a, single: false, lenient: c.lenient, ordinal: c.nextOrd}
 	}
 }
