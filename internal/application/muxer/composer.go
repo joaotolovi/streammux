@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"strings"
 
@@ -150,34 +151,55 @@ func newComposer(job *model.MuxJob) *composer {
 		c.audios[i].audioPos = i
 	}
 
-	// Rank every possible composition by combined quality: the mission is
-	// the best video+audio pair, whether single or dual. A small single
-	// bonus breaks ties (one connection, no sync risk, no mismatch).
+	// Rank every possible composition by combined quality using the geometric
+	// mean: √(VideoScore × EffectiveAudioScore) + single bonus. The geometric
+	// mean ensures "best video AND best audio" — a great video with garbage
+	// audio scores low, unlike an additive sum where one side dominates.
+	// EffectiveAudioScore weights the raw AudioScore by the language
+	// confidence: an uncertain-language audio is nearly worthless because it
+	// may not be in the user's language at all.
 	c.incompatible = map[string]bool{}
-	singleBonus := 15
-	scores := map[string]int{}
+	singleBonus := 15.0
 	type rankedEntry struct {
 		comp  *composition
-		score int
+		score float64
 	}
 	var entries []rankedEntry
 	for _, v := range c.videos {
 		for _, a := range c.audios {
-			single := v == a
-			if single {
-				comp := &composition{video: v, audio: a, single: true}
-				entries = append(entries, rankedEntry{comp, analyzer.VideoScore(v.stream) + analyzer.AudioScore(a.stream) + singleBonus})
-				continue
+			vs := float64(analyzer.VideoScore(v.stream))
+			as := float64(analyzer.AudioScore(a.stream))
+			// Language confidence multiplier: only sources with real evidence
+			// of the target language keep their audio score; weak-evidence
+			// sources (only the addon's self-reported language) are nearly
+			// zeroed — they may be any language.
+			conf := audioConfidence(a.stream, job.TargetLanguage)
+			switch conf {
+			case 3:
+				as *= 1.0
+			case 2:
+				as *= 0.7
+			default:
+				as *= 0.05
 			}
-			comp := &composition{video: v, audio: a, single: false}
-			entries = append(entries, rankedEntry{comp, analyzer.VideoScore(v.stream) + analyzer.AudioScore(a.stream)})
+			single := v == a
+			var combined float64
+			if vs <= 0 || as <= 0 {
+				combined = 0
+			} else {
+				combined = math.Sqrt(vs * as)
+			}
+			if single {
+				combined += singleBonus
+			}
+			comp := &composition{video: v, audio: a, single: single}
+			entries = append(entries, rankedEntry{comp, combined})
 		}
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
 	for i, e := range entries {
 		e.comp.ordinal = i + 1
 		c.ranked = append(c.ranked, e.comp)
-		scores[c.compositionKey(e.comp)] = e.score
 	}
 
 	log.Printf("mux: composer videos=%d audios=%d compositions=%d", len(c.videos), len(c.audios), len(c.ranked))
@@ -188,11 +210,14 @@ func newComposer(job *model.MuxJob) *composer {
 		log.Printf("mux:   audio#%d conf=%d score=%d key=%s", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), s.stream.SourceKey())
 	}
 	for i, comp := range c.ranked {
-		if i >= 6 {
-			log.Printf("mux:   ... %d more", len(c.ranked)-6)
+		if i >= 8 {
+			log.Printf("mux:   ... %d more", len(c.ranked)-8)
 			break
 		}
-		log.Printf("mux:   rank#%d score=%d video#%d audio#%d single=%v", comp.ordinal, scores[c.compositionKey(comp)], comp.video.videoPos, comp.audio.audioPos, comp.single)
+		vs := analyzer.VideoScore(comp.video.stream)
+		as := analyzer.AudioScore(comp.audio.stream)
+		conf := audioConfidence(comp.audio.stream, job.TargetLanguage)
+		log.Printf("mux:   rank#%d video#%d(=%d) audio#%d(=%d,conf=%d) single=%v", comp.ordinal, comp.video.videoPos, vs, comp.audio.audioPos, as, conf, comp.single)
 	}
 	return c
 }
