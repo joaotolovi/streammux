@@ -402,8 +402,9 @@ func targetAudioTrackStrict(tracks []ffmpeg.AudioTrack, targetLanguage string, s
 
 	// A source identified as dubbed with a single audio track is used as-is:
 	// with only one track there is nothing else to select, so the tag (or lack
-	// of one) is irrelevant.
-	if len(tracks) == 1 && analyzer.MatchesLanguage(source, targetLanguage) {
+	// of one) is irrelevant — but only when the source is explicitly dubbed
+	// (IsDubbed), not merely "Dual Audio" which may be any language.
+	if len(tracks) == 1 && source.IsDubbed && source.Language == targetLanguage {
 		return tracks[0].Index
 	}
 

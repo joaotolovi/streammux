@@ -352,6 +352,22 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 // otherwise static timeline.
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	deadline := time.Now().Add(m.policy.StartupTimeout)
+
+	// If a placeholder is configured, wait for it to be playing before
+	// preparing film sources — otherwise the film can be ready before the
+	// placeholder even starts, and the user never sees the intro.
+	if m.placeholderPath != "" {
+		state.mu.Lock()
+		phWait := state.placeholderWait
+		state.mu.Unlock()
+		if phWait != nil {
+			select {
+			case <-phWait:
+			case <-state.ctx.Done():
+			}
+		}
+	}
+
 	comp := m.composerFor(job, state)
 
 	var winner *generation

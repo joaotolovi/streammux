@@ -113,6 +113,10 @@ func newComposer(job *model.MuxJob) *composer {
 	})
 	sort.SliceStable(c.audios, func(i, j int) bool {
 		a, b := c.audios[i].stream, c.audios[j].stream
+		ai, aj := audioConfidence(a, job.TargetLanguage), audioConfidence(b, job.TargetLanguage)
+		if ai != aj {
+			return ai > aj
+		}
 		if analyzer.AudioScore(a) != analyzer.AudioScore(b) {
 			return analyzer.AudioScore(a) > analyzer.AudioScore(b)
 		}
@@ -125,6 +129,38 @@ func newComposer(job *model.MuxJob) *composer {
 		s.idx = i
 	}
 	return c
+}
+
+// audioConfidence scores how trustworthy a source's target-language claim is
+// before probing. Sources with explicit evidence (PTBR in the filename, an
+// explicit dubbed language, or "Portuguese (Brazil)" in parsed languages)
+// rank highest; sources that only match via the addon's self-reported
+// language or a generic "Dual Audio" tag rank lowest — they may still be the
+// right language but are tried last.
+func audioConfidence(s model.CollectedStream, target string) int {
+	// Explicit: the parsed filename languages include the target.
+	for _, lang := range s.Parsed.Languages {
+		if lang == target || lang == "Portuguese" && target == "Portuguese (Brazil)" || lang == "Portuguese (Brazil)" && target == "Portuguese" {
+			return 3
+		}
+	}
+	// Strong: the source is explicitly dubbed in the target language.
+	if s.IsDubbed && s.Language == target {
+		return 2
+	}
+	// Weak: only the addon says so, or "Dual Audio" without a specific language.
+	if s.AddonLanguage == target {
+		return 1
+	}
+	if s.IsDubbed && s.Language == "Dual Audio" {
+		return 1
+	}
+	for _, lang := range s.Parsed.Languages {
+		if lang == "Dual Audio" {
+			return 1
+		}
+	}
+	return 0
 }
 
 func videoRoleRank(role string) int {
