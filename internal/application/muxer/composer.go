@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 
 	"github.com/streammux/streammux/internal/application/analyzer"
 	"github.com/streammux/streammux/internal/application/ffmpeg"
@@ -138,17 +139,15 @@ func newComposer(job *model.MuxJob) *composer {
 // language or a generic "Dual Audio" tag rank lowest — they may still be the
 // right language but are tried last.
 func audioConfidence(s model.CollectedStream, target string) int {
-	// Explicit: the parsed filename languages include the target.
+	targetShort := strings.TrimSpace(strings.SplitN(target, " ", 2)[0])
 	for _, lang := range s.Parsed.Languages {
-		if lang == target || lang == "Portuguese" && target == "Portuguese (Brazil)" || lang == "Portuguese (Brazil)" && target == "Portuguese" {
+		if lang == target || strings.HasPrefix(lang, targetShort) || strings.HasPrefix(target, lang) {
 			return 3
 		}
 	}
-	// Strong: the source is explicitly dubbed in the target language.
 	if s.IsDubbed && s.Language == target {
 		return 2
 	}
-	// Weak: only the addon says so, or "Dual Audio" without a specific language.
 	if s.AddonLanguage == target {
 		return 1
 	}
