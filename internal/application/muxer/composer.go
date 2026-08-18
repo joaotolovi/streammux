@@ -99,8 +99,15 @@ func newComposer(job *model.MuxJob) *composer {
 		if plan.HasTargetAudio {
 			ak := plan.Audio.SourceKey()
 			if ak != "" && !seenAudio[ak] {
-				seenAudio[ak] = true
-				c.audios = append(c.audios, getState(plan.Audio))
+				// Only include sources with at least strong evidence of the
+				// target language. Sources that only match via the addon's
+				// self-reported language (confidence 1) are not trusted as
+				// audio candidates — they may be any language and are better
+				// served as subtitled fallback.
+				if audioConfidence(plan.Audio, job.TargetLanguage) >= 2 {
+					seenAudio[ak] = true
+					c.audios = append(c.audios, getState(plan.Audio))
+				}
 			}
 		}
 	}
@@ -128,6 +135,20 @@ func newComposer(job *model.MuxJob) *composer {
 	}
 	for i, s := range c.audios {
 		s.idx = i
+	}
+	log.Printf("mux: composer videos=%d audios=%d", len(c.videos), len(c.audios))
+	for i, s := range c.videos {
+		s.idx = i
+	}
+	for i, s := range c.audios {
+		s.idx = i
+	}
+	log.Printf("mux: composer videos=%d audios=%d", len(c.videos), len(c.audios))
+	for i, s := range c.videos {
+		log.Printf("mux:   video#%d score=%d key=%s", i, analyzer.VideoScore(s.stream), s.stream.SourceKey())
+	}
+	for i, s := range c.audios {
+		log.Printf("mux:   audio#%d conf=%d score=%d key=%s", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), s.stream.SourceKey())
 	}
 	return c
 }
