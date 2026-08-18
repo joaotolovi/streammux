@@ -65,8 +65,10 @@ func TestShiftExprPosterStopsAtEndX(t *testing.T) {
 	if !strings.Contains(expr, "gt(t,2.50)") {
 		t.Fatalf("expected gt(t,2.50) in expression, got %s", expr)
 	}
-	if !strings.Contains(expr, "min(947") {
-		t.Fatalf("expected min(947,...) to clamp at endX, got %s", expr)
+	// Must use max() not min() so the poster can start at 1280 (above endX)
+	// and slide down to 947, then clamp there.
+	if !strings.Contains(expr, "max(947") {
+		t.Fatalf("expected max(947,...) to clamp at endX, got %s", expr)
 	}
 }
 

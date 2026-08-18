@@ -502,8 +502,9 @@ func shiftExpr(startT, duration float64, distance, speed float64, reverse bool, 
 	startX := 1280
 	if reverse {
 		// Poster: starts at 1280 (off-screen right), slides left to endX,
-		// then clamps at endX via min().
-		return fmt.Sprintf("if(gt(t,%.2f),min(%d,%d-(t-%.2f)*%.0f),%d)", startT, endX, startX, startT, speed, startX)
+		// then clamps at endX via max() so it never goes past endX to the
+		// left. max(947, 1280)=1280 at start, max(947, 947)=947 at end.
+		return fmt.Sprintf("if(gt(t,%.2f),max(%d,%d-(t-%.2f)*%.0f),%d)", startT, endX, startX, startT, speed, startX)
 	}
 	// Video: starts at 0, shifts left to endX (negative), then clamps via max().
 	return fmt.Sprintf("if(gt(t,%.2f),max(%d,-(t-%.2f)*%.0f),0)", startT, endX, startT, speed)
