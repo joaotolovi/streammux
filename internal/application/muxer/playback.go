@@ -1279,7 +1279,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				}
 			default:
 				if (segment < active.startSegment || isForwardSeek(maxReq, segment, highest, active.startSegment)) && !recovering {
-					m.ensureRecovery(job, state, segment, "seek")
+					m.fastSeek(job, state, active, segment)
 				}
 			}
 		} else {
@@ -1305,6 +1305,73 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			}
 		}
 	}
+}
+
+// fastSeek relaunches the SAME sources at the requested offset — no composer
+// walk, no revalidation, no sync re-estimation. The CDN URL supports range
+// requests, so a fresh ffmpeg with -ss starts producing at the target in
+// seconds. Falls back to a full recovery if the relaunch fails. The new
+// generation is registered as active immediately (after its first segment),
+// so pending and future requests for the target segment find it.
+func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generation, targetSegment int) {
+	state.mu.Lock()
+	if state.recovering || state.closed || state.active != old {
+		state.mu.Unlock()
+		return
+	}
+	state.recovering = true
+	state.recoveryWait = make(chan struct{})
+	state.recoveryErr = nil
+	// Hold requests at the target; the seeker session is coming.
+	state.lastRequested = targetSegment
+	if targetSegment > state.maxRequested {
+		state.maxRequested = targetSegment
+	}
+	state.mu.Unlock()
+
+	go func() {
+		base := 0
+		state.mu.Lock()
+		base = state.filmBase
+		state.mu.Unlock()
+		startTime := float64(targetSegment-base) * ffmpeg.SegDuration()
+		if startTime < 0 {
+			startTime = 0
+		}
+
+		log.Printf("mux: fast seek to segment %d (%.0fs) with the active sources", targetSegment, startTime)
+		gen, err := m.launchGeneration(job, state, old.planIndex, old.prepared, targetSegment, startTime)
+
+		state.mu.Lock()
+		wait := state.recoveryWait
+		if err == nil && !state.closed {
+			if old != gen && old.planIndex != gen.planIndex {
+				state.discontinuities = append(state.discontinuities, targetSegment)
+			}
+			state.active = gen
+			state.all = append(state.all, gen)
+			state.lastRecovery = time.Now()
+		} else {
+			state.recoveryErr = err
+		}
+		state.recovering = false
+		state.recoveryWait = nil
+		state.mu.Unlock()
+		if wait != nil {
+			close(wait)
+		}
+
+		if err != nil {
+			log.Printf("mux: fast seek failed (%v); falling back to full recovery", err)
+			m.ensureRecovery(job, state, targetSegment, "seek fallback")
+			return
+		}
+		if old != gen {
+			old.session.Cancel()
+		}
+		log.Printf("mux: fast seek landed on segment %d", targetSegment)
+		go m.monitorGeneration(job, state, gen)
+	}()
 }
 
 func (m *Muxer) ensureRecovery(job *model.MuxJob, state *playbackState, startSegment int, reason string) {
