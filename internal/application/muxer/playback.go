@@ -522,10 +522,10 @@ func (m *Muxer) startupFailed(job *model.MuxJob, state *playbackState, cause err
 	log.Printf("mux: startup failed (retry after cooldown resumes from remaining sources): %v", cause)
 }
 
-// startErrorGeneration launches the local error video continuing the current
-// timeline. atSeg < 0 continues after the live placeholder (or from 0).
-// The error video is the last resort — it is a local file, so it gets a
-// generous deadline, a second attempt, and failure logging.
+// startErrorGeneration launches the local error video. The error video is
+// short VOD content, so it always numbers from segment 0 — start_number > its
+// content length would produce no segments at all. The placeholder (if any)
+// is retired and the public timeline resets with a DISCONTINUITY.
 func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generation {
 	if m.errorPath == "" {
 		return nil
@@ -537,20 +537,15 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 	ph := state.placeholder
 	state.mu.Unlock()
 
-	start := atSeg
-	if start < 0 {
-		start = 0
-		if ph != nil {
-			if common := lastCommonSegment(ph); common >= 0 {
-				start = common + 1
-			}
-			ph.session.Cancel()
-			state.mu.Lock()
-			state.placeholder = nil
-			state.retiredPlaceholder = ph
-			state.mu.Unlock()
-		}
+	if ph != nil {
+		ph.session.Cancel()
+		state.mu.Lock()
+		state.placeholder = nil
+		state.retiredPlaceholder = ph
+		state.mu.Unlock()
 	}
+	start := 0
+	_ = atSeg // accepted for API symmetry; the error video resets the timeline
 
 	var gen *generation
 	for attempt := 0; attempt < 2; attempt++ {

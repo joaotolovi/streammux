@@ -316,6 +316,7 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 	if track < 0 {
 		return nil, failAudio, fmt.Errorf("source has no confirmed %s audio track", job.TargetLanguage)
 	}
+	log.Printf("mux: composition %d selected audio track a:%d (of %d tracks) from %s", comp.ordinal, track, len(audio.probe.AudioTracks), audio.stream.SourceKey())
 
 	if comp.video.probe.Duration <= 0 {
 		return nil, failVideo, fmt.Errorf("video source has no probeable duration")
