@@ -635,7 +635,14 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 // for its first segment. startNumber is the first public segment written;
 // startTime is the content offset in seconds (0 for a fresh start).
 func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIndex int, prepared *preparedPlan, startNumber int, startTime float64) (*generation, error) {
-	attemptCtx, cancel := context.WithTimeout(state.ctx, m.policy.AttemptTimeout)
+	// Seeks do a remote input seek on a large file (MKV cues, byte-range
+	// request to the debrid), which can take much longer than a fresh start
+	// before the first segment appears.
+	attemptBudget := m.policy.AttemptTimeout
+	if startTime > 0 {
+		attemptBudget = m.policy.StartupTimeout
+	}
+	attemptCtx, cancel := context.WithTimeout(state.ctx, attemptBudget)
 	defer cancel()
 
 	state.mu.Lock()
@@ -758,9 +765,12 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		if gen, err := m.launchGeneration(job, state, prefer.planIndex, prefer.prepared, startSegment, startTime); err == nil {
 			return gen, nil
 		} else {
-			// Same sources failed to relaunch: drop them from the ledger.
 			log.Printf("mux: preferred sources failed to relaunch: %v", err)
-			m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
+			// A deadline is usually the slow remote input seek, not a dead
+			// source: keep the source available for other pairings.
+			if !errors.Is(err, context.DeadlineExceeded) {
+				m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
+			}
 		}
 	}
 
@@ -1477,12 +1487,16 @@ func (m *Muxer) reapIdleSessions() {
 
 		for _, state := range states {
 			state.mu.Lock()
-			if state.active != nil && now.Sub(state.lastAccess) > m.policy.IdleTimeout {
-				active := state.active
-				state.active = nil
-				state.mu.Unlock()
-				active.session.Cancel()
-				continue
+			// Never reap while a recovery/seek is in flight (the player may be
+			// quiet during a long seek) or the placeholder is still live.
+			if (state.active != nil || state.placeholder != nil) && now.Sub(state.lastAccess) > m.policy.IdleTimeout && !state.recovering {
+				if state.active != nil {
+					active := state.active
+					state.active = nil
+					state.mu.Unlock()
+					active.session.Cancel()
+					continue
+				}
 			}
 			state.mu.Unlock()
 		}

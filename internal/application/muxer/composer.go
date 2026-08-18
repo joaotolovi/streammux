@@ -2,6 +2,7 @@ package muxer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -368,9 +369,13 @@ func (c *composer) fail(comp *composition, class failClass, err error) {
 		}
 		c.cursor++
 	case failLaunch:
-		// The ffmpeg session died: blame the heavier side (video).
-		comp.video.failed = true
-		comp.video.failErr = err
+		// The ffmpeg session died. A deadline/timeout is often transient
+		// (remote input seek on a huge file): do not kill the source for
+		// other pairings. Any other launch error blames the video source.
+		if !errors.Is(err, context.DeadlineExceeded) {
+			comp.video.failed = true
+			comp.video.failErr = err
+		}
 		c.cursor++
 	default:
 		c.cursor++
