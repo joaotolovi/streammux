@@ -756,3 +756,32 @@ func TestStartErrorGenerationAfterPlaceholderWithRealFFmpeg(t *testing.T) {
 	}
 	t.Logf("error generation started at segment %d", gen.startSegment)
 }
+
+func TestComposerSameSourceInBothQueuesIsSingle(t *testing.T) {
+	// A dubbed source that is also a good video appears in both queues.
+	// It must be a single-source composition (no duration comparison, one
+	// ffmpeg input), recognized by pointer identity through the shared ledger.
+	comp := newComposer(composerJobFixture())
+
+	var single *composition
+	for {
+		c := comp.acquire()
+		if c == nil {
+			break
+		}
+		if c.single {
+			single = c
+			break
+		}
+		comp.fail(c, failCompose, errors.New("mismatch"))
+	}
+	if single == nil {
+		t.Fatal("no single-source composition was ever offered")
+	}
+	if single.video != single.audio {
+		t.Fatal("single composition must share one ledger entry")
+	}
+	if !strings.Contains(single.video.stream.Stream.URL, "a-best") {
+		t.Fatalf("single composition = %s, want the dubbed source", single.video.stream.Stream.URL)
+	}
+}

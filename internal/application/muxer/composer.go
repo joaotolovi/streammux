@@ -67,11 +67,22 @@ type composer struct {
 }
 
 // newComposer derives the ordered candidate queues from the planner output.
-// Video order follows video score (the planner already orders plans by
-// quality; first appearance approximates the ranking, re-sorted explicitly
-// here for safety).
+// One ledger entry per source: a dubbed source referenced by both queues is
+// the SAME sourceState, so acquire() recognizes single-source compositions
+// (same entry) and resolve/probe/track work is never duplicated.
 func newComposer(job *model.MuxJob) *composer {
 	c := &composer{}
+
+	ledger := map[string]*sourceState{}
+	getState := func(stream model.CollectedStream) *sourceState {
+		key := stream.SourceKey()
+		if s, ok := ledger[key]; ok {
+			return s
+		}
+		s := &sourceState{stream: stream, track: -1, trackLeni: -1}
+		ledger[key] = s
+		return s
+	}
 
 	seenVideo := map[string]bool{}
 	seenAudio := map[string]bool{}
@@ -82,13 +93,13 @@ func newComposer(job *model.MuxJob) *composer {
 		vk := plan.Video.SourceKey()
 		if vk != "" && !seenVideo[vk] {
 			seenVideo[vk] = true
-			c.videos = append(c.videos, &sourceState{stream: plan.Video, track: -1, trackLeni: -1})
+			c.videos = append(c.videos, getState(plan.Video))
 		}
 		if plan.HasTargetAudio {
 			ak := plan.Audio.SourceKey()
 			if ak != "" && !seenAudio[ak] {
 				seenAudio[ak] = true
-				c.audios = append(c.audios, &sourceState{stream: plan.Audio, track: -1, trackLeni: -1})
+				c.audios = append(c.audios, getState(plan.Audio))
 			}
 		}
 	}
