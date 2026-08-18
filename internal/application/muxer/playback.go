@@ -974,7 +974,25 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 
 	if active != nil && !active.isError && active.prepared != nil && duration > 0 {
 		if tiers > 1 {
-			return m.renderMasterABR(job.TierMetas, job.TargetLanguage), true
+			// Override tier 0 with the REAL probed bitrate/dimensions of
+			// the active generation — the estimate from Process time is
+			// only a placeholder until ffprobe measures the source.
+			metas := make([]model.TierMeta, len(job.TierMetas))
+			copy(metas, job.TierMetas)
+			bitrate := active.prepared.videoBitrate
+			if bitrate <= 0 {
+				bitrate = float64(active.plan.EstimatedBandwidth())
+			}
+			bw := int64(bitrate * 1.2)
+			if bw <= 0 {
+				bw = 8_000_000
+			}
+			metas[0] = model.TierMeta{
+				Bandwidth: bw,
+				Width:     active.prepared.videoWidth,
+				Height:    active.prepared.videoHeight,
+			}
+			return m.renderMasterABR(metas, job.TargetLanguage), true
 		}
 		bitrate := active.prepared.videoBitrate
 		if bitrate <= 0 {
