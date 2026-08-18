@@ -42,6 +42,7 @@ const (
 	failNone failClass = iota
 	failVideo
 	failAudio
+	failNoTrack
 	failCompose
 	failLaunch
 )
@@ -60,14 +61,17 @@ type composition struct {
 type composer struct {
 	videos  []*sourceState
 	audios  []*sourceState
-	vi, ai  int
+	ranked  []*composition
+	cursor  int
 	lenient bool
 	done    bool
 	nextOrd int
-	// lastKey guards against delivering the same composition twice without
-	// an intervening fail() — callers that re-acquire without failing are
-	// treated as if the composition had failed generically.
-	lastKey string
+	// incompatible marks dual pairs that failed compatibility (duration /
+	// edition mismatch): the sources remain valid for other pairings.
+	incompatible map[string]bool
+	// lastDelivered guards against delivering the same composition twice
+	// without an intervening fail().
+	lastDelivered string
 }
 
 // newComposer derives the ordered candidate queues from the planner output.
@@ -145,12 +149,50 @@ func newComposer(job *model.MuxJob) *composer {
 	for i := range c.audios {
 		c.audios[i].audioPos = i
 	}
-	log.Printf("mux: composer videos=%d audios=%d", len(c.videos), len(c.audios))
+
+	// Rank every possible composition by combined quality: the mission is
+	// the best video+audio pair, whether single or dual. A small single
+	// bonus breaks ties (one connection, no sync risk, no mismatch).
+	c.incompatible = map[string]bool{}
+	singleBonus := 15
+	scores := map[string]int{}
+	type rankedEntry struct {
+		comp  *composition
+		score int
+	}
+	var entries []rankedEntry
+	for _, v := range c.videos {
+		for _, a := range c.audios {
+			single := v == a
+			if single {
+				comp := &composition{video: v, audio: a, single: true}
+				entries = append(entries, rankedEntry{comp, analyzer.VideoScore(v.stream) + analyzer.AudioScore(a.stream) + singleBonus})
+				continue
+			}
+			comp := &composition{video: v, audio: a, single: false}
+			entries = append(entries, rankedEntry{comp, analyzer.VideoScore(v.stream) + analyzer.AudioScore(a.stream)})
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].score > entries[j].score })
+	for i, e := range entries {
+		e.comp.ordinal = i + 1
+		c.ranked = append(c.ranked, e.comp)
+		scores[c.compositionKey(e.comp)] = e.score
+	}
+
+	log.Printf("mux: composer videos=%d audios=%d compositions=%d", len(c.videos), len(c.audios), len(c.ranked))
 	for i, s := range c.videos {
 		log.Printf("mux:   video#%d score=%d key=%s", i, analyzer.VideoScore(s.stream), s.stream.SourceKey())
 	}
 	for i, s := range c.audios {
 		log.Printf("mux:   audio#%d conf=%d score=%d key=%s", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), s.stream.SourceKey())
+	}
+	for i, comp := range c.ranked {
+		if i >= 6 {
+			log.Printf("mux:   ... %d more", len(c.ranked)-6)
+			break
+		}
+		log.Printf("mux:   rank#%d score=%d video#%d audio#%d single=%v", comp.ordinal, scores[c.compositionKey(comp)], comp.video.videoPos, comp.audio.audioPos, comp.single)
 	}
 	return c
 }
@@ -210,108 +252,119 @@ func audioRoleRank(role string) int {
 // acquire returns the next untried composition, advancing past sources known
 // to have failed or (for audio) to lack the target language. Must be called
 // with state.mu held.
+// acquire returns the next composition from the ranked list, skipping
+// exhausted sources and incompatible pairs. Must be called with state.mu held.
 func (c *composer) acquire() *composition {
 	for {
 		if c.done {
 			return nil
 		}
-		if c.vi >= len(c.videos) {
-			if !c.lenient && len(c.audios) > 0 {
+		if c.cursor >= len(c.ranked) {
+			if !c.lenient && c.hasLenientCandidates() {
 				// Second pass: accept und/untagged tracks from dubbed
 				// multiaudio sources.
 				c.lenient = true
-				c.vi, c.ai = 0, 0
+				c.cursor = 0
 				continue
 			}
 			c.done = true
 			return nil
 		}
-		v := c.videos[c.vi]
-		if v.failed {
-			c.vi++
-			c.ai = 0
+		comp := c.ranked[c.cursor]
+		if comp.video.failed || comp.audio.failed {
+			c.cursor++
 			continue
 		}
-		if c.ai >= len(c.audios) {
-			c.vi++
-			c.ai = 0
-			continue
-		}
-		a := c.audios[c.ai]
-		if a.failed {
-			c.ai++
+		if !comp.single && c.incompatible[pairKey(comp)] {
+			c.cursor++
 			continue
 		}
 		// Skip audio sources confirmed to lack the target language in the
 		// current pass (the lenient pass may still find one).
 		if c.lenient {
-			if a.trackDone && a.trackLeni < 0 {
-				c.ai++
+			if comp.audio.trackDone && comp.audio.trackLeni < 0 {
+				c.cursor++
 				continue
 			}
-		} else if a.trackDone && a.track < 0 {
-			c.ai++
+		} else if comp.audio.trackDone && comp.audio.track < 0 {
+			c.cursor++
 			continue
 		}
-		if a == v {
-			key := "single:" + v.stream.SourceKey()
-			if key == c.lastKey {
-				c.ai++
-				continue
-			}
-			c.lastKey = key
-			c.nextOrd++
-			return &composition{video: v, audio: a, single: true, lenient: c.lenient, ordinal: c.nextOrd}
-		}
-		key := v.stream.SourceKey() + "\x00" + a.stream.SourceKey()
-		if key == c.lastKey {
-			c.ai++
+		key := c.compositionKey(comp)
+		if key == c.lastDelivered {
+			c.cursor++
 			continue
 		}
-		c.lastKey = key
-		c.nextOrd++
-		log.Printf("mux: acquire vi=%d ai=%d -> video#%d(score=%d) audio#%d(score=%d) single=%v key=%s", c.vi, c.ai, v.videoPos, analyzer.VideoScore(v.stream), a.audioPos, analyzer.AudioScore(a.stream), a == v, key[:min(60, len(key))])
-		return &composition{video: v, audio: a, single: false, lenient: c.lenient, ordinal: c.nextOrd}
+		c.lastDelivered = key
+		log.Printf("mux: acquire rank=%d/%d -> video#%d audio#%d single=%v lenient=%v",
+			c.cursor+1, len(c.ranked), comp.video.videoPos, comp.audio.audioPos, comp.single, c.lenient)
+		return comp
 	}
 }
 
-// fail records a failed composition and advances only the responsible side.
-// Must be called with state.mu held.
+// hasLenientCandidates reports whether any ranked composition could succeed
+// in the lenient pass (audio track not yet confirmed as absent).
+func (c *composer) hasLenientCandidates() bool {
+	for _, comp := range c.ranked {
+		if comp.video.failed || comp.audio.failed {
+			continue
+		}
+		if comp.audio.trackDone && comp.audio.trackLeni >= 0 {
+			return true
+		}
+		if !comp.audio.trackDone {
+			return true
+		}
+	}
+	return false
+}
+
+// fail records a failed composition. Mismatch marks the PAIR incompatible
+// (the sources stay valid for other pairings); resolve/probe/launch failures
+// mark the responsible source as failed for every pairing.
 func (c *composer) fail(comp *composition, class failClass, err error) {
 	switch class {
 	case failVideo:
 		comp.video.failed = true
 		comp.video.failErr = err
-		c.vi++
-		c.ai = 0
+		c.cursor++
 	case failAudio:
-		if comp.single {
-			// The source doubles as audio: mark the track as missing so it is
-			// skipped as an audio candidate but kept as a video candidate.
-			comp.audio.trackDone = true
-			if comp.audio.track < 0 && !c.lenient {
-				comp.audio.track = -1
-			}
-			c.ai++
-		} else {
-			comp.audio.failed = true
-			comp.audio.failErr = err
-			c.ai++
-		}
+		// Resolve/probe failure: the source is dead for every pairing.
+		comp.audio.failed = true
+		comp.audio.failErr = err
+		c.cursor++
+	case failNoTrack:
+		// The audio source has no target-language track in this pass. The
+		// track selection is already memoized (trackDone), so this and other
+		// pairings skip it as audio; it remains a video candidate. The
+		// lenient pass may still find an und/untagged track.
+		c.cursor++
 	case failCompose:
 		// Both sources work but not together (duration/edition mismatch):
-		// try the next audio with the same video first.
-		c.ai++
+		// the pair is dead, the sources remain available to other pairings.
+		if !comp.single {
+			c.incompatible[pairKey(comp)] = true
+		}
+		c.cursor++
 	case failLaunch:
-		// The ffmpeg session died: blame the heavier side (video) and also
-		// drop this audio pairing.
+		// The ffmpeg session died: blame the heavier side (video).
 		comp.video.failed = true
 		comp.video.failErr = err
-		c.vi++
-		c.ai = 0
+		c.cursor++
 	default:
-		c.ai++
+		c.cursor++
 	}
+}
+
+func pairKey(comp *composition) string {
+	return comp.video.stream.SourceKey() + "\x00" + comp.audio.stream.SourceKey()
+}
+
+func (c *composer) compositionKey(comp *composition) string {
+	if comp.single {
+		return "single:" + comp.video.stream.SourceKey()
+	}
+	return pairKey(comp)
 }
 
 // exhausted reports whether every composition has been tried (including the
@@ -338,10 +391,11 @@ func (c *composer) markFailed(sourceKey string) {
 // re-evaluate every source). Clears failed flags and cursor positions.
 // Must be called with state.mu held.
 func (c *composer) reset() {
-	c.vi, c.ai = 0, 0
+	c.cursor = 0
 	c.lenient = false
 	c.done = false
-	c.lastKey = ""
+	c.lastDelivered = ""
+	c.incompatible = map[string]bool{}
 	for _, s := range c.videos {
 		s.failed = false
 		s.failErr = nil
@@ -349,6 +403,9 @@ func (c *composer) reset() {
 	for _, s := range c.audios {
 		s.failed = false
 		s.failErr = nil
+		s.trackDone = false
+		s.track = -1
+		s.trackLeni = -1
 	}
 }
 
@@ -383,7 +440,10 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 
 	track := audio.selectedTrack(comp.isLenient())
 	if track < 0 {
-		return nil, failAudio, fmt.Errorf("source has no confirmed %s audio track", job.TargetLanguage)
+		// "No target track" is a property of the source+pass, not a dead
+		// source: failNoTrack lets the composer skip it as audio while other
+		// pairings (and the lenient pass) remain possible.
+		return nil, failNoTrack, fmt.Errorf("source has no confirmed %s audio track", job.TargetLanguage)
 	}
 	log.Printf("mux: composition %d selected audio track a:%d (of %d tracks) from %s", comp.ordinal, track, len(audio.probe.AudioTracks), audio.stream.SourceKey())
 
