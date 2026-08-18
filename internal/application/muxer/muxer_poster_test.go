@@ -1,0 +1,200 @@
+package muxer
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/streammux/streammux/internal/application/ffmpeg"
+	"github.com/streammux/streammux/internal/domain/model"
+)
+
+// fakeMediaEngine is a minimal mediaEngine implementation that lets us
+// observe which placeholder session variant is requested.
+type fakeMediaEngine struct {
+	imageCalls []string
+	plainCalls []string
+	probeFn    func(context.Context, string) (*ffmpeg.ProbeResult, error)
+}
+
+func (f *fakeMediaEngine) Probe(ctx context.Context, url string) (*ffmpeg.ProbeResult, error) {
+	if f.probeFn != nil {
+		return f.probeFn(ctx, url)
+	}
+	return &ffmpeg.ProbeResult{}, nil
+}
+
+func (f *fakeMediaEngine) StartSession(ctx context.Context, spec ffmpeg.SessionSpec) (*ffmpeg.Session, error) {
+	return nil, nil
+}
+
+func (f *fakeMediaEngine) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, realtime bool) (*ffmpeg.Session, error) {
+	f.plainCalls = append(f.plainCalls, outputDir)
+	return newFakeSession(outputDir), nil
+}
+
+func (f *fakeMediaEngine) StartImagePlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*ffmpeg.Session, error) {
+	f.imageCalls = append(f.imageCalls, imagePath)
+	return newFakeSession(outputDir), nil
+}
+
+func newFakeSession(outputDir string) *ffmpeg.Session {
+	s := &ffmpeg.Session{}
+	s.InitDone()
+	// Simulate segment production by creating a tiny segment file in the output dir.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = os.MkdirAll(filepath.Join(outputDir, "video"), 0755)
+		_ = os.MkdirAll(filepath.Join(outputDir, "audio"), 0755)
+		_ = os.WriteFile(filepath.Join(outputDir, "video", "seg_00000.ts"), []byte("segment"), 0644)
+		_ = os.WriteFile(filepath.Join(outputDir, "audio", "seg_00000.ts"), []byte("segment"), 0644)
+		_ = os.WriteFile(filepath.Join(outputDir, "video", "video.m3u8"), []byte("playlist"), 0644)
+		_ = os.WriteFile(filepath.Join(outputDir, "audio", "audio.m3u8"), []byte("playlist"), 0644)
+	}()
+	return s
+}
+
+func (f *fakeMediaEngine) DetectAudioOffset(videoURL, audioURL string, tracks []ffmpeg.AudioTrack, sampleRate int, duration float64) (time.Duration, int, float64, error) {
+	return 0, 0, 0, nil
+}
+
+func waitPlaceholder(t *testing.T, state *playbackState) {
+	t.Helper()
+	select {
+	case <-state.placeholderWait:
+	case <-time.After(2 * time.Second):
+		state.mu.Lock()
+		wait := state.placeholderWait
+		state.mu.Unlock()
+		if wait != nil {
+			t.Fatal("placeholder wait not closed")
+		}
+	}
+}
+
+func TestRunPlaceholderUsesImageWhenPosterExists(t *testing.T) {
+	ff := &fakeMediaEngine{}
+	mux := &Muxer{
+		ffmpeg:          ff,
+		placeholderPath: "placeholder.mp4",
+		policy:          defaultPolicy(),
+		states:          make(map[string]*playbackState),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := t.TempDir()
+	job := &model.MuxJob{
+		ID:          "job",
+		ContentType: "movie",
+		ContentID:   "tt0111161",
+		CacheDir:    cacheDir,
+	}
+	_ = os.WriteFile(filepath.Join(cacheDir, posterFileName), []byte("poster"), 0644)
+
+	state := &playbackState{
+		ctx:           ctx,
+		cancel:        cancel,
+		cacheDir:      t.TempDir(),
+		lastRequested: -1,
+		maxRequested:  -1,
+	}
+	mux.states[job.ID] = state
+
+	go mux.runPlaceholder(job, state)
+	waitPlaceholder(t, state)
+
+	if len(ff.imageCalls) != 1 {
+		t.Fatalf("expected image placeholder call, got %d", len(ff.imageCalls))
+	}
+	if len(ff.plainCalls) != 0 {
+		t.Fatalf("expected no plain placeholder calls, got %d", len(ff.plainCalls))
+	}
+	cancel()
+}
+
+func TestRunPlaceholderFallsBackToPlainWhenPosterMissing(t *testing.T) {
+	ff := &fakeMediaEngine{}
+	mux := &Muxer{
+		ffmpeg:          ff,
+		placeholderPath: "placeholder.mp4",
+		policy:          defaultPolicy(),
+		states:          make(map[string]*playbackState),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	job := &model.MuxJob{
+		ID:          "job",
+		ContentType: "movie",
+		ContentID:   "tt0111161",
+		CacheDir:    t.TempDir(),
+	}
+
+	state := &playbackState{
+		ctx:           ctx,
+		cancel:        cancel,
+		cacheDir:      t.TempDir(),
+		lastRequested: -1,
+		maxRequested:  -1,
+	}
+	mux.states[job.ID] = state
+
+	go mux.runPlaceholder(job, state)
+	waitPlaceholder(t, state)
+
+	if len(ff.plainCalls) != 1 {
+		t.Fatalf("expected plain placeholder call, got %d", len(ff.plainCalls))
+	}
+	if len(ff.imageCalls) != 0 {
+		t.Fatalf("expected no image placeholder calls, got %d", len(ff.imageCalls))
+	}
+	cancel()
+}
+
+func TestRunPlaceholderUsesPlainWhenContentIDMissing(t *testing.T) {
+	ff := &fakeMediaEngine{}
+	mux := &Muxer{
+		ffmpeg:          ff,
+		placeholderPath: "placeholder.mp4",
+		policy:          defaultPolicy(),
+		states:          make(map[string]*playbackState),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cacheDir := t.TempDir()
+	job := &model.MuxJob{
+		ID:          "job",
+		ContentType: "",
+		ContentID:   "",
+		CacheDir:    cacheDir,
+	}
+	_ = os.WriteFile(filepath.Join(cacheDir, posterFileName), []byte("poster"), 0644)
+
+	state := &playbackState{
+		ctx:           ctx,
+		cancel:        cancel,
+		cacheDir:      t.TempDir(),
+		lastRequested: -1,
+		maxRequested:  -1,
+	}
+	mux.states[job.ID] = state
+
+	go mux.runPlaceholder(job, state)
+	waitPlaceholder(t, state)
+
+	if len(ff.plainCalls) != 1 {
+		t.Fatalf("expected plain placeholder call, got %d", len(ff.plainCalls))
+	}
+	if len(ff.imageCalls) != 0 {
+		t.Fatalf("expected no image placeholder calls, got %d", len(ff.imageCalls))
+	}
+
+	cancel()
+}

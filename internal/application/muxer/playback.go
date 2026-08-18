@@ -19,6 +19,15 @@ import (
 // ErrBeyondEnd reports a segment request past the end of the film.
 var ErrBeyondEnd = errors.New("segment beyond end of film")
 
+// posterFileName is the local filename of the cached poster image in a job's
+// cache directory. It is downloaded from Cinemeta while sources are collected.
+const posterFileName = "poster.jpg"
+
+// imagePlaceholderWait is how long runPlaceholder waits for a poster download
+// before falling back to the plain placeholder. It is short enough to keep
+// playback instant but gives fast Cinemeta responses time to land.
+const imagePlaceholderWait = 500 * time.Millisecond
+
 // playbackState is the per-job VOD timeline. The public HLS timeline is
 // static once the film is ready: segment n always maps to file seg_%05d.ts of
 // whichever generation produced it, and the media playlists expose the full
@@ -277,7 +286,47 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	state.mu.Unlock()
 
 	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-	session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.placeholderPath, dir, true)
+
+	// Prefer a composed placeholder with the film poster, but only when the
+	// poster is already available or arrives within a very short window. We
+	// never delay playback for the poster: Cinemeta is best-effort.
+	posterPath := filepath.Join(job.CacheDir, posterFileName)
+	usePoster := fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
+	if !usePoster && job.ContentType != "" && job.ContentID != "" {
+		deadline := time.After(imagePlaceholderWait)
+	waitLoop:
+		for !fileExists(posterPath) {
+			select {
+			case <-state.ctx.Done():
+				break waitLoop
+			case <-deadline:
+				break waitLoop
+			default:
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		usePoster = fileExists(posterPath)
+	}
+
+	var session *ffmpeg.Session
+	var err error
+
+	if usePoster {
+		log.Printf("mux: starting image placeholder with poster %s", posterPath)
+		session, err = m.ffmpeg.StartImagePlaceholderSession(state.ctx, m.placeholderPath, posterPath, dir, true)
+		if err != nil {
+			log.Printf("mux: image placeholder failed, falling back to plain placeholder: %v", err)
+			_ = os.RemoveAll(dir)
+			dir = filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
+			usePoster = false
+		}
+	}
+
+	if !usePoster {
+		log.Printf("mux: starting plain placeholder")
+		session, err = m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.placeholderPath, dir, true)
+	}
+
 	fail := func(format string, args ...any) {
 		_ = os.RemoveAll(dir)
 		state.mu.Lock()
@@ -290,8 +339,9 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		}
 		log.Printf("mux: placeholder: "+format, args...)
 	}
+
 	if err != nil {
-		fail("%v", err)
+		fail("failed to start any placeholder session: %v", err)
 		return
 	}
 

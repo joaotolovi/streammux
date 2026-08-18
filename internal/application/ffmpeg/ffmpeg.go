@@ -67,6 +67,14 @@ type Session struct {
 	err error
 }
 
+// InitDone initialises the internal done channel. It exists for tests that
+// construct a Session directly and never run FFmpeg.
+func (s *Session) InitDone() {
+	if s.done == nil {
+		s.done = make(chan struct{})
+	}
+}
+
 // StderrTail returns the last ffmpeg stderr output (diagnostics only).
 func (s *Session) StderrTail() string {
 	if s == nil || s.stderrTail == nil {
@@ -383,6 +391,118 @@ func tail(s string, n int) string {
 	return s[len(s)-n:]
 }
 
+// buildImagePlaceholderArgs encodes the local placeholder video composed with
+// a static poster image. The video shifts -140px to the left while a 320x480
+// poster slides in from x=1280 to x=883 between t=2.5s and t=3.3s. The poster
+// has rounded corners and a subtle gray border. The output is an HLS live
+// window identical to buildPlaceholderArgs, so the film handoff is unchanged.
+func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool) []string {
+	const (
+		startT       = 2.5
+		duration     = 0.8
+		posterW      = 320
+		posterH      = 480
+		posterX      = 1280 - posterW - 77
+		posterY      = (720 - posterH) / 2
+		shiftLeft    = 140
+		videoSpeed   = float64(shiftLeft) / duration
+		posterSpeedX = 1280 - posterX
+		posterSpeed  = float64(posterSpeedX) / duration
+	)
+
+	filter := fmt.Sprintf(
+		"color=c=black:s=1280x720[base];"+
+			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
+			"[poster_raw][2:v]alphamerge[rounded];"+
+			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
+			"[base][0:v]overlay=x='%s':y=0[shifted];"+
+			"[shifted][poster]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[withposter];"+
+			"[withposter][3:v]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[v]",
+		posterW, posterH,
+		startT, duration,
+		shiftExpr(startT, duration, -shiftLeft, videoSpeed, false, -shiftLeft),
+		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
+		posterY, startT,
+		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
+		posterY, startT,
+	)
+
+	preset := "veryfast"
+	if !realtime {
+		preset = "ultrafast"
+	}
+	videoFlags := "independent_segments+temp_file"
+	audioFlags := "independent_segments+temp_file+split_by_time"
+	if realtime {
+		videoFlags += "+omit_endlist"
+		audioFlags += "+omit_endlist"
+	}
+
+	args := []string{"-nostdin", "-hide_banner", "-nostats"}
+	if realtime {
+		args = append(args, "-readrate", "1", "-readrate_initial_burst", fmtDuration(segDuration))
+	}
+	args = append(args,
+		"-i", path,
+		"-loop", "1", "-i", imagePath,
+		"-loop", "1", "-i", findAsset(path, "poster_round_mask.png"),
+		"-loop", "1", "-i", findAsset(path, "poster_round_border.png"),
+	)
+	args = append(args,
+		"-filter_complex", filter,
+		"-shortest",
+		"-map", "[v]",
+		"-c:v", "libx264", "-preset", preset, "-crf", "23",
+		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
+		"-force_key_frames", "expr:gte(t,n_forced*4)",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "3",
+		"-hls_allow_cache", "0",
+		"-hls_flags", videoFlags,
+		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "video", "video.m3u8"),
+		"-map", "0:a:0",
+		"-c:a", "aac", "-b:a", "128k",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "3",
+		"-hls_allow_cache", "0",
+		"-hls_flags", audioFlags,
+		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
+		"-start_number", "0",
+		filepath.Join(outputDir, "audio", "audio.m3u8"),
+	)
+	return args
+}
+
+// findAsset resolves the path to an embedded overlay asset. When the placeholder
+// path is inside a temp directory, the asset files are extracted next to it.
+func findAsset(placeholderPath, name string) string {
+	dir := filepath.Dir(placeholderPath)
+	candidate := filepath.Join(dir, name)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return name
+}
+
+// shiftExpr builds an expression that moves from startX to endX over the
+// animation interval. The returned string is suitable for an overlay x= or y=
+// parameter. When reverse is true, the value decreases from right to left.
+func shiftExpr(startT, duration float64, distance, speed float64, reverse bool, endX int) string {
+	_ = distance
+	endT := startT + duration
+	startX := 1280
+	if reverse {
+		return fmt.Sprintf("if(gt(t,%.2f),min(%d,%d-(t-%.2f)*%.0f),%d)", endT, endX, startX, startT, speed, startX)
+	}
+	return fmt.Sprintf("if(gt(t,%.2f),max(%d,-(t-%.2f)*%.0f),0)", endT, endX, startT, speed)
+}
+
+
+
 // buildPlaceholderArgs encodes a local video as a live-looking HLS window.
 // realtime=true paces the placeholder at 1x with a sliding window and no
 // ENDLIST (the film takes over the timeline). realtime=false encodes the
@@ -436,6 +556,19 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 // open (film handoff); false encodes the terminal error video as fast as
 // possible with a natural ENDLIST.
 func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, realtime bool) (*Session, error) {
+	return m.startPlaceholderSession(ctx, path, "", outputDir, realtime)
+}
+
+// StartImagePlaceholderSession launches the local placeholder video composed
+// with a static poster image. The poster slides in from the right after a
+// short delay while the placeholder video slides slightly to the left. The
+// output is identical to a regular placeholder session, so the film handoff
+// works unchanged.
+func (m *Muxer) StartImagePlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {
+	return m.startPlaceholderSession(ctx, path, imagePath, outputDir, realtime)
+}
+
+func (m *Muxer) startPlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("placeholder session: no video provided")
 	}
@@ -449,7 +582,12 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputD
 		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
 	}
 
-	args := buildPlaceholderArgs(path, outputDir, realtime)
+	var args []string
+	if imagePath != "" {
+		args = buildImagePlaceholderArgs(path, imagePath, outputDir, realtime)
+	} else {
+		args = buildPlaceholderArgs(path, outputDir, realtime)
+	}
 
 	sessCtx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)

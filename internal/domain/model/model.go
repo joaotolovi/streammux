@@ -181,6 +181,12 @@ type MuxJob struct {
 	CacheDir      string  `json:"-"`
 	Duration      float64 `json:"-"`
 	PlaylistReady bool    `json:"-"`
+
+	// ContentType and ContentID identify the Stremio item being requested.
+	// They are set during Process so downstream components can fetch metadata
+	// (e.g. poster art) while the film is prepared.
+	ContentType string `json:"-"`
+	ContentID   string `json:"-"`
 }
 
 type Manifest struct {

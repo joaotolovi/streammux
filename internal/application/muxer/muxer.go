@@ -3,8 +3,11 @@ package muxer
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +31,8 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
-	StartSinglePlaceholderSession(context.Context, string, string, bool) (*ffmpeg.Session, error) // bool: realtime pacing
+	StartSinglePlaceholderSession(context.Context, string, string, bool) (*ffmpeg.Session, error)        // bool: realtime pacing
+	StartImagePlaceholderSession(context.Context, string, string, string, bool) (*ffmpeg.Session, error) // (video, posterImage, outputDir, realtime)
 	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
 }
 
@@ -210,8 +214,25 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 		Title:          primary.Video.AddonName + " + " + primary.Audio.AddonName,
 		Plans:          plans,
 		Config:         *cfg,
+		ContentType:    contentType,
+		ContentID:      contentID,
 	}
+
 	jobID := m.store.Save(job)
+
+	// Start a best-effort poster prefetch in a per-job temp directory. If the
+	// user clicks play immediately, runPlaceholder will wait up to 500ms for this
+	// to finish before falling back to the plain placeholder.
+	posterDir, err := os.MkdirTemp("", "streammux-poster-"+jobID+"-*")
+	if err != nil {
+		log.Printf("mux: cannot create poster cache: %v", err)
+	} else {
+		// Ensure job.CacheDir is the poster directory so runPlaceholder can find
+		// the downloaded poster without needing a separate lookup.
+		job.CacheDir = posterDir
+		posterPath := filepath.Join(posterDir, posterFileName)
+		_ = m.prefetchPoster(ctx, contentType, contentID, posterPath)
+	}
 
 	mode := "Remux"
 	if primary.SingleSource() {

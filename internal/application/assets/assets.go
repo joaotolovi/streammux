@@ -12,10 +12,11 @@ import (
 	"path/filepath"
 )
 
-//go:embed placeholder.mp4 error.mp4
+//go:embed placeholder.mp4 error.mp4 poster_round_mask.png poster_round_border.png
 var files embed.FS
 
-// PlaceholderPath extracts the default placeholder to a temporary directory.
+// PlaceholderPath extracts the default placeholder and its overlay mask assets
+// to a temporary directory. The caller should clean up the directory when done.
 func PlaceholderPath() (path, dir string, err error) {
 	dir, err = os.MkdirTemp("", "streammux-assets-*")
 	if err != nil {
@@ -23,6 +24,10 @@ func PlaceholderPath() (path, dir string, err error) {
 	}
 	path, err = extract("placeholder.mp4", dir)
 	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", "", err
+	}
+	if err := extractAll(dir, []string{"poster_round_mask.png", "poster_round_border.png"}); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", "", err
 	}
@@ -40,6 +45,15 @@ func ErrorPath() (path, dir string, err error) {
 		return "", "", err
 	}
 	return path, dir, nil
+}
+
+func extractAll(dir string, names []string) error {
+	for _, name := range names {
+		if _, err := extract(name, dir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func extract(name, dir string) (string, error) {
