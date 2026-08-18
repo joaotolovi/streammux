@@ -392,16 +392,16 @@ func tail(s string, n int) string {
 }
 
 // buildImagePlaceholderArgs encodes the local placeholder video composed with
-// a static poster image. The video shifts -140px to the left while a 320x480
-// poster slides in from x=1280 to x=883 between t=2.5s and t=3.3s. The poster
+// a static poster image. The video shifts -140px to the left while a 256x384
+// poster slides in from x=1280 to x=947 between t=2.5s and t=3.3s. The poster
 // has rounded corners and a subtle gray border. The output is an HLS live
 // window identical to buildPlaceholderArgs, so the film handoff is unchanged.
 func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool) []string {
 	const (
 		startT       = 2.5
 		duration     = 0.8
-		posterW      = 320
-		posterH      = 480
+		posterW      = 256 // 320 * 0.8
+		posterH      = 384 // 480 * 0.8
 		posterX      = 1280 - posterW - 77
 		posterY      = (720 - posterH) / 2
 		shiftLeft    = 140
@@ -413,11 +413,15 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 	filter := fmt.Sprintf(
 		"color=c=black:s=1280x720[base];"+
 			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
-			"[poster_raw][2:v]alphamerge[rounded];"+
+			"[2:v]scale=%d:%d[mask_scaled];"+
+			"[3:v]scale=%d:%d[border_scaled];"+
+			"[poster_raw][mask_scaled]alphamerge[rounded];"+
 			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base][0:v]overlay=x='%s':y=0[shifted];"+
 			"[shifted][poster]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[withposter];"+
-			"[withposter][3:v]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[v]",
+			"[withposter][border_scaled]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[v]",
+		posterW, posterH,
+		posterW, posterH,
 		posterW, posterH,
 		startT, duration,
 		shiftExpr(startT, duration, -shiftLeft, videoSpeed, false, -shiftLeft),
@@ -489,16 +493,20 @@ func findAsset(placeholderPath, name string) string {
 }
 
 // shiftExpr builds an expression that moves from startX to endX over the
-// animation interval. The returned string is suitable for an overlay x= or y=
-// parameter. When reverse is true, the value decreases from right to left.
+// animation interval [startT, startT+duration]. The returned string is
+// suitable for an overlay x= parameter. When reverse is true the value
+// decreases from right (1280) to endX; otherwise it decreases from 0 to endX
+// (a negative value, i.e. shifting left).
 func shiftExpr(startT, duration float64, distance, speed float64, reverse bool, endX int) string {
 	_ = distance
-	endT := startT + duration
 	startX := 1280
 	if reverse {
-		return fmt.Sprintf("if(gt(t,%.2f),min(%d,%d-(t-%.2f)*%.0f),%d)", endT, endX, startX, startT, speed, startX)
+		// Poster: starts at 1280 (off-screen right), slides left to endX,
+		// then clamps at endX via min().
+		return fmt.Sprintf("if(gt(t,%.2f),min(%d,%d-(t-%.2f)*%.0f),%d)", startT, endX, startX, startT, speed, startX)
 	}
-	return fmt.Sprintf("if(gt(t,%.2f),max(%d,-(t-%.2f)*%.0f),0)", endT, endX, startT, speed)
+	// Video: starts at 0, shifts left to endX (negative), then clamps via max().
+	return fmt.Sprintf("if(gt(t,%.2f),max(%d,-(t-%.2f)*%.0f),0)", startT, endX, startT, speed)
 }
 
 
