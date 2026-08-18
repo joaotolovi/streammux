@@ -99,14 +99,18 @@ func newComposer(job *model.MuxJob) *composer {
 		if plan.HasTargetAudio {
 			ak := plan.Audio.SourceKey()
 			if ak != "" && !seenAudio[ak] {
-				// Only include sources with at least strong evidence of the
-				// target language. Sources that only match via the addon's
-				// self-reported language (confidence 1) are not trusted as
-				// audio candidates — they may be any language and are better
-				// served as subtitled fallback.
 				if audioConfidence(plan.Audio, job.TargetLanguage) >= 2 {
 					seenAudio[ak] = true
-					c.audios = append(c.audios, getState(plan.Audio))
+					audioState := getState(plan.Audio)
+					c.audios = append(c.audios, audioState)
+					// A dubbed source may also carry excellent video (e.g. a
+					// 55GB BluRay REMUX with PT-BR audio). Include it as a
+					// video candidate so single-source compositions are
+					// reachable — it is tried as a video at its natural score.
+					if !seenVideo[ak] {
+						seenVideo[ak] = true
+						c.videos = append(c.videos, audioState)
+					}
 				}
 			}
 		}
