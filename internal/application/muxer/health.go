@@ -97,6 +97,28 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 		if requested < 0 || ahead >= m.policy.MinPublishedAhead || !cooldownElapsed || alreadyRecovering {
 			continue
 		}
+
+		// Bursty CDNs defeat the two-consecutive-slow-windows rule: a
+		// short full stall is followed by a fast burst that resets the
+		// count, yet the player — running close to the production
+		// frontier with a thin buffer — stalls during every gap. A single
+		// near-stalled window (below half of realtime) with the player
+		// this close to the frontier means a stall within seconds:
+		// switch before the buffer drains instead of after.
+		if decision.realtime > 0 && decision.realtime < m.policy.MinRealtime/2 {
+			startSegment := highest + 1
+			if startSegment <= requested {
+				startSegment = requested + 1
+			}
+			log.Printf(
+				"mux: plan stalled at %.2fx with %s buffered (bursty source gap); trying other sources",
+				decision.realtime,
+				ahead.Round(time.Second),
+			)
+			m.ensureRecovery(job, state, startSegment, "production gap")
+			continue
+		}
+
 		startSegment := highest + 1
 		if startSegment <= requested {
 			startSegment = requested + 1
