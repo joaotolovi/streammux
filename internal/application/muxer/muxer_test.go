@@ -552,17 +552,63 @@ func TestPlayerTooSlowRequiresAllWindowsSlow(t *testing.T) {
 	if playerTooSlow(nil, required) {
 		t.Fatal("no samples must not be slow")
 	}
-	if playerTooSlow([]deliverySample{slow, slow, slow}, required) {
+	if playerTooSlow([]deliverySample{slow, slow}, required) {
 		t.Fatal("fewer than window samples must not decide")
 	}
-	if playerTooSlow([]deliverySample{slow, slow, slow, fast}, required) {
+	if playerTooSlow([]deliverySample{slow, slow, fast}, required) {
 		t.Fatal("one fast delivery in the window must veto the downgrade")
 	}
-	if !playerTooSlow([]deliverySample{slow, slow, slow, slow}, required) {
+	if !playerTooSlow([]deliverySample{slow, slow, slow}, required) {
 		t.Fatal("all deliveries slow must downgrade")
 	}
-	if playerTooSlow([]deliverySample{slow, slow, slow, slow}, 0) {
+	if playerTooSlow([]deliverySample{slow, slow, slow}, 0) {
 		t.Fatal("unknown required bitrate must not downgrade")
+	}
+}
+
+func TestPlayerTooSlowCatastrophicSingleDelivery(t *testing.T) {
+	required := 10_000_000.0
+	// 1 MB in 13s — a single transfer slower than 3x the 4s segment marks
+	// the player as too slow immediately, no need to fill the window.
+	catastrophic := deliverySample{at: time.Unix(1000, 0), bytes: 1_000_000, seconds: 13}
+	if !playerTooSlow([]deliverySample{catastrophic}, required) {
+		t.Fatal("catastrophic delivery must trigger immediately")
+	}
+	// 9s is below the 12s (3x segment) threshold: must not decide alone.
+	badButNotCatastrophic := deliverySample{at: time.Unix(1000, 0), bytes: 1_000_000, seconds: 9}
+	if playerTooSlow([]deliverySample{badButNotCatastrophic}, required) {
+		t.Fatal("non-catastrophic single delivery must wait for the window")
+	}
+}
+
+func TestAppendDeliverySampleKeepsSlowBackToBackDeliveries(t *testing.T) {
+	// Regression: a player whose transfers take longer than deliveryPauseGap
+	// must NOT have its window reset — the deliveries are back-to-back, the
+	// player is starving, not paused. 30 MB (2160p REMUX segment) taking 20s
+	// each: request starts are ~20s apart but idle time is ~0.
+	now := time.Unix(1000, 0)
+	samples := appendDeliverySample(nil, now, 30_000_000, 20*time.Second)
+	samples = appendDeliverySample(samples, now.Add(20*time.Second), 30_000_000, 20*time.Second)
+	samples = appendDeliverySample(samples, now.Add(40*time.Second), 30_000_000, 20*time.Second)
+	samples = appendDeliverySample(samples, now.Add(60*time.Second), 30_000_000, 20*time.Second)
+
+	if len(samples) != deliveryWindow {
+		t.Fatalf("expected window of %d samples, got %d — slow back-to-back deliveries must accumulate, not reset", deliveryWindow, len(samples))
+	}
+	// 30 MB in 20s = 12 Mbps, below a 60 Mbps REMUX requirement.
+	if !playerTooSlow(samples, 60_000_000*1.25) {
+		t.Fatal("starving player must be detected as too slow")
+	}
+}
+
+func TestAppendDeliverySampleResetsAfterGenuinePause(t *testing.T) {
+	now := time.Unix(1000, 0)
+	samples := appendDeliverySample(nil, now, 30_000_000, 5*time.Second)
+	// Next request starts 60s later; previous transfer took only 5s, so the
+	// player was idle for 55s — a genuine pause must reset the window.
+	samples = appendDeliverySample(samples, now.Add(60*time.Second), 30_000_000, 5*time.Second)
+	if len(samples) != 1 {
+		t.Fatalf("expected window reset to 1 sample after pause, got %d", len(samples))
 	}
 }
 
