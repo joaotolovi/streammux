@@ -147,12 +147,15 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		state.mu.Unlock()
 		return &DirectFallbackError{URL: direct, Err: cause}
 	}
-	// Allow one retry per cooldown window; retries resume from the remaining
-	// (not yet failed) sources in the composer ledger.
-	// the user's second click tries fresh sources instead of repeating.
+	// Allow one retry per cooldown window. Reset the composer so the retry
+	// re-evaluates every source from scratch — a source that failed on the
+	// first attempt may work on the second (debrid CDN may have warmed up).
 	if state.startErr != nil && time.Since(state.lastStart) > m.policy.RetryCooldown {
 		state.starting = false
 		state.startErr = nil
+		if state.composer != nil {
+			state.composer.reset()
+		}
 	}
 
 	if m.placeholderPath != "" && !state.placeholderStarted && state.startErr == nil {

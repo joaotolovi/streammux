@@ -335,12 +335,22 @@ func (c *composer) markFailed(sourceKey string) {
 	}
 }
 
-// reset relaunches the composer from scratch (used when a session dies and
-// the current sources must be reconsidered). Must be called with state.mu held.
+// reset relaunches the composer from scratch (used when a retry should
+// re-evaluate every source). Clears failed flags and cursor positions.
+// Must be called with state.mu held.
 func (c *composer) reset() {
 	c.vi, c.ai = 0, 0
 	c.lenient = false
 	c.done = false
+	c.lastKey = ""
+	for _, s := range c.videos {
+		s.failed = false
+		s.failErr = nil
+	}
+	for _, s := range c.audios {
+		s.failed = false
+		s.failErr = nil
+	}
 }
 
 func (m *Muxer) composerFor(job *model.MuxJob, state *playbackState) *composer {
@@ -442,6 +452,7 @@ func (m *Muxer) ensureVideoSource(ctx context.Context, job *model.MuxJob, s *sou
 		if err != nil {
 			s.failed = true
 			s.failErr = err
+			log.Printf("mux: video source resolve failed (video#%d): %v", s.idx, err)
 			return err
 		}
 		s.url = url
@@ -451,6 +462,7 @@ func (m *Muxer) ensureVideoSource(ctx context.Context, job *model.MuxJob, s *sou
 		if err != nil {
 			s.failed = true
 			s.failErr = err
+			log.Printf("mux: video source probe failed (video#%d): %v", s.idx, err)
 			return err
 		}
 		s.probe = probe
