@@ -152,14 +152,13 @@ func newComposer(job *model.MuxJob) *composer {
 	}
 
 	// Rank every possible composition by combined quality using the geometric
-	// mean: √(VideoScore × EffectiveAudioScore) + single bonus. The geometric
-	// mean ensures "best video AND best audio" — a great video with garbage
-	// audio scores low, unlike an additive sum where one side dominates.
+	// mean: √(VideoScore × EffectiveAudioScore). The geometric mean ensures
+	// "best video AND best audio" — a great video with garbage audio scores
+	// low, unlike an additive sum where one side dominates.
 	// EffectiveAudioScore weights the raw AudioScore by the language
 	// confidence: an uncertain-language audio is nearly worthless because it
 	// may not be in the user's language at all.
 	c.incompatible = map[string]bool{}
-	singleBonus := 15.0
 	type rankedEntry struct {
 		comp  *composition
 		score float64
@@ -188,9 +187,6 @@ func newComposer(job *model.MuxJob) *composer {
 				combined = 0
 			} else {
 				combined = math.Sqrt(vs * as)
-			}
-			if single {
-				combined += singleBonus
 			}
 			comp := &composition{video: v, audio: a, single: single}
 			entries = append(entries, rankedEntry{comp, combined})

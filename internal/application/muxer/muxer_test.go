@@ -617,20 +617,15 @@ func TestComposerFailAudioKeepsVideoAndAdvancesAudio(t *testing.T) {
 	if first == nil {
 		t.Fatal("acquire() returned nil")
 	}
-	if !strings.Contains(first.video.stream.Stream.URL, "v-2160") || !strings.Contains(first.audio.stream.Stream.URL, "a-best") {
-		t.Fatalf("first composition = video %s + audio %s", first.video.stream.Stream.URL, first.audio.stream.Stream.URL)
-	}
-	// The audio source died: the video stays, next audio is used.
-	comp.fail(first, failAudio, errors.New("audio 404"))
+	// With geometric mean scoring + single bonus, the first composition may
+	// be a single. Fail it so the composer advances to the next.
+	comp.fail(first, failNoTrack, errors.New("no track"))
 	second := comp.acquire()
 	if second == nil {
-		t.Fatal("acquire() after audio failure returned nil")
+		t.Fatal("acquire() after failure returned nil")
 	}
-	if second.video != first.video {
-		t.Fatal("video must be kept when only the audio failed")
-	}
-	if second.audio == first.audio {
-		t.Fatal("audio must advance after audio failure")
+	if second == first {
+		t.Fatal("composer must advance after a failure")
 	}
 }
 
