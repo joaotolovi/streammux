@@ -86,19 +86,21 @@ func TestRunPlaceholderUsesImageWhenPosterExists(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cacheDir := t.TempDir()
+	posterDir := t.TempDir()
+	posterPath := filepath.Join(posterDir, posterFileName)
+	_ = os.WriteFile(posterPath, []byte("poster"), 0644)
+
 	job := &model.MuxJob{
 		ID:          "job",
 		ContentType: "movie",
 		ContentID:   "tt0111161",
-		CacheDir:    cacheDir,
 	}
-	_ = os.WriteFile(filepath.Join(cacheDir, posterFileName), []byte("poster"), 0644)
 
 	state := &playbackState{
 		ctx:           ctx,
 		cancel:        cancel,
 		cacheDir:      t.TempDir(),
+		posterPath:    posterPath,
 		lastRequested: -1,
 		maxRequested:  -1,
 	}
@@ -132,13 +134,14 @@ func TestRunPlaceholderFallsBackToPlainWhenPosterMissing(t *testing.T) {
 		ID:          "job",
 		ContentType: "movie",
 		ContentID:   "tt0111161",
-		CacheDir:    t.TempDir(),
 	}
 
+	// posterPath set but file doesn't exist → should fall back to plain.
 	state := &playbackState{
 		ctx:           ctx,
 		cancel:        cancel,
 		cacheDir:      t.TempDir(),
+		posterPath:    filepath.Join(t.TempDir(), posterFileName),
 		lastRequested: -1,
 		maxRequested:  -1,
 	}
@@ -168,19 +171,21 @@ func TestRunPlaceholderUsesPlainWhenContentIDMissing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	cacheDir := t.TempDir()
+	posterDir := t.TempDir()
+	posterPath := filepath.Join(posterDir, posterFileName)
+	_ = os.WriteFile(posterPath, []byte("poster"), 0644)
+
 	job := &model.MuxJob{
 		ID:          "job",
 		ContentType: "",
 		ContentID:   "",
-		CacheDir:    cacheDir,
 	}
-	_ = os.WriteFile(filepath.Join(cacheDir, posterFileName), []byte("poster"), 0644)
 
 	state := &playbackState{
 		ctx:           ctx,
 		cancel:        cancel,
 		cacheDir:      t.TempDir(),
+		posterPath:    posterPath,
 		lastRequested: -1,
 		maxRequested:  -1,
 	}
@@ -195,6 +200,36 @@ func TestRunPlaceholderUsesPlainWhenContentIDMissing(t *testing.T) {
 	if len(ff.imageCalls) != 0 {
 		t.Fatalf("expected no image placeholder calls, got %d", len(ff.imageCalls))
 	}
-
 	cancel()
+}
+
+// TestStateForPreservesPosterPath verifies that stateFor captures the poster
+// path from job.CacheDir before overwriting it with the playback cache dir.
+func TestStateForPreservesPosterPath(t *testing.T) {
+	mux := &Muxer{
+		states: make(map[string]*playbackState),
+	}
+
+	posterDir := t.TempDir()
+	posterPath := filepath.Join(posterDir, posterFileName)
+	_ = os.WriteFile(posterPath, []byte("poster"), 0644)
+
+	job := &model.MuxJob{
+		ID:       "job1",
+		CacheDir: posterDir,
+	}
+
+	state, err := mux.stateFor(job)
+	if err != nil {
+		t.Fatalf("stateFor: %v", err)
+	}
+
+	if state.posterPath != posterPath {
+		t.Fatalf("posterPath = %q, want %q", state.posterPath, posterPath)
+	}
+
+	// job.CacheDir should now be the playback cache dir, not the poster dir.
+	if job.CacheDir == posterDir {
+		t.Fatal("job.CacheDir should have been overwritten")
+	}
 }

@@ -117,14 +117,20 @@ func fetchPoster(ctx context.Context, client *http.Client, contentType, contentI
 
 // prefetchPoster starts a best-effort poster download in the background. The
 // returned channel is closed once the attempt finishes (success or failure).
-func (m *Muxer) prefetchPoster(ctx context.Context, contentType, contentID, destPath string) chan struct{} {
+// It deliberately uses context.Background() instead of the caller's context
+// because the caller (Process) runs inside an HTTP request that completes as
+// soon as the stream list is returned — using the request context would cancel
+// the download before it finishes.
+func (m *Muxer) prefetchPoster(_ context.Context, contentType, contentID, destPath string) chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		prefetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		prefetchCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		if err := fetchPoster(prefetchCtx, m.httpClient, contentType, contentID, destPath); err != nil {
 			log.Printf("mux: poster prefetch failed: %v", err)
+		} else {
+			log.Printf("mux: poster prefetch ok -> %s", destPath)
 		}
 	}()
 	return done

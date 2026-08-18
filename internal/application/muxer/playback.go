@@ -40,7 +40,8 @@ type playbackState struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	cacheDir string
+	cacheDir   string
+	posterPath string // absolute path to poster.jpg, set by stateFor from Process's poster dir
 
 	// active is the ffmpeg session currently encoding the film (or the
 	// terminal error video). Segments produced by earlier generations remain
@@ -116,11 +117,21 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create playback cache: %w", err)
 	}
+
+	// Preserve the poster path that Process set up (job.CacheDir was the
+	// poster dir at that point) before we overwrite it with the playback
+	// cache dir.
+	posterPath := ""
+	if job.CacheDir != "" {
+		posterPath = filepath.Join(job.CacheDir, posterFileName)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &playbackState{
 		ctx:           ctx,
 		cancel:        cancel,
 		cacheDir:      dir,
+		posterPath:    posterPath,
 		lastRequested: -1,
 		maxRequested:  -1,
 		lastAccess:    time.Now(),
@@ -290,9 +301,9 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	// Prefer a composed placeholder with the film poster, but only when the
 	// poster is already available or arrives within a very short window. We
 	// never delay playback for the poster: Cinemeta is best-effort.
-	posterPath := filepath.Join(job.CacheDir, posterFileName)
-	usePoster := fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
-	if !usePoster && job.ContentType != "" && job.ContentID != "" {
+	posterPath := state.posterPath
+	usePoster := posterPath != "" && fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
+	if !usePoster && posterPath != "" && job.ContentType != "" && job.ContentID != "" {
 		deadline := time.After(imagePlaceholderWait)
 	waitLoop:
 		for !fileExists(posterPath) {
