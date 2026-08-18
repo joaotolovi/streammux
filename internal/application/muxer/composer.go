@@ -272,7 +272,7 @@ func (c *composer) acquire() *composition {
 		}
 		c.lastKey = key
 		c.nextOrd++
-		log.Printf("mux: acquire vi=%d ai=%d -> video#%d audio#%d single=%v", c.vi, c.ai, v.idx, a.idx, a == v)
+		log.Printf("mux: acquire vi=%d ai=%d -> video#%d(score=%d) audio#%d(score=%d) single=%v key=%s", c.vi, c.ai, v.idx, analyzer.VideoScore(v.stream), a.idx, analyzer.AudioScore(a.stream), a == v, key[:min(60, len(key))])
 		return &composition{video: v, audio: a, single: false, lenient: c.lenient, ordinal: c.nextOrd}
 	}
 }
@@ -547,4 +547,11 @@ func makeCompositionPlan(comp *composition) model.PlaybackPlan {
 		Audio:          comp.audio.stream,
 		HasTargetAudio: true,
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
