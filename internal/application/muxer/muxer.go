@@ -45,6 +45,9 @@ type Policy struct {
 	RetryCooldown     time.Duration
 	MinRealtime       float64
 	MinPublishedAhead time.Duration
+	// MinHandoffBuffer is how much content the film must have ready before the
+	// intro hands off, so playback doesn't stall on the first bandwidth dip.
+	MinHandoffBuffer  time.Duration
 	DurationTolerance float64
 	// PlaceholderMinTime is how long the placeholder must play before the
 	// film takes over, even when the film is ready sooner.
@@ -65,6 +68,7 @@ func defaultPolicy() Policy {
 		RetryCooldown:      30 * time.Second,
 		MinRealtime:        1.0,
 		MinPublishedAhead:  12 * time.Second,
+		MinHandoffBuffer:   12 * time.Second,
 		DurationTolerance:  0.002,
 		PlaceholderMinTime: 8 * time.Second,
 	}

@@ -693,7 +693,7 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 
 	for {
 		if fileExists(segmentPath) && fileExists(audioSegmentPath) {
-			return generation, nil
+			break
 		}
 		select {
 		case <-attemptCtx.Done():
@@ -702,7 +702,7 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 			return nil, fmt.Errorf("first segment deadline: %w", attemptCtx.Err())
 		case <-session.Done():
 			if fileExists(segmentPath) && fileExists(audioSegmentPath) {
-				return generation, nil
+				break
 			}
 			go cleanupFailedGeneration(generation)
 			if session.Err() != nil {
@@ -713,6 +713,32 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 		case <-ticker.C:
 		}
 	}
+
+	// Wait for a minimum buffer before handing off from the placeholder, so
+	// the first bandwidth dip doesn't immediately stall playback.
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4.0
+	}
+	minSegs := int(math.Ceil(m.policy.MinHandoffBuffer.Seconds() / segDur))
+	for produced := 1; produced < minSegs; {
+		highest := highestCompleteSegment(generation.dir)
+		if highest >= 0 && highest-startNumber+1 >= minSegs {
+			break
+		}
+		select {
+		case <-attemptCtx.Done():
+			// Timeout while buffering: proceed with what we have rather than
+			// killing the session — some content is better than none.
+			return generation, nil
+		case <-session.Done():
+			// Session ended while buffering: proceed with what we have.
+			return generation, nil
+		case <-ticker.C:
+		}
+	}
+
+	return generation, nil
 }
 
 // coordinateRecovery walks the composer until one composition launches.
