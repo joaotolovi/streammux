@@ -71,9 +71,10 @@ func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Dura
 		// accumulates enough evidence.
 		last := samples[len(samples)-1]
 		if required > 0 && last.bytes > 0 && float64(last.bytes*8)/last.seconds < required {
-			log.Printf("mux: delivery %.1f Mbps below required %.1f Mbps (%.1f MB in %.1fs; window %d/%d)",
+			sustained := windowThroughput(samples)
+			log.Printf("mux: delivery %.1f Mbps below required %.1f Mbps (%.1f MB in %.1fs; window %d/%d sustained %.1f Mbps)",
 				float64(last.bytes*8)/last.seconds/1e6, required/1e6,
-				float64(last.bytes)/1e6, last.seconds, len(samples), deliveryWindow)
+				float64(last.bytes)/1e6, last.seconds, len(samples), deliveryWindow, sustained/1e6)
 		}
 		return
 	}
@@ -108,11 +109,31 @@ func appendDeliverySample(samples []deliverySample, started time.Time, sent int6
 	return samples
 }
 
-// playerTooSlow reports whether every recent delivery was slower than the
-// required bitrate. Requiring all samples in the window avoids false
-// positives from a single jittery delivery — except for a catastrophic
-// delivery (one transfer taking more than 3x the segment duration), which is
-// evidence enough on its own: the buffer is visibly draining.
+// windowThroughput returns the aggregate sustained throughput of the window:
+// total bits delivered divided by total transfer time. Idle gaps between
+// transfers are excluded — they mean the player was buffered, not slow.
+func windowThroughput(samples []deliverySample) float64 {
+	var bits, seconds float64
+	for _, s := range samples {
+		if s.bytes <= 0 || s.seconds <= 0 {
+			continue
+		}
+		bits += float64(s.bytes) * 8
+		seconds += s.seconds
+	}
+	if seconds <= 0 {
+		return 0
+	}
+	return bits / seconds
+}
+
+// playerTooSlow reports whether the player's sustained delivery throughput
+// cannot keep up with the required bitrate. It compares the AGGREGATE
+// throughput of the window (total bits / total transfer time) against the
+// requirement: a marginal link oscillating around the threshold drains the
+// player's buffer over time, and a per-sample "all below" rule would be
+// vetoed by every fast burst. A single catastrophic delivery (one transfer
+// taking >= 3x the segment duration) is evidence enough on its own.
 func playerTooSlow(samples []deliverySample, required float64) bool {
 	if required <= 0 || len(samples) == 0 {
 		return false
@@ -129,10 +150,5 @@ func playerTooSlow(samples []deliverySample, required float64) bool {
 	if len(samples) < deliveryWindow {
 		return false
 	}
-	for _, s := range samples {
-		if float64(s.bytes*8)/s.seconds >= required {
-			return false
-		}
-	}
-	return true
+	return windowThroughput(samples) < required
 }

@@ -1463,6 +1463,13 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	if prefer != nil && reason != "seek" {
 		m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
 	}
+	if reason == "player throughput" {
+		// The bottleneck is the player's link, not the server: relaunching
+		// the same heavy source would always succeed (server-side
+		// production is healthy) and the downgrade would be a no-op. Drop
+		// the preference so the composer picks the next lighter video.
+		prefer = nil
+	}
 	if reason == "no active session" {
 		state.mu.Lock()
 		if state.composer != nil {

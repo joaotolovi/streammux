@@ -544,8 +544,6 @@ func TestSegmentPathSearchesGenerationsNewestFirst(t *testing.T) {
 func TestPlayerTooSlowRequiresAllWindowsSlow(t *testing.T) {
 	now := time.Unix(1000, 0)
 	required := 10_000_000.0 // 10 Mbps
-	// 1 MB in 0.5s = 16 Mbps (fast).
-	fast := deliverySample{at: now, bytes: 1_000_000, seconds: 0.5}
 	// 1 MB in 2s = 4 Mbps (slow).
 	slow := deliverySample{at: now, bytes: 1_000_000, seconds: 2}
 
@@ -555,14 +553,35 @@ func TestPlayerTooSlowRequiresAllWindowsSlow(t *testing.T) {
 	if playerTooSlow([]deliverySample{slow, slow}, required) {
 		t.Fatal("fewer than window samples must not decide")
 	}
-	if playerTooSlow([]deliverySample{slow, slow, fast}, required) {
-		t.Fatal("one fast delivery in the window must veto the downgrade")
+	// Aggregate model: fast deliveries that keep the window's sustained
+	// throughput above the requirement veto the downgrade even with one
+	// slow sample (32+32+4 Mbps samples average above 10 Mbps).
+	fast2x := deliverySample{at: now, bytes: 2_000_000, seconds: 0.5}
+	if playerTooSlow([]deliverySample{fast2x, fast2x, slow}, required) {
+		t.Fatal("window with sustained throughput above requirement must veto the downgrade")
 	}
 	if !playerTooSlow([]deliverySample{slow, slow, slow}, required) {
 		t.Fatal("all deliveries slow must downgrade")
 	}
 	if playerTooSlow([]deliverySample{slow, slow, slow}, 0) {
 		t.Fatal("unknown required bitrate must not downgrade")
+	}
+}
+
+// TestPlayerTooSlowMarginalOscillatingLink reproduces the exact field
+// scenario: a link oscillating just below the required bitrate. The old
+// per-sample "all below" rule was vetoed by every fast burst and the
+// downgrade never fired; the aggregate sustained throughput must decide.
+func TestPlayerTooSlowMarginalOscillatingLink(t *testing.T) {
+	required := 97_000_000.0 // 97 Mbps (77.5 Mbps REMUX with 1.25x headroom)
+	// 39 MB in 3.3s = 94.5 Mbps, 46 MB in 3.9s = 94.5 Mbps, 41.4 MB in 5.6s
+	// = 59.2 Mbps — the exact deliveries observed in production.
+	// Aggregate: 126.4 MB in 12.8s = 79 Mbps < 97 Mbps → must downgrade.
+	below1 := deliverySample{at: time.Unix(1000, 0), bytes: 39_000_000, seconds: 3.3}
+	below2 := deliverySample{at: time.Unix(1010, 0), bytes: 46_000_000, seconds: 3.9}
+	below3 := deliverySample{at: time.Unix(1020, 0), bytes: 41_400_000, seconds: 5.6}
+	if !playerTooSlow([]deliverySample{below1, below2, below3}, required) {
+		t.Fatal("marginal oscillating link must be detected as too slow")
 	}
 }
 
