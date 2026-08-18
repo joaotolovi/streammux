@@ -52,6 +52,11 @@ type Policy struct {
 	// MinHandoffBuffer is how much content the film must have ready before the
 	// intro hands off, so playback doesn't stall on the first bandwidth dip.
 	MinHandoffBuffer  time.Duration
+	// TierSwitchBuffer is the cushion required when spinning up a lazy ABR
+	// tier switch: smaller than the startup cushion so the switch is fast,
+	// but nonzero so the first segment is already out before the player
+	// resumes.
+	TierSwitchBuffer  time.Duration
 	DurationTolerance float64
 	// PlaceholderMinTime is how long the placeholder must play before the
 	// film takes over, even when the film is ready sooner.
@@ -73,6 +78,7 @@ func defaultPolicy() Policy {
 		MinRealtime:        1.0,
 		MinPublishedAhead:  12 * time.Second,
 		MinHandoffBuffer:   20 * time.Second,
+		TierSwitchBuffer:   8 * time.Second,
 		DurationTolerance:  0.002,
 		PlaceholderMinTime: 8 * time.Second,
 	}
@@ -219,6 +225,14 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	}
 
 	jobID := m.store.Save(job)
+
+	// Compute the ABR downgrade ladder metadata for the master playlist from
+	// the plan list (no probing): tier 0 is the primary plan, tiers 1-2 pick
+	// the best lighter source when one exists within the tier's bitrate
+	// budget, else fall back to a transcode of the primary source. The
+	// strategies themselves are resolved lazily when the player requests a
+	// tier.
+	job.TierMetas = tierMetasFromPlans(plans)
 
 	// Start a best-effort poster prefetch in a per-job temp directory. If the
 	// user clicks play immediately, runPlaceholder will wait up to 500ms for this

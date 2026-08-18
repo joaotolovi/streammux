@@ -83,6 +83,18 @@ type playbackState struct {
 	// composer assembles source compositions dynamically; created lazily.
 	composer *composer
 
+	// ABR downgrade ladder: activeTier is the tier the player is currently
+	// consuming (0 = primary), tier0Prepared retains the primary plan for
+	// transcode strategies, tierBudgets are per-tier bitrate ceilings, and
+	// tierDisc marks per-tier video discontinuities (strategy switches).
+	activeTier    int
+	tierBusy      bool
+	tierWait      chan struct{}
+	tierErr       error
+	tier0Prepared *preparedPlan
+	tierBudgets   [tierCount]int64
+	tierDisc      [tierCount][]int
+
 	duration      float64 // film duration in seconds (from probe)
 	lastRequested int
 	maxRequested  int
@@ -101,6 +113,7 @@ type generation struct {
 	dir          string
 	session      *ffmpeg.Session
 	startSegment int // first public segment number this generation writes
+	tier         int // ABR tier namespace this generation serves (0 = primary)
 	startedAt    time.Time
 	isLocal      bool // placeholder or error video
 	isError      bool
@@ -489,7 +502,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		state.filmBase = base
 		state.mu.Unlock()
 
-		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, base, 0)
+		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, base, 0, m.policy.MinHandoffBuffer)
 		if err == nil {
 			winner = gen
 			break
@@ -526,6 +539,9 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.placeholder = nil
 	state.retiredPlaceholder = placeholder
 	state.active = winner
+	state.activeTier = 0
+	state.tier0Prepared = winner.prepared
+	state.tierBudgets = tierBudgets(streamBandwidth(winner.plan.Video))
 	state.all = append(state.all, winner)
 	state.starting = false
 	state.startErr = nil
@@ -694,8 +710,11 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 
 // launchGeneration starts the ffmpeg session for a prepared plan and waits
 // for its first segment. startNumber is the first public segment written;
-// startTime is the content offset in seconds (0 for a fresh start).
-func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIndex int, prepared *preparedPlan, startNumber int, startTime float64) (*generation, error) {
+// startTime is the content offset in seconds (0 for a fresh start). tier is
+// the ABR namespace the generation serves; minBuffer is how much content must
+// be ready before returning (the initial handoff wants a deep cushion, lazy
+// tier switches and seeks want speed).
+func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIndex int, prepared *preparedPlan, tier, startNumber int, startTime float64, minBuffer time.Duration) (*generation, error) {
 	// Seeks do a remote input seek on a large file (MKV cues, byte-range
 	// request to the debrid), which can take much longer than a fresh start
 	// before the first segment appears.
@@ -737,6 +756,7 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 		AudioTitle:      job.TargetLanguage,
 		UserAgent:       browserUA,
 		AudioOffset:     audioOffset,
+		Transcode:       prepared.transcode,
 	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
@@ -751,6 +771,7 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 		dir:          dir,
 		session:      session,
 		startSegment: startNumber,
+		tier:         tier,
 		startedAt:    time.Now(),
 	}
 
@@ -788,7 +809,10 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 	if segDur <= 0 {
 		segDur = 4.0
 	}
-	minSegs := int(math.Ceil(m.policy.MinHandoffBuffer.Seconds() / segDur))
+	if minBuffer < 0 {
+		minBuffer = 0
+	}
+	minSegs := int(math.Ceil(minBuffer.Seconds() / segDur))
 	for produced := 1; produced < minSegs; {
 		highest := highestCompleteSegment(generation.dir)
 		if highest >= 0 && highest-startNumber+1 >= minSegs {
@@ -815,6 +839,14 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, prefer *generation, startSegment int, timeout time.Duration) (*generation, error) {
 	deadline := time.Now().Add(timeout)
 
+	state.mu.Lock()
+	tier := state.activeTier
+	budget := int64(0)
+	if tier > 0 && tier < tierCount {
+		budget = state.tierBudgets[tier]
+	}
+	state.mu.Unlock()
+
 	if prefer != nil && prefer.prepared != nil {
 		state.mu.Lock()
 		base := state.filmBase
@@ -823,7 +855,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		if startTime < 0 {
 			startTime = 0
 		}
-		if gen, err := m.launchGeneration(job, state, prefer.planIndex, prefer.prepared, startSegment, startTime); err == nil {
+		if gen, err := m.launchGeneration(job, state, prefer.planIndex, prefer.prepared, prefer.tier, startSegment, startTime, m.policy.MinHandoffBuffer); err == nil {
 			return gen, nil
 		} else {
 			log.Printf("mux: preferred sources failed to relaunch: %v", err)
@@ -842,7 +874,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 			break
 		}
 		state.mu.Lock()
-		candidate := comp.acquire()
+		candidate := comp.acquireWithin(budget)
 		state.mu.Unlock()
 		if candidate == nil {
 			break
@@ -867,7 +899,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		if startTime < 0 {
 			startTime = 0
 		}
-		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, startSegment, startTime)
+		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, tier, startSegment, startTime, m.policy.MinHandoffBuffer)
 		if err == nil {
 			return gen, nil
 		}
@@ -923,7 +955,10 @@ func (m *Muxer) resolveDirectFallback(job *model.MuxJob, state *playbackState) s
 
 // MasterPlaylist renders the master we serve. The audio rendition group is
 // declared in every phase — without it players ignore the audio playlist and
-// every film plays silently.
+// every film plays silently. When ABR tiers are available (the film is live and
+// the ladder was computed at Process time), the master advertises one variant
+// per tier so the player can switch down automatically on network dips and the
+// user can switch manually on decode issues.
 func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
@@ -934,9 +969,13 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	active := state.active
 	placeholder := state.placeholder
 	duration := state.duration
+	tiers := len(job.TierMetas)
 	state.mu.Unlock()
 
 	if active != nil && !active.isError && active.prepared != nil && duration > 0 {
+		if tiers > 1 {
+			return m.renderMasterABR(job.TierMetas, job.TargetLanguage), true
+		}
 		bitrate := active.prepared.videoBitrate
 		if bitrate <= 0 {
 			bitrate = float64(active.plan.EstimatedBandwidth())
@@ -952,6 +991,46 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return m.renderMaster(3_000_000, 0, 0, job.TargetLanguage), true
 	}
 	return nil, false
+}
+
+// renderMasterABR renders the master with one #EXT-X-STREAM-INF per tier. The
+// audio rendition group is shared: the audio playlist stays the same across
+// tiers (the dub is preserved). Each variant points at video/v{tier}.m3u8 so
+// the HTTP layer can route tier-specific playlist and segment requests.
+func (m *Muxer) renderMasterABR(metas []model.TierMeta, targetLanguage string) []byte {
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:6\n")
+	code := ffmpeg.LanguageCode(targetLanguage)
+	name := targetLanguage
+	if name == "" {
+		name = "Audio"
+	}
+	media := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=YES,AUTOSELECT=YES", name)
+	if code != "" {
+		media += ",LANGUAGE=\"" + code + "\""
+	}
+	media += ",URI=\"audio/audio.m3u8\"\n"
+	b.WriteString(media)
+
+	for i, meta := range metas {
+		bandwidth := meta.Bandwidth
+		if bandwidth <= 0 {
+			bandwidth = 8_000_000
+		}
+		streamInf := fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d", bandwidth)
+		if meta.Width > 0 && meta.Height > 0 {
+			streamInf += fmt.Sprintf(",RESOLUTION=%dx%d", meta.Width, meta.Height)
+		}
+		streamInf += ",AUDIO=\"aud\"\n"
+		b.WriteString(streamInf)
+		if i == 0 {
+			b.WriteString("video/video.m3u8\n")
+		} else {
+			b.WriteString(fmt.Sprintf("video/v%d.m3u8\n", i))
+		}
+	}
+	return []byte(b.String())
 }
 
 func (m *Muxer) renderMaster(bandwidth int64, width, height int, targetLanguage string) []byte {
@@ -980,17 +1059,20 @@ func (m *Muxer) renderMaster(bandwidth int64, width, height int, targetLanguage 
 	return []byte(b.String())
 }
 
-// VideoPlaylist renders the video media playlist for the current phase.
-func (m *Muxer) VideoPlaylist(job *model.MuxJob) ([]byte, bool) {
-	return m.renderMediaPlaylist(job)
+// VideoPlaylist renders the video media playlist for the requested ABR tier.
+// tier 0 (the default, served at video/video.m3u8) uses the shared timeline;
+// higher tiers are served at video/v{tier}.m3u8 and trigger a lazy downgrade-
+// ladder spin-up on first request. Audio is shared across tiers.
+func (m *Muxer) VideoPlaylist(job *model.MuxJob, tier int) ([]byte, bool) {
+	return m.renderMediaPlaylist(job, tier)
 }
 
 // AudioPlaylist renders the audio media playlist for the current phase.
 func (m *Muxer) AudioPlaylist(job *model.MuxJob) ([]byte, bool) {
-	return m.renderMediaPlaylist(job)
+	return m.renderMediaPlaylist(job, 0)
 }
 
-func (m *Muxer) renderMediaPlaylist(job *model.MuxJob) ([]byte, bool) {
+func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) {
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return nil, false
@@ -1003,10 +1085,25 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob) ([]byte, bool) {
 	base := state.filmBase
 	duration := state.duration
 	disc := append([]int(nil), state.discontinuities...)
+	if tier > 0 && tier < tierCount {
+		disc = append(disc, state.tierDisc[tier]...)
+	}
 	errGen := state.errorGeneration
 	errStart := state.errorStart
+	activeTier := state.activeTier
+	tierBusy := state.tierBusy
+	lastRequested := state.lastRequested
 	state.mu.Unlock()
 
+	// A tier > 0 that is not yet active: ensure the downgrade ladder spins up
+	// at the player's position. The playlist this call returns is the same
+	// shared VOD timeline (the ladder's first segment carries a
+	// DISCONTINUITY); the player does not see the tier namespace.
+	if tier > 0 && tier != activeTier && !tierBusy && lastRequested >= 0 {
+		m.ensureTier(job, state, tier, lastRequested+1)
+	}
+
+	_ = retired
 	// Live placeholder phase: synchronized sliding window of both renditions,
 	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
@@ -1253,18 +1350,21 @@ func vodSegmentCount(filmDuration float64) int {
 }
 
 // EnsureSegment serves (or waits for / restarts at) the requested video
-// segment. Backward requests hit the on-disk cache; forward requests beyond
-// what the encoder produced restart the session at that offset.
-func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
-	return m.ensureMediaSegment(ctx, job, segment, false)
+// segment for the given ABR tier. tier 0 is the primary; tiers > 0 trigger a
+// lazy downgrade-ladder spin-up on first request. Backward requests hit the
+// on-disk cache; forward requests beyond what the encoder produced restart
+// the session at that offset.
+func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment, tier int) (string, error) {
+	return m.ensureMediaSegment(ctx, job, segment, tier, false)
 }
 
-// EnsureAudioSegment is EnsureSegment for the audio rendition.
+// EnsureAudioSegment is EnsureSegment for the audio rendition (tier-agnostic:
+// audio is shared across tiers).
 func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
-	return m.ensureMediaSegment(ctx, job, segment, true)
+	return m.ensureMediaSegment(ctx, job, segment, 0, true)
 }
 
-func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segment int, audio bool) (string, error) {
+func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segment, tier int, audio bool) (string, error) {
 	if err := m.EnsurePlaylist(ctx, job); err != nil {
 		return "", err
 	}
@@ -1275,6 +1375,24 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return "", fmt.Errorf("playback state not found")
+	}
+
+	// A tier > 0 not yet active: spin up the downgrade ladder at the
+	// player's position before falling through to the normal wait/seek
+	// logic. The ladder's first segment carries a DISCONTINUITY.
+	if !audio && tier > 0 {
+		state.mu.Lock()
+		busy := state.tierBusy
+		activeTier := state.activeTier
+		lastRequested := state.lastRequested
+		state.mu.Unlock()
+		if !busy && activeTier != tier {
+			at := lastRequested + 1
+			if at < 0 {
+				at = segment
+			}
+			m.ensureTier(job, state, tier, at)
+		}
 	}
 
 	state.mu.Lock()
@@ -1404,7 +1522,7 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		}
 
 		log.Printf("mux: fast seek to segment %d (%.0fs) with the active sources", targetSegment, startTime)
-		gen, err := m.launchGeneration(job, state, old.planIndex, old.prepared, targetSegment, startTime)
+		gen, err := m.launchGeneration(job, state, old.planIndex, old.prepared, old.tier, targetSegment, startTime, 0)
 
 		state.mu.Lock()
 		wait := state.recoveryWait
@@ -1528,6 +1646,19 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	}
 	log.Printf("mux: switched at segment %d to video#%d audio#%d (%s) after %s", startSegment, winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, reason)
 	go m.monitorGeneration(job, state, winner)
+}
+
+// ActiveTier returns the ABR tier currently serving the job (0 = primary).
+// Used by the segment handler to spin up the correct tier when a segment is
+// not yet produced. It returns 0 before playback starts.
+func (m *Muxer) ActiveTier(job *model.MuxJob) int {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return 0
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.activeTier
 }
 
 func (m *Muxer) lookupState(jobID string) *playbackState {

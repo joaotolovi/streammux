@@ -26,6 +26,21 @@ const (
 	AudioModeAAC  AudioMode = "aac"
 )
 
+// TranscodeSpec re-encodes the video on the fly instead of copying it. It is
+// used by the ABR downgrade ladder when no lighter source exists: the same
+// source is decoded once and re-encoded to a decode-friendly H.264 rendition
+// (8-bit, capped bitrate) at the segment the player is about to watch.
+type TranscodeSpec struct {
+	// Height is the target height in pixels (width follows the aspect).
+	Height int
+	// MaxRateKbps caps the peak bitrate; CRF+maxrate bounds both quality and
+	// bandwidth. BufSize defaults to 2x MaxRate.
+	MaxRateKbps int
+	// Preset is the x264 preset; veryfast sustains 4-8x realtime for 1080p
+	// on a modern desktop CPU.
+	Preset string
+}
+
 // SessionSpec describes one continuous FFmpeg HLS session. AudioURL may be
 // empty (or equal to VideoURL) to select both streams from a single input.
 // Stream indexes are relative to their media type, as used by FFmpeg maps such
@@ -51,6 +66,9 @@ type SessionSpec struct {
 	// only applied for dual-source sessions and is derived from a cross-
 	// correlation of the first seconds of both audio tracks (or set manually).
 	AudioOffset time.Duration
+	// Transcode, when non-nil, re-encodes the video (see TranscodeSpec)
+	// instead of stream-copying it.
+	Transcode *TranscodeSpec
 }
 
 // Session is a single continuous FFmpeg run that produces HLS segments.
@@ -229,7 +247,31 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	}
 	args = append(args,
 		"-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex),
-		"-c:v", "copy",
+	)
+	if tc := spec.Transcode; tc != nil {
+		// Downgrade-ladder transcode: decode once, re-encode to a capped,
+		// decode-friendly H.264 rendition. Keyframes forced on the 4s grid so
+		// HLS segmentation stays aligned without split_by_time.
+		preset := strings.TrimSpace(tc.Preset)
+		if preset == "" {
+			preset = "veryfast"
+		}
+		bufKbps := tc.MaxRateKbps * 2
+		args = append(args,
+			"-c:v", "libx264",
+			"-preset", preset,
+			"-pix_fmt", "yuv420p",
+			"-vf", fmt.Sprintf("scale=-2:%d", tc.Height),
+			"-crf", "20",
+			"-maxrate", fmt.Sprintf("%dk", tc.MaxRateKbps),
+			"-bufsize", fmt.Sprintf("%dk", bufKbps),
+			"-sc_threshold", "0",
+			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%.0f)", segDuration),
+		)
+	} else {
+		args = append(args, "-c:v", "copy")
+	}
+	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
 		"-hls_playlist_type", "event",

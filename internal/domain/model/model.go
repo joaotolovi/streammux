@@ -170,6 +170,16 @@ func (p PlaybackPlan) SingleSource() bool {
 	return p.Audio.SourceKey() == p.Video.SourceKey()
 }
 
+// TierMeta advertises one ABR variant in the master playlist. Tiers are
+// severity signals ("give me something lighter"), not bindings: behind each
+// tier the server walks a downgrade ladder of strategies (lighter sources or
+// an on-the-fly transcode) picking the highest expected quality.
+type TierMeta struct {
+	Bandwidth int64 `json:"bandwidth"`
+	Width     int   `json:"width,omitempty"`
+	Height    int   `json:"height,omitempty"`
+}
+
 type MuxJob struct {
 	ID             string         `json:"id"`
 	TargetLanguage string         `json:"targetLanguage"`
@@ -187,6 +197,11 @@ type MuxJob struct {
 	// (e.g. poster art) while the film is prepared.
 	ContentType string `json:"-"`
 	ContentID   string `json:"-"`
+
+	// TierMetas describes the ABR variants served in the master playlist,
+	// computed from plan metadata at Process time. Index 0 is the primary
+	// (best) plan; higher indexes are progressively lighter.
+	TierMetas []TierMeta `json:"tierMetas,omitempty"`
 }
 
 type Manifest struct {

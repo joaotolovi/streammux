@@ -277,6 +277,15 @@ func audioRoleRank(role string) int {
 // acquire returns the next composition from the ranked list, skipping
 // exhausted sources and incompatible pairs. Must be called with state.mu held.
 func (c *composer) acquire() *composition {
+	return c.acquireWithin(0)
+}
+
+// acquireWithin is acquire with a video bitrate ceiling: compositions whose
+// video source is estimated above maxBits bits/s are skipped. Used by
+// recoveries on a lightweight ABR tier so a failed light session is not
+// "recovered" back onto the heavy primary source. maxBits <= 0 means
+// unlimited. Must be called with state.mu held.
+func (c *composer) acquireWithin(maxBits int64) *composition {
 	for {
 		if c.done {
 			return nil
@@ -298,6 +307,10 @@ func (c *composer) acquire() *composition {
 			continue
 		}
 		if !comp.single && c.incompatible[pairKey(comp)] {
+			c.cursor++
+			continue
+		}
+		if maxBits > 0 && streamBandwidth(comp.video.stream) > maxBits {
 			c.cursor++
 			continue
 		}
@@ -420,19 +433,34 @@ func (c *composer) reset() {
 	c.cursor = 0
 	c.lenient = false
 	c.done = false
+	c.incompatible = make(map[string]bool)
 	c.lastDelivered = ""
-	c.incompatible = map[string]bool{}
-	for _, s := range c.videos {
-		s.failed = false
-		s.failErr = nil
+	for _, q := range [][]*sourceState{c.videos, c.audios} {
+		for _, s := range q {
+			s.failed = false
+			s.failErr = nil
+			s.trackDone = false
+			s.track = 0
+			s.trackLeni = 0
+		}
 	}
-	for _, s := range c.audios {
-		s.failed = false
-		s.failErr = nil
-		s.trackDone = false
-		s.track = -1
-		s.trackLeni = -1
+}
+
+// sourceByKey returns the sourceState for a given SourceKey, or nil when no
+// source in either queue matches. Used by the ABR ladder to pair a lighter
+// video with the current dub audio. Must be called with state.mu held.
+func (c *composer) sourceByKey(sourceKey string) *sourceState {
+	if sourceKey == "" {
+		return nil
 	}
+	for _, q := range [][]*sourceState{c.videos, c.audios} {
+		for _, s := range q {
+			if s.stream.SourceKey() == sourceKey {
+				return s
+			}
+		}
+	}
+	return nil
 }
 
 func (m *Muxer) composerFor(job *model.MuxJob, state *playbackState) *composer {

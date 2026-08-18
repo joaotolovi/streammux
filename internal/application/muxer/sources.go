@@ -64,6 +64,9 @@ type preparedPlan struct {
 	// videoAudioTracks are the audio tracks of the video source, used for A/V
 	// offset estimation on dual-source plans.
 	videoAudioTracks []ffmpeg.AudioTrack
+	// transcode, when non-nil, re-encodes the video on the fly instead of
+	// stream-copying it. Set by ABR downgrade-ladder strategies.
+	transcode *ffmpeg.TranscodeSpec
 }
 
 func (m *Muxer) preparePlan(ctx context.Context, job *model.MuxJob, plan model.PlaybackPlan) (*preparedPlan, error) {

@@ -56,9 +56,8 @@ func (s *Server) routes() {
 	// HLS endpoints — master, renditions and segments.
 	s.mux.HandleFunc("GET /mux/{jobId}", s.handleMuxRedirect)
 	s.mux.HandleFunc("GET /mux/{jobId}/playlist.m3u8", s.handleHLSMaster)
-	s.mux.HandleFunc("GET /mux/{jobId}/video/video.m3u8", s.handleHLSVideoPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/video/{path...}", s.handleHLSVideoPath)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/audio.m3u8", s.handleHLSAudioPlaylist)
-	s.mux.HandleFunc("GET /mux/{jobId}/video/{segment}", s.handleHLSSegment)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
 
 	// API
@@ -202,8 +201,21 @@ func (s *Server) handleHLSMaster(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func (s *Server) handleHLSVideoPlaylist(w http.ResponseWriter, r *http.Request) {
-	s.serveVodPlaylist(w, r, s.muxer.VideoPlaylist)
+func (s *Server) handleHLSVideoPath(w http.ResponseWriter, r *http.Request) {
+	path := r.PathValue("path")
+	// video.m3u8 or v{N}.m3u8 → playlist; anything else → segment file.
+	if strings.HasSuffix(path, ".m3u8") {
+		tier := 0
+		if strings.HasPrefix(path, "v") {
+			fmt.Sscanf(path, "v%d.m3u8", &tier)
+		}
+		finalTier := tier
+		s.serveVodPlaylist(w, r, func(job *model.MuxJob) ([]byte, bool) {
+			return s.muxer.VideoPlaylist(job, finalTier)
+		})
+		return
+	}
+	s.serveSegment(w, r, false)
 }
 
 func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) {
@@ -254,7 +266,12 @@ func (s *Server) handleHLSAudioSegment(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool) {
 	jobID := r.PathValue("jobId")
-	segment := filepath.Base(r.PathValue("segment"))
+	// "path" is set by the video catch-all route; "segment" by the audio route.
+	segment := r.PathValue("path")
+	if segment == "" {
+		segment = r.PathValue("segment")
+	}
+	segment = filepath.Base(segment)
 	job, ok := s.store.Get(jobID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "mux job not found")
@@ -290,7 +307,7 @@ func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool
 	if audio {
 		segPath, err = s.muxer.EnsureAudioSegment(r.Context(), job, segIndex)
 	} else {
-		segPath, err = s.muxer.EnsureSegment(r.Context(), job, segIndex)
+		segPath, err = s.muxer.EnsureSegment(r.Context(), job, segIndex, s.muxer.ActiveTier(job))
 	}
 	if err != nil {
 		if errors.Is(err, muxer.ErrBeyondEnd) {

@@ -192,7 +192,7 @@ func TestRenderMediaPlaylistVodWithDiscontinuity(t *testing.T) {
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	data, ok := mux.VideoPlaylist(job)
+	data, ok := mux.VideoPlaylist(job, 0)
 	if !ok {
 		t.Fatal("VideoPlaylist() returned false")
 	}
@@ -223,7 +223,7 @@ func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	data, ok := mux.VideoPlaylist(job)
+	data, ok := mux.VideoPlaylist(job, 0)
 	if !ok {
 		t.Fatal("VideoPlaylist() returned false")
 	}
@@ -254,7 +254,7 @@ func TestRenderMediaPlaylistErrorTailTruncatesFilm(t *testing.T) {
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	data, ok := mux.VideoPlaylist(job)
+	data, ok := mux.VideoPlaylist(job, 0)
 	if !ok {
 		t.Fatal("VideoPlaylist() returned false")
 	}
@@ -281,7 +281,7 @@ func TestRenderMediaPlaylistErrorOnlyAfterPlaceholder(t *testing.T) {
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	data, ok := mux.VideoPlaylist(job)
+	data, ok := mux.VideoPlaylist(job, 0)
 	if !ok {
 		t.Fatal("VideoPlaylist() returned false")
 	}
@@ -480,7 +480,7 @@ func TestVodPlaylistServesFullDurationImmediately(t *testing.T) {
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}
 
-	data, ok := mux.VideoPlaylist(job)
+	data, ok := mux.VideoPlaylist(job, 0)
 	if !ok {
 		t.Fatal("VideoPlaylist() returned false")
 	}
