@@ -1242,13 +1242,16 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		recoveryErr := state.recoveryErr
+		// Capture the max BEFORE including this request: a real seek jumps
+		// far beyond it, and comparing against a max that already contains
+		// the request itself never detects anything.
+		prevMax := state.maxRequested
 		if !placeholderActive {
 			state.lastRequested = segment
 			if segment > state.maxRequested {
 				state.maxRequested = segment
 			}
 		}
-		maxReq := state.maxRequested
 		state.mu.Unlock()
 
 		if placeholderActive {
@@ -1278,7 +1281,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 					m.ensureRecovery(job, state, segment, "session ended")
 				}
 			default:
-				if (segment < active.startSegment || isForwardSeek(maxReq, segment, highest, active.startSegment)) && !recovering {
+				if (segment < active.startSegment || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
 					m.fastSeek(job, state, active, segment)
 				}
 			}

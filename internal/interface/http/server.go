@@ -81,7 +81,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	s.mux.ServeHTTP(w, r)
+	sw := &statusWriter{ResponseWriter: w, status: 200}
+	s.mux.ServeHTTP(sw, r)
+	if sw.status >= 400 {
+		log.Printf("http %d %s %s", sw.status, r.Method, r.URL.Path)
+	}
+}
+
+// statusWriter records the response status for request logging.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func (s *Server) handlePublicManifest(w http.ResponseWriter, r *http.Request) {
