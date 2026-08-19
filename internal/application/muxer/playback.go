@@ -138,6 +138,7 @@ type generation struct {
 	startedAt    time.Time
 	isLocal      bool // placeholder or error video
 	isError      bool
+	cleanupOnce  sync.Once
 }
 
 func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
@@ -2020,13 +2021,17 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			}
 		} else if !active.isError {
 			highest := highestCompleteSegment(active.dir)
+			lowest := lowestCompleteSegment(active.dir)
 			select {
 			case <-active.session.Done():
 				if !recovering {
 					m.ensureRecovery(job, state, segment, "session ended")
 				}
 			default:
-				if (segment < active.startSegment || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
+				// A bounded HLS cache removes old segments. A request behind the
+				// producer is therefore a backward seek and must relaunch at that
+				// position instead of retaining the entire film on disk.
+				if (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
 					m.fastSeek(job, state, active, segment)
 				}
 			}
@@ -2116,6 +2121,7 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		}
 		if old != gen {
 			old.session.Cancel()
+			m.removeGenerationWhenStopped(old)
 		}
 		log.Printf("mux: fast seek landed on segment %d", targetSegment)
 		go m.monitorGeneration(job, state, gen)
@@ -2209,6 +2215,7 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	}
 	if old != nil && old != winner {
 		old.session.Cancel()
+		m.removeGenerationWhenStopped(old)
 	}
 	log.Printf("mux: switched at segment %d to video#%d audio#%d (%s) after %s", startSegment, winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, reason)
 	go m.monitorGeneration(job, state, winner)
@@ -2246,6 +2253,21 @@ func generationAudioPlaylistPath(generation *generation) string {
 		return ""
 	}
 	return filepath.Join(generation.dir, "audio", "audio.m3u8")
+}
+
+// removeGenerationWhenStopped prevents repeated seeks from accumulating
+// retired HLS windows. Files already opened by an HTTP response remain valid
+// on Linux after unlinking.
+func (m *Muxer) removeGenerationWhenStopped(generation *generation) {
+	if generation == nil || generation.session == nil || generation.dir == "" {
+		return
+	}
+	generation.cleanupOnce.Do(func() {
+		go func() {
+			<-generation.session.Done()
+			_ = os.RemoveAll(generation.dir)
+		}()
+	})
 }
 
 func generationSegmentPath(generation *generation, segment int) string {
@@ -2288,6 +2310,24 @@ func highestCompleteSegment(dir string) int {
 	return highest
 }
 
+func lowestCompleteSegment(dir string) int {
+	entries, err := os.ReadDir(filepath.Join(dir, "video"))
+	if err != nil {
+		return -1
+	}
+	lowest := -1
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		var index int
+		if _, err := fmt.Sscanf(entry.Name(), "seg_%05d.ts", &index); err == nil && (lowest < 0 || index < lowest) {
+			lowest = index
+		}
+	}
+	return lowest
+}
+
 func computeEqualLengthSegments(segDur, total float64) []float64 {
 	if segDur <= 0 || total <= 0 {
 		return nil
@@ -2313,6 +2353,7 @@ func (m *Muxer) reapIdleSessions() {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for now := range ticker.C {
+		m.enforceCacheBudget()
 		m.stateMu.Lock()
 		states := make([]*playbackState, 0, len(m.states))
 		for _, state := range m.states {

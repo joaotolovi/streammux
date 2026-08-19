@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/streammux/streammux/internal/application/collector"
@@ -61,6 +63,12 @@ type Policy struct {
 	// PlaceholderMinTime is how long the placeholder must play before the
 	// film takes over, even when the film is ready sooner.
 	PlaceholderMinTime time.Duration
+	// CacheMaxBytes caps all playback caches managed by this process.
+	CacheMaxBytes int64
+	// CacheMinFreeBytes keeps space available for the OS and Docker.
+	CacheMinFreeBytes int64
+	// SessionMaxBytes caps one active generation, regardless of bitrate.
+	SessionMaxBytes int64
 }
 
 func defaultPolicy() Policy {
@@ -81,6 +89,9 @@ func defaultPolicy() Policy {
 		TierSwitchBuffer:   8 * time.Second,
 		DurationTolerance:  0.002,
 		PlaceholderMinTime: 8 * time.Second,
+		CacheMaxBytes:      8 * 1024 * 1024 * 1024,
+		CacheMinFreeBytes:  3 * 1024 * 1024 * 1024,
+		SessionMaxBytes:    512 * 1024 * 1024,
 	}
 }
 
@@ -177,6 +188,171 @@ func (m *Muxer) errorSegmentCount() int {
 		}
 	})
 	return m.errSegCount
+}
+
+func directoryBytes(root string) int64 {
+	var total int64
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+func (m *Muxer) cacheUsage() int64 {
+	m.stateMu.Lock()
+	states := make([]*playbackState, 0, len(m.states))
+	for _, state := range m.states {
+		states = append(states, state)
+	}
+	m.stateMu.Unlock()
+	var total int64
+	for _, state := range states {
+		state.mu.Lock()
+		dir := state.cacheDir
+		state.mu.Unlock()
+		total += directoryBytes(dir)
+	}
+	return total
+}
+
+func (m *Muxer) hasDiskHeadroom(path string) bool {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return true
+	}
+	free := int64(stat.Bavail) * int64(stat.Bsize)
+	return free >= m.policy.CacheMinFreeBytes
+}
+
+// enforceCacheBudget keeps active windows bounded by bytes and removes
+// completed generations left behind by seeks, ABR switches, and recoveries.
+// Active generations are never removed here; a missing old segment triggers a
+// normal seek restart instead.
+func (m *Muxer) enforceCacheBudget() {
+	m.stateMu.Lock()
+	states := make([]*playbackState, 0, len(m.states))
+	for _, state := range m.states {
+		states = append(states, state)
+	}
+	m.stateMu.Unlock()
+
+	activeCount := 0
+	for _, state := range states {
+		state.mu.Lock()
+		if state.active != nil {
+			activeCount++
+		}
+		state.mu.Unlock()
+	}
+	sessionLimit := m.policy.SessionMaxBytes
+	if activeCount > 0 && m.policy.CacheMaxBytes > 0 {
+		fairShare := m.policy.CacheMaxBytes / int64(activeCount)
+		if fairShare > 0 && fairShare < sessionLimit {
+			sessionLimit = fairShare
+		}
+	}
+
+	for _, state := range states {
+		state.mu.Lock()
+		active := state.active
+		all := append([]*generation(nil), state.all...)
+		state.mu.Unlock()
+		if active != nil {
+			pruneGenerationBytes(active.dir, sessionLimit)
+		}
+		for _, generation := range all {
+			if generation == nil || generation == active || generation.session == nil {
+				continue
+			}
+			select {
+			case <-generation.session.Done():
+				_ = os.RemoveAll(generation.dir)
+			default:
+			}
+		}
+	}
+
+	usage := m.cacheUsage()
+	if usage <= m.policy.CacheMaxBytes && m.hasDiskHeadroom(os.TempDir()) {
+		return
+	}
+	// Under pressure, cancel retired sessions that have not exited yet. The
+	// active generation and placeholder are protected because they serve the
+	// current player timeline.
+	for _, state := range states {
+		state.mu.Lock()
+		active := state.active
+		placeholder := state.placeholder
+		retired := make([]*generation, 0)
+		for _, generation := range state.all {
+			if generation != nil && generation != active && generation != placeholder && generation.session != nil {
+				retired = append(retired, generation)
+			}
+		}
+		state.mu.Unlock()
+		for _, generation := range retired {
+			generation.session.Cancel()
+			m.removeGenerationWhenStopped(generation)
+		}
+	}
+}
+
+type cacheSegment struct {
+	index int
+	paths []string
+	size  int64
+}
+
+func pruneGenerationBytes(dir string, maxBytes int64) {
+	if dir == "" || maxBytes <= 0 {
+		return
+	}
+	segments := map[int]*cacheSegment{}
+	for _, media := range []string{"video", "audio"} {
+		entries, err := os.ReadDir(filepath.Join(dir, media))
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			var index int
+			if _, err := fmt.Sscanf(entry.Name(), "seg_%05d.ts", &index); err != nil {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			segment := segments[index]
+			if segment == nil {
+				segment = &cacheSegment{index: index}
+				segments[index] = segment
+			}
+			segment.paths = append(segment.paths, filepath.Join(dir, media, entry.Name()))
+			segment.size += info.Size()
+		}
+	}
+	var total int64
+	ordered := make([]*cacheSegment, 0, len(segments))
+	for _, segment := range segments {
+		total += segment.size
+		ordered = append(ordered, segment)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+	for _, segment := range ordered {
+		if total <= maxBytes {
+			break
+		}
+		for _, path := range segment.paths {
+			_ = os.Remove(path)
+		}
+		total -= segment.size
+	}
 }
 
 // Process performs only addon collection and inexpensive metadata planning.
