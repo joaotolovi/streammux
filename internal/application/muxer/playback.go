@@ -8,10 +8,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/streammux/streammux/internal/application/analyzer"
 	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/domain/model"
 )
@@ -103,6 +105,25 @@ type playbackState struct {
 	closed        bool
 
 	deliveries []deliverySample
+
+	// audioRenditions are lazy audio-only sessions. The main rendition is
+	// always produced by the active video generation; alternates are created
+	// only after the player requests them.
+	audioRenditions map[string]*audioRendition
+	activeAudioID   string
+}
+
+type audioRendition struct {
+	id        string
+	language  string
+	title     string
+	altTarget bool
+	prepared  *preparedPlan
+	dir       string
+	session   *ffmpeg.Session
+	start     int
+	starting  bool
+	wait      chan struct{}
 }
 
 type generation struct {
@@ -141,13 +162,14 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &playbackState{
-		ctx:           ctx,
-		cancel:        cancel,
-		cacheDir:      dir,
-		posterPath:    posterPath,
-		lastRequested: -1,
-		maxRequested:  -1,
-		lastAccess:    time.Now(),
+		ctx:             ctx,
+		cancel:          cancel,
+		cacheDir:        dir,
+		posterPath:      posterPath,
+		lastRequested:   -1,
+		maxRequested:    -1,
+		lastAccess:      time.Now(),
+		audioRenditions: make(map[string]*audioRendition),
 	}
 	m.states[job.ID] = state
 	job.CacheDir = dir
@@ -992,7 +1014,7 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 				Width:     active.prepared.videoWidth,
 				Height:    active.prepared.videoHeight,
 			}
-			return m.renderMasterABR(metas, job.TargetLanguage), true
+			return m.renderMasterABR(job, metas, job.TargetLanguage), true
 		}
 		bitrate := active.prepared.videoBitrate
 		if bitrate <= 0 {
@@ -1002,34 +1024,143 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		if bandwidth <= 0 {
 			bandwidth = 8_000_000
 		}
-		return m.renderMaster(bandwidth, active.prepared.videoWidth, active.prepared.videoHeight, job.TargetLanguage), true
+		return m.renderMaster(job, bandwidth, active.prepared.videoWidth, active.prepared.videoHeight, job.TargetLanguage), true
 	}
 	if placeholder != nil || (active != nil && active.isError) {
 		// Small placeholder/error rendition.
-		return m.renderMaster(3_000_000, 0, 0, job.TargetLanguage), true
+		return m.renderMaster(job, 3_000_000, 0, 0, job.TargetLanguage), true
 	}
 	return nil, false
+}
+
+type audioRenditionMeta struct {
+	id       string
+	code     string
+	name     string
+	uri      string
+	defaultY bool
+	auto     bool
+}
+
+// audioRenditionMedia advertises the requested language first, its alternative
+// second, then languages inferred from addon metadata. These are optimistic
+// capabilities: only the selected rendition is resolved and validated.
+func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
+	seen := map[string]bool{}
+	metas := make([]audioRenditionMeta, 0, 4)
+	targetCode := ffmpeg.LanguageCode(targetLanguage)
+	if targetCode == "" {
+		targetCode = "eng"
+	}
+	targetName := targetLanguage
+	if targetName == "" {
+		targetName = "Audio"
+	}
+	metas = append(metas,
+		audioRenditionMeta{id: "main", code: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true},
+		audioRenditionMeta{id: targetCode + "-alt", code: targetCode, name: targetName + " (alternativa)", uri: "audio/" + targetCode + "-alt/audio.m3u8"},
+	)
+	seen[targetCode] = true
+	if job != nil {
+		for _, plan := range job.Plans {
+			for _, stream := range []model.CollectedStream{plan.Audio, plan.Video} {
+				for _, raw := range append(append([]string{}, stream.Parsed.Languages...), stream.AddonLanguage, stream.Language) {
+					code, name := knownAudioLanguage(raw)
+					if code == "" || seen[code] || !audioLanguageAllowed(job, code, targetCode) {
+						continue
+					}
+					seen[code] = true
+					metas = append(metas, audioRenditionMeta{id: code, code: code, name: name, uri: "audio/" + code + "/audio.m3u8", auto: true})
+				}
+			}
+		}
+	}
+	lines := make([]string, 0, len(metas))
+	for _, meta := range metas {
+		auto := "NO"
+		if meta.auto {
+			auto = "YES"
+		}
+		defaultValue := "NO"
+		if meta.defaultY {
+			defaultValue = "YES"
+		}
+		line := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=%s,AUTOSELECT=%s,LANGUAGE=\"%s\",URI=\"%s\"\n", meta.name, defaultValue, auto, meta.code, meta.uri)
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func audioLanguageAllowed(job *model.MuxJob, code, targetCode string) bool {
+	if code == targetCode {
+		return true
+	}
+	if job == nil {
+		return false
+	}
+	for _, addon := range job.Config.Addons {
+		if !addon.Enabled {
+			continue
+		}
+		if addon.ShowAllAudioLanguages {
+			return true
+		}
+		for _, raw := range addon.AudioLanguages {
+			if allowed, _ := knownAudioLanguage(raw); allowed == code {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func knownAudioLanguage(raw string) (string, string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "Dual Audio" || raw == "Multi" || raw == "Dubbed" || raw == "Latino" {
+		return "", ""
+	}
+	code := ffmpeg.LanguageCode(raw)
+	switch code {
+	case "por":
+		return code, "Português"
+	case "eng":
+		return code, "English"
+	case "spa":
+		return code, "Español"
+	case "fra":
+		return code, "Français"
+	case "deu":
+		return code, "Deutsch"
+	case "ita":
+		return code, "Italiano"
+	case "jpn":
+		return code, "日本語"
+	case "kor":
+		return code, "한국어"
+	case "hin":
+		return code, "हिन्दी"
+	case "rus":
+		return code, "Русский"
+	case "ara":
+		return code, "العربية"
+	case "zho":
+		return code, "中文"
+	default:
+		return "", ""
+	}
 }
 
 // renderMasterABR renders the master with one #EXT-X-STREAM-INF per tier. The
 // audio rendition group is shared: the audio playlist stays the same across
 // tiers (the dub is preserved). Each variant points at video/v{tier}.m3u8 so
 // the HTTP layer can route tier-specific playlist and segment requests.
-func (m *Muxer) renderMasterABR(metas []model.TierMeta, targetLanguage string) []byte {
+func (m *Muxer) renderMasterABR(job *model.MuxJob, metas []model.TierMeta, targetLanguage string) []byte {
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
-	code := ffmpeg.LanguageCode(targetLanguage)
-	name := targetLanguage
-	if name == "" {
-		name = "Audio"
+	for _, media := range audioRenditionMedia(job, targetLanguage) {
+		b.WriteString(media)
 	}
-	media := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=YES,AUTOSELECT=YES", name)
-	if code != "" {
-		media += ",LANGUAGE=\"" + code + "\""
-	}
-	media += ",URI=\"audio/audio.m3u8\"\n"
-	b.WriteString(media)
 
 	for i, meta := range metas {
 		bandwidth := meta.Bandwidth
@@ -1051,21 +1182,13 @@ func (m *Muxer) renderMasterABR(metas []model.TierMeta, targetLanguage string) [
 	return []byte(b.String())
 }
 
-func (m *Muxer) renderMaster(bandwidth int64, width, height int, targetLanguage string) []byte {
+func (m *Muxer) renderMaster(job *model.MuxJob, bandwidth int64, width, height int, targetLanguage string) []byte {
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:6\n")
-	code := ffmpeg.LanguageCode(targetLanguage)
-	name := targetLanguage
-	if name == "" {
-		name = "Audio"
+	for _, media := range audioRenditionMedia(job, targetLanguage) {
+		b.WriteString(media)
 	}
-	media := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=YES,AUTOSELECT=YES", name)
-	if code != "" {
-		media += ",LANGUAGE=\"" + code + "\""
-	}
-	media += ",URI=\"audio/audio.m3u8\"\n"
-	b.WriteString(media)
 
 	streamInf := "#EXT-X-STREAM-INF:BANDWIDTH=" + fmt.Sprint(bandwidth)
 	if width > 0 && height > 0 {
@@ -1085,9 +1208,232 @@ func (m *Muxer) VideoPlaylist(job *model.MuxJob, tier int) ([]byte, bool) {
 	return m.renderMediaPlaylist(job, tier)
 }
 
+func audioRenditionExists(job *model.MuxJob, id string) bool {
+	if job == nil {
+		return false
+	}
+	for _, line := range audioRenditionMedia(job, job.TargetLanguage) {
+		if strings.Contains(line, `URI="audio/`+id+`/audio.m3u8"`) {
+			return true
+		}
+	}
+	return false
+}
+
+func audioRenditionLanguage(job *model.MuxJob, id string) string {
+	if id == "" || id == "main" || strings.HasSuffix(id, "-alt") {
+		return job.TargetLanguage
+	}
+	return languageNameForCode(id)
+}
+
+func languageNameForCode(code string) string {
+	if _, name := knownAudioLanguage(code); name != "" {
+		return name
+	}
+	return code
+}
+
+// prepareAudioRendition reuses the active video and ranks only audio sources
+// for the requested language. It deliberately probes candidates in order, so
+// addon metadata only advertises a possibility; ffprobe remains authoritative.
+func (m *Muxer) prepareAudioRendition(ctx context.Context, job *model.MuxJob, state *playbackState, id string) (*preparedPlan, error) {
+	state.mu.Lock()
+	active := state.active
+	filmBase := state.filmBase
+	state.mu.Unlock()
+	if active == nil || active.prepared == nil || active.isError {
+		return nil, fmt.Errorf("no active video for audio rendition")
+	}
+	language := audioRenditionLanguage(job, id)
+	if language == "" {
+		return nil, fmt.Errorf("unknown audio rendition %q", id)
+	}
+	skipKey := ""
+	if strings.HasSuffix(id, "-alt") {
+		skipKey = active.prepared.plan.Audio.SourceKey()
+		if skipKey == "" {
+			skipKey = active.prepared.plan.Video.SourceKey()
+		}
+	}
+
+	candidates := make([]model.CollectedStream, 0, len(job.Plans)*2+1)
+	seen := map[string]bool{}
+	activeVideoKey := active.prepared.plan.Video.SourceKey()
+	activeAudioKey := active.prepared.plan.Audio.SourceKey()
+	appendCandidate := func(stream model.CollectedStream, force bool) {
+		key := stream.SourceKey()
+		if key == "" || seen[key] || (!force && !analyzer.MatchesLanguage(stream, language)) {
+			return
+		}
+		seen[key] = true
+		candidates = append(candidates, stream)
+	}
+	forceActive := language == job.TargetLanguage
+	appendCandidate(active.prepared.plan.Video, forceActive)
+	appendCandidate(active.prepared.plan.Audio, forceActive)
+	for _, plan := range job.Plans {
+		appendCandidate(plan.Audio, false)
+		appendCandidate(plan.Video, false)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		rank := func(s model.CollectedStream) int {
+			if s.SourceKey() == activeVideoKey {
+				return 0
+			}
+			if s.SourceKey() == activeAudioKey {
+				return 1
+			}
+			return 2
+		}
+		ri, rj := rank(candidates[i]), rank(candidates[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return analyzer.AudioScore(candidates[i]) > analyzer.AudioScore(candidates[j])
+	})
+
+	for _, candidate := range candidates {
+		if skipKey != "" && candidate.SourceKey() == skipKey {
+			continue
+		}
+		prepared, err := m.prepareAudioCandidate(ctx, job, active, candidate, language, filmBase, false)
+		if err == nil {
+			return prepared, nil
+		}
+		log.Printf("mux: audio rendition %s candidate %s rejected: %v", id, candidate.SourceKey(), err)
+	}
+	// Undefined tracks are a last resort, consistent with the primary composer.
+	for _, candidate := range candidates {
+		if skipKey != "" && candidate.SourceKey() == skipKey {
+			continue
+		}
+		if prepared, err := m.prepareAudioCandidate(ctx, job, active, candidate, language, filmBase, true); err == nil {
+			return prepared, nil
+		}
+	}
+	return nil, fmt.Errorf("no verified %s audio source", language)
+}
+
+func (m *Muxer) prepareAudioCandidate(ctx context.Context, job *model.MuxJob, active *generation, candidate model.CollectedStream, language string, filmBase int, lenient bool) (*preparedPlan, error) {
+	video := active.prepared.plan.Video
+	audioURL := ""
+	var audioProbe *ffmpeg.ProbeResult
+	if candidate.SourceKey() == active.prepared.plan.Video.SourceKey() {
+		audioURL = active.prepared.videoURL
+		audioProbe = &ffmpeg.ProbeResult{Duration: active.prepared.duration, AudioTracks: active.prepared.videoAudioTracks}
+	} else if candidate.SourceKey() == active.prepared.plan.Audio.SourceKey() && active.prepared.audioURL != "" {
+		audioURL = active.prepared.audioURL
+		audioProbe, _ = m.probeSource(ctx, audioURL)
+	} else {
+		var err error
+		audioURL, err = m.resolveSource(ctx, job, candidate)
+		if err != nil {
+			return nil, err
+		}
+		audioProbe, err = m.probeSource(ctx, audioURL)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if audioProbe == nil {
+		return nil, fmt.Errorf("audio probe unavailable")
+	}
+	track := targetAudioTrackStrict(audioProbe.AudioTracks, language, candidate, lenient)
+	if track < 0 {
+		return nil, fmt.Errorf("no confirmed %s track", language)
+	}
+	if active.prepared.duration <= 0 || audioProbe.Duration <= 0 {
+		return nil, fmt.Errorf("unknown duration")
+	}
+	tolerance := active.prepared.duration * m.policy.DurationTolerance
+	if tolerance < 1 {
+		tolerance = 1
+	}
+	if tolerance > 15 {
+		tolerance = 15
+	}
+	if delta := math.Abs(active.prepared.duration - audioProbe.Duration); delta > tolerance {
+		return nil, fmt.Errorf("duration mismatch: %.3fs exceeds %.3fs tolerance", delta, tolerance)
+	}
+	plan := model.PlaybackPlan{Kind: model.PlanDualSource, Video: video, Audio: candidate, HasTargetAudio: true}
+	if candidate.SourceKey() == video.SourceKey() {
+		plan.Kind = model.PlanSingleSource
+	}
+	prepared := &preparedPlan{
+		plan: plan, videoURL: active.prepared.videoURL, audioURL: audioURL,
+		videoTrackIndex: active.prepared.videoTrackIndex, audioTrackIndex: track,
+		audioMode: compatibleAudioMode(audioTrackCodec(audioProbe.AudioTracks, track)),
+		duration:  active.prepared.duration, videoBitrate: active.prepared.videoBitrate,
+		videoWidth: active.prepared.videoWidth, videoHeight: active.prepared.videoHeight,
+		videoAudioTracks: active.prepared.videoAudioTracks,
+	}
+	if candidate.SourceKey() != video.SourceKey() && len(prepared.videoAudioTracks) > 0 {
+		if offset, ok := m.audioOffsetFor(plan); ok {
+			_ = offset
+		} else {
+			lag, _, confidence, err := m.detectOffset(prepared)
+			if err == nil && confidence >= ffmpeg.SyncMinConfidence {
+				m.cacheAudioOffset(plan, -lag)
+			}
+		}
+	}
+	return prepared, nil
+}
+
+func audioTrackCodec(tracks []ffmpeg.AudioTrack, index int) string {
+	for _, track := range tracks {
+		if track.Index == index {
+			return track.Codec
+		}
+	}
+	return ""
+}
+
+func audioOffsetForPrepared(m *Muxer, prepared *preparedPlan) time.Duration {
+	if prepared == nil {
+		return 0
+	}
+	offset, _ := m.audioOffsetFor(prepared.plan)
+	return offset
+}
+
 // AudioPlaylist renders the audio media playlist for the current phase.
 func (m *Muxer) AudioPlaylist(job *model.MuxJob) ([]byte, bool) {
+	m.activateAudioRendition(job, "")
 	return m.renderMediaPlaylist(job, 0)
+}
+
+// AudioPlaylistRendition renders the shared public timeline for an audio
+// rendition. The actual alternate audio session starts only when its segment
+// is requested.
+func (m *Muxer) AudioPlaylistRendition(job *model.MuxJob, id string) ([]byte, bool) {
+	if id == "" || id == "main" {
+		return m.AudioPlaylist(job)
+	}
+	if !audioRenditionExists(job, id) {
+		return m.AudioPlaylist(job)
+	}
+	m.activateAudioRendition(job, id)
+	return m.renderMediaPlaylist(job, 0)
+}
+
+func (m *Muxer) activateAudioRendition(job *model.MuxJob, id string) {
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	if state.activeAudioID == id {
+		state.mu.Unlock()
+		return
+	}
+	old := state.audioRenditions[state.activeAudioID]
+	state.activeAudioID = id
+	state.mu.Unlock()
+	if old != nil && old.session != nil {
+		old.session.Cancel()
+	}
 }
 
 func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) {
@@ -1379,7 +1725,176 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment, t
 // EnsureAudioSegment is EnsureSegment for the audio rendition (tier-agnostic:
 // audio is shared across tiers).
 func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
+	if state := m.lookupState(job.ID); state != nil {
+		state.mu.Lock()
+		id := state.activeAudioID
+		if id != "" {
+			state.activeAudioID = ""
+		}
+		old := state.audioRenditions[id]
+		state.mu.Unlock()
+		if old != nil && old.session != nil {
+			old.session.Cancel()
+		}
+	}
 	return m.ensureMediaSegment(ctx, job, segment, 0, true)
+}
+
+// AudioSegmentPathRendition resolves an alternate rendition only while it is
+// active. A stale request after a switch falls back to the already validated
+// primary audio instead of reviving the old session.
+func (m *Muxer) AudioSegmentPathRendition(job *model.MuxJob, id string, segment int) string {
+	if id == "" || id == "main" {
+		return m.AudioSegmentPath(job, segment)
+	}
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return ""
+	}
+	state.mu.Lock()
+	active := state.activeAudioID == id
+	r := state.audioRenditions[id]
+	state.mu.Unlock()
+	if !active || r == nil {
+		return ""
+	}
+	return audioRenditionSegmentPath(r, segment)
+}
+
+// EnsureAudioSegmentRendition lazily starts one audio-only session. Failed or
+// unverified alternatives fall back to the primary rendition.
+func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJob, id string, segment int) (string, error) {
+	if id == "" || id == "main" {
+		return m.EnsureAudioSegment(ctx, job, segment)
+	}
+	if !audioRenditionExists(job, id) {
+		return m.EnsureAudioSegment(ctx, job, segment)
+	}
+	state := m.lookupState(job.ID)
+	if state == nil {
+		return "", fmt.Errorf("playback state not found")
+	}
+	state.mu.Lock()
+	if state.activeAudioID != id {
+		state.mu.Unlock()
+		return m.EnsureAudioSegment(ctx, job, segment)
+	}
+	state.mu.Unlock()
+	for {
+		if path := m.AudioSegmentPathRendition(job, id, segment); path != "" {
+			return path, nil
+		}
+		state.mu.Lock()
+		r := state.audioRenditions[id]
+		if r == nil {
+			r = &audioRendition{id: id}
+			state.audioRenditions[id] = r
+		}
+		if state.activeAudioID != id {
+			state.mu.Unlock()
+			return m.EnsureAudioSegment(ctx, job, segment)
+		}
+		if r.starting {
+			wait := r.wait
+			state.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-wait:
+			}
+			continue
+		}
+		if r.session != nil {
+			session := r.session
+			state.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-session.Done():
+				state.mu.Lock()
+				if r.session == session {
+					r.session = nil
+				}
+				state.mu.Unlock()
+				continue
+			case <-time.After(75 * time.Millisecond):
+				continue
+			}
+		}
+		r.starting = true
+		r.wait = make(chan struct{})
+		prepared := r.prepared
+		state.mu.Unlock()
+
+		if prepared == nil {
+			var err error
+			prepared, err = m.prepareAudioRendition(ctx, job, state, id)
+			if err != nil {
+				state.mu.Lock()
+				r.starting = false
+				close(r.wait)
+				state.mu.Unlock()
+				return m.EnsureAudioSegment(ctx, job, segment)
+			}
+		}
+		starter, ok := m.ffmpeg.(interface {
+			StartAudioSession(context.Context, ffmpeg.AudioSessionSpec) (*ffmpeg.Session, error)
+		})
+		if !ok {
+			state.mu.Lock()
+			r.starting = false
+			close(r.wait)
+			state.mu.Unlock()
+			return m.EnsureAudioSegment(ctx, job, segment)
+		}
+		dir := filepath.Join(state.cacheDir, "audio-renditions", id)
+		if err := os.MkdirAll(filepath.Join(dir, "audio"), 0755); err != nil {
+			return m.EnsureAudioSegment(ctx, job, segment)
+		}
+		session, err := starter.StartAudioSession(state.ctx, ffmpeg.AudioSessionSpec{
+			AudioURL: prepared.audioURL, AudioTrackIndex: prepared.audioTrackIndex,
+			StartSegment: segment, StartTime: float64(segment-state.filmBase) * ffmpeg.SegDuration(),
+			OutputDir: dir, AudioMode: prepared.audioMode, AudioLanguage: id,
+			AudioTitle: id, UserAgent: browserUA, AudioOffset: audioOffsetForPrepared(m, prepared),
+		})
+		state.mu.Lock()
+		r.starting = false
+		if err == nil {
+			r.prepared, r.dir, r.session, r.start = prepared, dir, session, segment
+		}
+		close(r.wait)
+		state.mu.Unlock()
+		if err != nil {
+			return m.EnsureAudioSegment(ctx, job, segment)
+		}
+		deadline := time.NewTimer(m.policy.SegmentTimeout)
+		defer deadline.Stop()
+		for {
+			if path := audioRenditionSegmentPath(r, segment); path != "" {
+				return path, nil
+			}
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-deadline.C:
+				return m.EnsureAudioSegment(ctx, job, segment)
+			case <-session.Done():
+				return m.EnsureAudioSegment(ctx, job, segment)
+			case <-time.After(75 * time.Millisecond):
+			}
+		}
+	}
+}
+
+func audioRenditionSegmentPath(r *audioRendition, segment int) string {
+	if r == nil || r.dir == "" {
+		return ""
+	}
+	path := filepath.Join(r.dir, "audio", fmt.Sprintf("seg_%05d.ts", segment))
+	if fileExists(path) {
+		return path
+	}
+	return ""
 }
 
 func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segment, tier int, audio bool) (string, error) {

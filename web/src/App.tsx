@@ -273,6 +273,8 @@ function AddonsSection({
         language: '',
         enabled: true,
         timeout: 20000,
+        showAllAudioLanguages: false,
+        audioLanguages: [],
       },
     ]);
   };
@@ -390,6 +392,27 @@ function AddonCard({
               step={1}
               onChange={(v) => onChange({ timeout: Math.round((v ?? 20) * 1000) })}
             />
+            <div className="sm:col-span-2 space-y-2">
+              <Toggle
+                isSelected={addon.showAllAudioLanguages ?? false}
+                onChange={(v) => onChange({ showAllAudioLanguages: v })}
+                label="Mostrar todas as línguas encontradas"
+              />
+              <Input
+                label="Filtrar línguas (opcional)"
+                placeholder="English, Spanish, French"
+                tooltip="O idioma principal do usuário sempre aparece. Separe outras línguas por vírgula. Ignorado quando 'todas' estiver ativo."
+                value={(addon.audioLanguages ?? []).join(', ')}
+                onChange={(v) =>
+                  onChange({
+                    audioLanguages: String(v)
+                      .split(',')
+                      .map((language) => language.trim())
+                      .filter(Boolean),
+                  })
+                }
+              />
+            </div>
           </div>
         </div>
         <Tooltip title="Remover addon">

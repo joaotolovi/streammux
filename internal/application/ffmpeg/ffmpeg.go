@@ -71,6 +71,21 @@ type SessionSpec struct {
 	Transcode *TranscodeSpec
 }
 
+// AudioSessionSpec describes a lazy audio-only HLS session aligned to the
+// public film segment timeline.
+type AudioSessionSpec struct {
+	AudioURL        string
+	AudioTrackIndex int
+	StartSegment    int
+	StartTime       float64
+	OutputDir       string
+	AudioMode       AudioMode
+	AudioLanguage   string
+	AudioTitle      string
+	UserAgent       string
+	AudioOffset     time.Duration
+}
+
 // Session is a single continuous FFmpeg run that produces HLS segments.
 type Session struct {
 	cancel     context.CancelFunc
@@ -168,6 +183,87 @@ func (m *Muxer) StartSession(ctx context.Context, spec SessionSpec) (*Session, e
 	}()
 
 	return s, nil
+}
+
+// StartAudioSession launches FFmpeg for one audio rendition only.
+func (m *Muxer) StartAudioSession(ctx context.Context, spec AudioSessionSpec) (*Session, error) {
+	args, err := buildAudioSessionArgs(spec)
+	if err != nil {
+		return nil, err
+	}
+	sessCtx, cancel := context.WithCancel(ctx)
+	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
+	stderr := newTailBuffer(stderrTailSize)
+	cmd.Stderr = stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("ffmpeg audio progress pipe: %w", err)
+	}
+	s := &Session{cancel: cancel, done: make(chan struct{}), progress: make(chan ProgressSample, 1), startN: spec.StartSegment, stderrTail: stderr}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("ffmpeg audio start: %w", err)
+	}
+	go func() {
+		parseErr := parseProgress(stdout, s.progress, time.Now)
+		if parseErr != nil {
+			_, _ = io.Copy(io.Discard, stdout)
+		}
+		waitErr := cmd.Wait()
+		if waitErr != nil {
+			if ctxErr := sessCtx.Err(); ctxErr != nil {
+				waitErr = ctxErr
+			}
+			s.setErr(ffmpegRunError(waitErr, stderr.String()))
+		} else if parseErr != nil {
+			s.setErr(ffmpegRunError(fmt.Errorf("read progress: %w", parseErr), stderr.String()))
+		}
+		cancel()
+		close(s.progress)
+		close(s.done)
+	}()
+	return s, nil
+}
+
+func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
+	if strings.TrimSpace(spec.AudioURL) == "" {
+		return nil, fmt.Errorf("ffmpeg audio session: audio URL is required")
+	}
+	if strings.TrimSpace(spec.OutputDir) == "" {
+		return nil, fmt.Errorf("ffmpeg audio session: output directory is required")
+	}
+	if spec.AudioTrackIndex < 0 || spec.StartSegment < 0 {
+		return nil, fmt.Errorf("ffmpeg audio session: invalid track or segment")
+	}
+	audioMode := AudioMode(strings.ToLower(strings.TrimSpace(string(spec.AudioMode))))
+	if audioMode == "" {
+		audioMode = AudioModeCopy
+	}
+	if audioMode != AudioModeCopy && audioMode != AudioModeAAC {
+		return nil, fmt.Errorf("ffmpeg audio session: unsupported audio mode %q", spec.AudioMode)
+	}
+	offset := spec.StartTime
+	if offset < 0 {
+		offset = 0
+	}
+	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y"}
+	if spec.AudioOffset != 0 {
+		args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
+	}
+	args = append(args, "-ss", fmtDuration(offset))
+	if ua := strings.TrimSpace(spec.UserAgent); ua != "" {
+		args = append(args, "-user_agent", ua)
+	}
+	args = append(args, "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
+	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
+		args = append(args, "-metadata:s:a:0", "language="+language, "-disposition:a:0", "default")
+	}
+	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
+		args = append(args, "-metadata:s:a:0", "title="+title)
+	}
+	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_playlist_type", "event", "-hls_flags", "independent_segments+temp_file+split_by_time", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
+	return args, nil
 }
 
 func buildSessionArgs(spec SessionSpec) ([]string, error) {
@@ -551,8 +647,6 @@ func shiftExpr(startT, duration float64, distance, speed float64, reverse bool, 
 	// Video: starts at 0, shifts left to endX (negative), then clamps via max().
 	return fmt.Sprintf("if(gt(t,%.2f),max(%d,-(t-%.2f)*%.0f),0)", startT, endX, startT, speed)
 }
-
-
 
 // buildPlaceholderArgs encodes a local video as a live-looking HLS window.
 // realtime=true paces the placeholder at 1x with a sliding window and no

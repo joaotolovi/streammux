@@ -49,6 +49,36 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 	}
 }
 
+func TestBuildAudioSessionArgs(t *testing.T) {
+	spec := AudioSessionSpec{
+		AudioURL:        "https://audio.test/audio.mka",
+		AudioTrackIndex: 2,
+		StartSegment:    7,
+		StartTime:       28,
+		OutputDir:       "/tmp/audio-alt",
+		AudioMode:       AudioModeAAC,
+		AudioLanguage:   "English",
+		AudioTitle:      "English",
+	}
+	got, err := buildAudioSessionArgs(spec)
+	if err != nil {
+		t.Fatalf("buildAudioSessionArgs() error = %v", err)
+	}
+	for _, want := range [][]string{
+		{"-ss", "28", "-i", spec.AudioURL},
+		{"-map", "0:a:2"},
+		{"-c:a", "aac"},
+		{"-metadata:s:a:0", "language=eng"},
+		{"-hls_segment_filename", "/tmp/audio-alt/audio/seg_%05d.ts"},
+		{"-start_number", "7"},
+		{"/tmp/audio-alt/audio/audio.m3u8"},
+	} {
+		if !containsArguments(got, want) {
+			t.Errorf("audio args do not contain %q: %#v", want, got)
+		}
+	}
+}
+
 func TestBuildSessionArgsDualSource(t *testing.T) {
 	spec := SessionSpec{
 		VideoURL:        "https://video.test/video.mp4",

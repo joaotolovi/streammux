@@ -21,6 +21,8 @@ export interface Addon {
   language: string;
   enabled: boolean;
   timeout?: number;
+  showAllAudioLanguages?: boolean;
+  audioLanguages?: string[];
 }
 
 export interface Config {

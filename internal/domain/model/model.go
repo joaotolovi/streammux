@@ -13,13 +13,15 @@ type Service struct {
 }
 
 type Addon struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	ManifestURL string `json:"manifestUrl"`
-	Role        string `json:"role"`
-	Language    string `json:"language"`
-	Enabled     bool   `json:"enabled"`
-	Timeout     int    `json:"timeout,omitempty"`
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	ManifestURL           string   `json:"manifestUrl"`
+	Role                  string   `json:"role"`
+	Language              string   `json:"language"`
+	Enabled               bool     `json:"enabled"`
+	Timeout               int      `json:"timeout,omitempty"`
+	ShowAllAudioLanguages bool     `json:"showAllAudioLanguages,omitempty"`
+	AudioLanguages        []string `json:"audioLanguages,omitempty"`
 }
 
 type Config struct {

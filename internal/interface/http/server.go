@@ -58,6 +58,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /mux/{jobId}/playlist.m3u8", s.handleHLSMaster)
 	s.mux.HandleFunc("GET /mux/{jobId}/video/{path...}", s.handleHLSVideoPath)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/audio.m3u8", s.handleHLSAudioPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/audio/{rendition}/audio.m3u8", s.handleHLSAudioRenditionPlaylist)
+	s.mux.HandleFunc("GET /mux/{jobId}/audio/{rendition}/{segment}", s.handleHLSAudioRenditionSegment)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
 
 	// API
@@ -222,6 +224,13 @@ func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) 
 	s.serveVodPlaylist(w, r, s.muxer.AudioPlaylist)
 }
 
+func (s *Server) handleHLSAudioRenditionPlaylist(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("rendition")
+	s.serveVodPlaylist(w, r, func(job *model.MuxJob) ([]byte, bool) {
+		return s.muxer.AudioPlaylistRendition(job, id)
+	})
+}
+
 func (s *Server) serveVodPlaylist(w http.ResponseWriter, r *http.Request, render func(*model.MuxJob) ([]byte, bool)) {
 	jobID := r.PathValue("jobId")
 	job, ok := s.store.Get(jobID)
@@ -262,6 +271,41 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHLSAudioSegment(w http.ResponseWriter, r *http.Request) {
 	s.serveSegment(w, r, true)
+}
+
+func (s *Server) handleHLSAudioRenditionSegment(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	id := r.PathValue("rendition")
+	segment := filepath.Base(r.PathValue("segment"))
+	job, ok := s.store.Get(jobID)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	var segIndex int
+	if _, err := fmt.Sscanf(segment, "seg_%05d.ts", &segIndex); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid segment")
+		return
+	}
+	if cached := s.muxer.AudioSegmentPathRendition(job, id, segIndex); cached != "" {
+		s.deliverSegment(w, r, job, cached, true)
+		return
+	}
+	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
+		return
+	}
+	path, err := s.muxer.EnsureAudioSegmentRendition(r.Context(), job, id, segIndex)
+	if err != nil {
+		if errors.Is(err, muxer.ErrBeyondEnd) {
+			writeError(w, http.StatusNotFound, "segment beyond end of film")
+			return
+		}
+		log.Printf("mux audio rendition %s segment %d: %v", id, segIndex, err)
+		writeError(w, http.StatusBadGateway, "segment source unavailable")
+		return
+	}
+	s.deliverSegment(w, r, job, path, true)
 }
 
 func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool) {
