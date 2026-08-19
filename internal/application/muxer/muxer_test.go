@@ -514,6 +514,18 @@ func TestMasterPlaylistDeclaresAudioRenditionGroup(t *testing.T) {
 	}
 }
 
+func TestMasterPlaylistSeparatesSameLanguageAlternativeForExoPlayer(t *testing.T) {
+	mux := &Muxer{}
+	job := &model.MuxJob{TargetLanguage: "Portuguese (Brazil)"}
+	playlist := string(mux.renderMaster(job, 1_000_000, 0, 0, job.TargetLanguage))
+	if !strings.Contains(playlist, `LANGUAGE="por",URI="audio/audio.m3u8"`) {
+		t.Fatalf("master missing primary Portuguese rendition: %s", playlist)
+	}
+	if !strings.Contains(playlist, `LANGUAGE="por-x-alt",URI="audio/por-alt/audio.m3u8"`) {
+		t.Fatalf("master missing distinct alternative language tag: %s", playlist)
+	}
+}
+
 func TestVodPlaylistServesFullDurationImmediately(t *testing.T) {
 	// A 2h film must expose 1800 segments from the very first request.
 	state := &playbackState{

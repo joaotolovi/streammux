@@ -1036,6 +1036,7 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 type audioRenditionMeta struct {
 	id       string
 	code     string
+	language string
 	name     string
 	uri      string
 	defaultY bool
@@ -1057,8 +1058,8 @@ func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
 		targetName = "Audio"
 	}
 	metas = append(metas,
-		audioRenditionMeta{id: "main", code: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true},
-		audioRenditionMeta{id: targetCode + "-alt", code: targetCode, name: targetName + " (alternativa)", uri: "audio/" + targetCode + "-alt/audio.m3u8"},
+		audioRenditionMeta{id: "main", code: targetCode, language: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true},
+		audioRenditionMeta{id: targetCode + "-alt", code: targetCode, language: targetCode + "-x-alt", name: targetName + " (alternativa)", uri: "audio/" + targetCode + "-alt/audio.m3u8"},
 	)
 	seen[targetCode] = true
 	if job != nil {
@@ -1070,7 +1071,7 @@ func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
 						continue
 					}
 					seen[code] = true
-					metas = append(metas, audioRenditionMeta{id: code, code: code, name: name, uri: "audio/" + code + "/audio.m3u8", auto: true})
+					metas = append(metas, audioRenditionMeta{id: code, code: code, language: code, name: name, uri: "audio/" + code + "/audio.m3u8", auto: true})
 				}
 			}
 		}
@@ -1085,7 +1086,7 @@ func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
 		if meta.defaultY {
 			defaultValue = "YES"
 		}
-		line := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=%s,AUTOSELECT=%s,LANGUAGE=\"%s\",URI=\"%s\"\n", meta.name, defaultValue, auto, meta.code, meta.uri)
+		line := fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=%q,DEFAULT=%s,AUTOSELECT=%s,LANGUAGE=\"%s\",URI=\"%s\"\n", meta.name, defaultValue, auto, meta.language, meta.uri)
 		lines = append(lines, line)
 	}
 	return lines
