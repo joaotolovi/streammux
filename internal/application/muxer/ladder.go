@@ -45,16 +45,29 @@ type tierStrategy struct {
 	desc      string           // human-readable, for logs
 }
 
-// tierBudgets returns the per-tier bitrate ceilings derived from the primary
-// plan's bitrate. Tier 0 is unbounded (it IS the primary).
-func tierBudgets(t0Bits int64) [tierCount]int64 {
+// tierTargets returns the per-tier bitrate targets derived from the primary
+// plan's bitrate. Each tier aims 20% lighter than the primary: tier 1 ~80%,
+// tier 2 ~60%. The values are targets, not ceilings — the ladder ranks all
+// lighter sources by distance to the target so degradation is gradual: no
+// source is discarded, the closest to the target is tried first, then the
+// next closest on failure, etc. Caps keep the tiers well spaced (100/50/10
+// is more stable than 100/90/80) when the primary is huge.
+func tierTargets(t0Bits int64) [tierCount]int64 {
 	if t0Bits <= 0 {
 		t0Bits = 8_000_000
 	}
 	var b [tierCount]int64
-	b[0] = 0 // unlimited
-	b[1] = min64(25_000_000, t0Bits*6/10)
-	b[2] = min64(10_000_000, t0Bits/4)
+	b[0] = t0Bits
+	// 20% and 40% lighter than primary, capped so tiers stay distant for
+	// huge primaries (80 GB REMUX should not have tier 1 at 62 Mbps).
+	b[1] = min64(25_000_000, t0Bits*80/100)
+	if b[1] >= t0Bits {
+		b[1] = t0Bits * 80 / 100
+	}
+	b[2] = min64(10_000_000, t0Bits*60/100)
+	if b[2] >= b[1] {
+		b[2] = b[1] * 75 / 100
+	}
 	return b
 }
 
@@ -76,8 +89,15 @@ func transcodeSpecFor(tier, t0Height int) *ffmpeg.TranscodeSpec {
 }
 
 // buildTierLadder computes the strategy ladder for one tier from the composer
-// ledger (metadata only — no probing). Rungs are ordered by expected delivered
-// quality; the first source switch and the transcode are interleaved by score.
+// ledger (metadata only — no probing). All lighter sources are kept — none is
+// discarded — but ordered by distance to the tier's target bitrate so
+// degradation is gradual. Example with t0=100 and target=80: available 95,
+// 89, 79, 67 orders as 79, 89, 67, 95 — the closest to the 20% lighter ideal
+// first, falling back through the next closest if it fails. This avoids a
+// single large jump to a very low quality when a gentle step would suffice.
+// The transcode candidate is interleaved by the same distance metric, with
+// score as tie-break so a professional encode at similar bitrate wins over a
+// realtime transcode.
 func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 	if tier <= 0 || tier >= tierCount || state.tier0Prepared == nil || state.composer == nil {
 		return nil
@@ -88,29 +108,53 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 	if audioKey == "" || audioKey == t0Key {
 		audioKey = ""
 	}
-	budget := state.tierBudgets[tier]
+	target := state.tierBudgets[tier]
+	if target <= 0 {
+		target = state.tierBudgets[0] * 8 / 10
+		if target <= 0 {
+			target = 8_000_000
+		}
+	}
+	t0Bits := streamBandwidth(t0.plan.Video)
 
-	ladder := make([]*tierStrategy, 0, 4)
+	type ranked struct {
+		s    *tierStrategy
+		dist int64
+	}
+	var ranked_list []ranked
+
+	// Transcode candidate for this tier.
 	tc := transcodeSpecFor(tier, t0.videoHeight)
+	tcBits := int64(tc.MaxRateKbps) * 1000
 	tcScore := int(float64(analyzer.VideoScore(t0.plan.Video)) * transcodeQuality)
-	ladder = append(ladder, &tierStrategy{
-		kind:      stratTranscode,
-		transcode: tc,
-		score:     tcScore,
-		estBits:   int64(tc.MaxRateKbps) * 1000,
-		height:    tc.Height,
-		desc:      fmt.Sprintf("transcode primary -> %dp@%dk", tc.Height, tc.MaxRateKbps),
+	tcDist := tcBits - target
+	if tcDist < 0 {
+		tcDist = -tcDist
+	}
+	ranked_list = append(ranked_list, ranked{
+		s: &tierStrategy{
+			kind:      stratTranscode,
+			transcode: tc,
+			score:     tcScore,
+			estBits:   tcBits,
+			height:    tc.Height,
+			desc:      fmt.Sprintf("transcode primary -> %dp@%dk", tc.Height, tc.MaxRateKbps),
+		},
+		dist: tcDist,
 	})
 
-	// Lighter existing sources within the tier budget, paired with the
-	// current dub whenever possible. Sources already marked failed are
-	// skipped (the ledger is live).
+	// All lighter existing sources (strictly below t0), paired with the
+	// current dub whenever possible. None discarded — ordered by proximity
+	// to target. Sources already marked failed are skipped (ledger is live).
 	for _, v := range state.composer.videos {
 		if v.failed || v.stream.SourceKey() == t0Key {
 			continue
 		}
 		est := streamBandwidth(v.stream)
-		if budget > 0 && est > budget {
+		if est >= t0Bits {
+			continue
+		}
+		if est <= 0 {
 			continue
 		}
 		score := analyzer.VideoScore(v.stream)
@@ -122,8 +166,6 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 			pair = state.composer.sourceByKey(audioKey)
 		}
 		if pair == nil || pair.failed {
-			// Fall back to the composer's best audio for this video; the
-			// synthetic composition below resolves tracks itself.
 			for _, a := range state.composer.audios {
 				if !a.failed {
 					pair = a
@@ -134,22 +176,44 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 		if pair == nil {
 			continue
 		}
-		ladder = append(ladder, &tierStrategy{
-			kind:    stratSource,
-			video:   v,
-			audio:   pair,
-			score:   score,
-			estBits: est,
-			height:  resolutionHeight(v.stream.Parsed.Resolution),
-			desc:    fmt.Sprintf("source video#%d (%s %s)", v.videoPos, v.stream.Parsed.Resolution, v.stream.Parsed.Quality),
+		dist := est - target
+		if dist < 0 {
+			dist = -dist
+		}
+		ranked_list = append(ranked_list, ranked{
+			s: &tierStrategy{
+				kind:    stratSource,
+				video:   v,
+				audio:   pair,
+				score:   score,
+				estBits: est,
+				height:  resolutionHeight(v.stream.Parsed.Resolution),
+				desc:    fmt.Sprintf("source video#%d (%s %s)", v.videoPos, v.stream.Parsed.Resolution, v.stream.Parsed.Quality),
+			},
+			dist: dist,
 		})
 	}
 
-	// Highest expected quality first.
-	for i := 1; i < len(ladder); i++ {
-		for j := i; j > 0 && ladder[j].score > ladder[j-1].score; j-- {
-			ladder[j], ladder[j-1] = ladder[j-1], ladder[j]
+	// Sort by distance to target (closest first), tie-break by quality
+	// so among equally distant bitrates the better encode wins.
+	for i := 1; i < len(ranked_list); i++ {
+		for j := i; j > 0; j-- {
+			a, b := ranked_list[j-1], ranked_list[j]
+			swap := false
+			if b.dist < a.dist {
+				swap = true
+			} else if b.dist == a.dist && b.s.score > a.s.score {
+				swap = true
+			}
+			if !swap {
+				break
+			}
+			ranked_list[j-1], ranked_list[j] = ranked_list[j], ranked_list[j-1]
 		}
+	}
+	ladder := make([]*tierStrategy, 0, len(ranked_list))
+	for _, r := range ranked_list {
+		ladder = append(ladder, r.s)
 	}
 	return ladder
 }
@@ -334,9 +398,20 @@ func strategyDesc(p *preparedPlan) string {
 }
 
 // tierMetasFromPlans computes the ABR variant metadata for the master
-// playlist from plan metadata only (no probes): tier 0 is the primary plan,
-// tiers 1-2 pick the best in-budget source when one exists, else the
-// transcode parameters for that tier.
+// playlist from plan metadata only (no probes). It mirrors buildTierLadder's
+// target model: tier 0 is the primary, tiers 1-2 aim 20%/40% lighter (80%/60%
+// of the primary).
+//
+// The BANDWIDTH announced for each tier is the SMALLER of:
+//   - the estimated bitrate of the best strategy for that tier, or
+//   - the tier's minimum target (tier0 × 0.80 / × 0.60).
+//
+// When the real strategy is lighter than the minimum (e.g. 30% below tier 0
+// when the minimum is 20%), the player sees the real value — its ABR decision
+// is precise. When the real strategy is barely lighter than tier 0 (e.g. only
+// 10% below), the player sees the 20% minimum instead — forcing enough
+// spacing so the player doesn't switch for no reason between near-identical
+// bitrates.
 func tierMetasFromPlans(plans []model.PlaybackPlan) []model.TierMeta {
 	var primary *model.PlaybackPlan
 	for i := range plans {
@@ -351,7 +426,7 @@ func tierMetasFromPlans(plans []model.PlaybackPlan) []model.TierMeta {
 
 	t0Bits := streamBandwidth(primary.Video)
 	t0Height := resolutionHeight(primary.Video.Parsed.Resolution)
-	budgets := tierBudgets(t0Bits)
+	targets := tierTargets(t0Bits)
 
 	metas := make([]model.TierMeta, tierCount)
 	metas[0] = model.TierMeta{Bandwidth: t0Bits * 12 / 10, Height: t0Height}
@@ -361,8 +436,10 @@ func tierMetasFromPlans(plans []model.PlaybackPlan) []model.TierMeta {
 
 	seen := map[string]bool{primary.Video.SourceKey(): true}
 	for tier := 1; tier < tierCount; tier++ {
-		budget := budgets[tier]
-		best := (*model.CollectedStream)(nil)
+		target := targets[tier]
+		// Best existing source closest to the target (among all lighter than t0).
+		var best *model.CollectedStream
+		bestDist := int64(1<<62 - 1)
 		bestScore := -1
 		for i := range plans {
 			v := &plans[i].Video
@@ -371,29 +448,53 @@ func tierMetasFromPlans(plans []model.PlaybackPlan) []model.TierMeta {
 				continue
 			}
 			est := streamBandwidth(*v)
-			if budget > 0 && est > budget {
+			if est <= 0 || est >= t0Bits {
 				continue
 			}
-			if score := analyzer.VideoScore(*v); score > bestScore {
+			dist := est - target
+			if dist < 0 {
+				dist = -dist
+			}
+			score := analyzer.VideoScore(*v)
+			if dist < bestDist || (dist == bestDist && score > bestScore) {
+				bestDist = dist
 				bestScore = score
 				best = v
 			}
 		}
-		if best != nil {
-			seen[best.SourceKey()] = true
-			est := streamBandwidth(*best)
-			h := resolutionHeight(best.Parsed.Resolution)
-			metas[tier] = model.TierMeta{Bandwidth: est * 12 / 10, Height: h}
-			if h > 0 {
-				metas[tier].Width = h * 16 / 9
-			}
-			continue
-		}
+		// Transcode candidate for this tier as fallback.
 		tc := transcodeSpecFor(tier, t0Height)
-		metas[tier] = model.TierMeta{
-			Bandwidth: int64(tc.MaxRateKbps) * 1000 * 12 / 10,
-			Width:     tc.Height * 16 / 9,
-			Height:    tc.Height,
+		tcBits := int64(tc.MaxRateKbps) * 1000
+		tcDist := tcBits - target
+		if tcDist < 0 {
+			tcDist = -tcDist
+		}
+		// Pick whichever is closer to the target; tie-break by quality.
+		tcScore := int(float64(analyzer.VideoScore(primary.Video)) * transcodeQuality)
+		useTranscode := best == nil || tcDist < bestDist || (tcDist == bestDist && tcScore > bestScore)
+
+		var estBits int64
+		var height int
+		if useTranscode {
+			estBits = tcBits
+			height = tc.Height
+		} else {
+			seen[best.SourceKey()] = true
+			estBits = streamBandwidth(*best)
+			height = resolutionHeight(best.Parsed.Resolution)
+		}
+
+		// The BANDWIDTH is the smaller of the real estimate and the tier's
+		// minimum target. When the real strategy is lighter than the minimum,
+		// the player sees reality; when it's barely lighter, the player sees
+		// the forced minimum so it doesn't switch between near-identical tiers.
+		announced := min64(estBits, target)
+		if announced <= 0 {
+			announced = target
+		}
+		metas[tier] = model.TierMeta{Bandwidth: announced * 12 / 10, Height: height}
+		if height > 0 {
+			metas[tier].Width = height * 16 / 9
 		}
 	}
 	return metas

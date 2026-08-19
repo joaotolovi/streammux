@@ -541,7 +541,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.active = winner
 	state.activeTier = 0
 	state.tier0Prepared = winner.prepared
-	state.tierBudgets = tierBudgets(streamBandwidth(winner.plan.Video))
+	state.tierBudgets = tierTargets(streamBandwidth(winner.plan.Video))
 	state.all = append(state.all, winner)
 	state.starting = false
 	state.startErr = nil
