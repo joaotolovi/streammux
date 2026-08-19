@@ -267,7 +267,7 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
 	}
-	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_playlist_type", "live", "-hls_list_size", strconv.Itoa(hlsWindowSegments), "-hls_flags", "independent_segments+temp_file+split_by_time+delete_segments", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
+	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_list_size", strconv.Itoa(hlsWindowSegments), "-hls_flags", "independent_segments+temp_file+split_by_time+delete_segments", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
 	return args, nil
 }
 
@@ -376,7 +376,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_playlist_type", "live",
 		"-hls_list_size", strconv.Itoa(hlsWindowSegments),
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "video", "seg_%05d.ts"),
@@ -406,7 +405,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_playlist_type", "live",
 		"-hls_list_size", strconv.Itoa(hlsWindowSegments),
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"),
