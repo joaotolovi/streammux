@@ -51,7 +51,7 @@ type Policy struct {
 	MinPublishedAhead time.Duration
 	// MinHandoffBuffer is how much content the film must have ready before the
 	// intro hands off, so playback doesn't stall on the first bandwidth dip.
-	MinHandoffBuffer  time.Duration
+	MinHandoffBuffer time.Duration
 	// TierSwitchBuffer is the cushion required when spinning up a lazy ABR
 	// tier switch: smaller than the startup cushion so the switch is fast,
 	// but nonzero so the first segment is already out before the player
@@ -194,6 +194,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	}
 
 	result := &Result{}
+	var subtitleStream *model.StremioStream
 	if subtitle, ok := firstPlan(plans, func(plan model.PlaybackPlan) bool {
 		return plan.Kind == model.PlanSubtitledFallback
 	}); ok {
@@ -201,7 +202,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 		if language == "" {
 			language = "English"
 		}
-		result.Subtitled = directStream(
+		subtitleStream = directStream(
 			fmt.Sprintf("🎞️ Legendado — %s %s", subtitle.Video.Parsed.Resolution, subtitle.Video.Parsed.Quality),
 			fmt.Sprintf("Fonte: %s | %s", subtitle.Video.AddonName, language),
 			subtitle.Video.Stream,
@@ -212,6 +213,9 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 		return plan.HasTargetAudio
 	})
 	if !hasDubbed {
+		// Expose one catalog entry only. When no target-language audio exists,
+		// the same entry is the subtitle fallback and is named accordingly.
+		result.Dubbed = subtitleStream
 		return result, nil
 	}
 

@@ -159,9 +159,6 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if result.Dubbed != nil {
 		streams = append(streams, *result.Dubbed)
 	}
-	if result.Subtitled != nil {
-		streams = append(streams, *result.Subtitled)
-	}
 
 	writeJSON(w, map[string]any{"streams": streams})
 }
