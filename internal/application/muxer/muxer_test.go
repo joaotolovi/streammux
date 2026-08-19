@@ -68,6 +68,23 @@ func TestPruneGenerationBytesRemovesOldestCompleteSegments(t *testing.T) {
 	}
 }
 
+func TestComposerWithAudioPreservesRequestedAudioSource(t *testing.T) {
+	video := &sourceState{stream: model.CollectedStream{Stream: model.Stream{URL: "https://video.test/file"}}}
+	audio := &sourceState{stream: model.CollectedStream{Stream: model.Stream{URL: "https://audio.test/file"}}}
+	composer := &composer{videos: []*sourceState{video}, audios: []*sourceState{audio}}
+
+	pair := composer.withAudio(video, audio.stream.SourceKey())
+	if pair == nil {
+		t.Fatal("withAudio() returned nil")
+	}
+	if pair.video != video || pair.audio != audio || pair.single {
+		t.Fatalf("withAudio() = %#v, want video/audio pair", pair)
+	}
+	if pair := composer.withAudio(video, "missing"); pair != nil {
+		t.Fatal("withAudio() paired an unknown audio source")
+	}
+}
+
 func TestHealthTrackerHealthyWindowResetsSlowState(t *testing.T) {
 	policy := defaultPolicy()
 	tracker := newHealthTracker(policy)

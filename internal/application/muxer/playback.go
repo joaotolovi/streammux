@@ -891,6 +891,16 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 	}
 
 	comp := m.composerFor(job, state)
+	retainedAudioKey := ""
+	if prefer != nil && prefer.prepared != nil {
+		videoKey := prefer.prepared.plan.Video.SourceKey()
+		audioKey := prefer.prepared.plan.Audio.SourceKey()
+		// A source that carried both A/V cannot be retained after its video
+		// failed. Separate dubs remain preferred across video recovery.
+		if audioKey != "" && audioKey != videoKey {
+			retainedAudioKey = audioKey
+		}
+	}
 	var failures []error
 	for {
 		if time.Now().After(deadline) {
@@ -901,6 +911,28 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		state.mu.Unlock()
 		if candidate == nil {
 			break
+		}
+		if retained := comp.withAudio(candidate.video, retainedAudioKey); retained != nil && !retained.single {
+			prepCtx, prepCancel := context.WithTimeout(state.ctx, time.Until(deadline))
+			prepared, _, err := m.prepareComposition(prepCtx, job, retained)
+			prepCancel()
+			if err == nil {
+				state.mu.Lock()
+				base := state.filmBase
+				state.mu.Unlock()
+				startTime := float64(startSegment-base) * ffmpeg.SegDuration()
+				if startTime < 0 {
+					startTime = 0
+				}
+				gen, launchErr := m.launchGeneration(job, state, candidate.ordinal, prepared, tier, startSegment, startTime, m.policy.MinHandoffBuffer)
+				if launchErr == nil {
+					log.Printf("mux: recovery preserved audio source %s while switching video", retainedAudioKey)
+					return gen, nil
+				}
+				log.Printf("mux: recovery preserved-audio launch failed: %v", launchErr)
+			} else {
+				log.Printf("mux: recovery could not pair video with current audio: %v", err)
+			}
 		}
 
 		prepCtx, prepCancel := context.WithTimeout(state.ctx, time.Until(deadline))

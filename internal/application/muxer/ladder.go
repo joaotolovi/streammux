@@ -36,13 +36,13 @@ const (
 // tierStrategy is one rung of a tier's downgrade ladder.
 type tierStrategy struct {
 	kind      strategyKind
-	video     *sourceState     // stratSource: the lighter source to switch to
-	audio     *sourceState     // stratSource: pairing (usually the current dub)
+	video     *sourceState          // stratSource: the lighter source to switch to
+	audio     *sourceState          // stratSource: pairing (usually the current dub)
 	transcode *ffmpeg.TranscodeSpec // stratTranscode: params for re-encoding the primary source
-	score     int              // expected delivered quality, ranks the rungs
-	estBits   int64            // committed/estimated bitrate for ABR metadata
-	height    int              // target height for ABR metadata
-	desc      string           // human-readable, for logs
+	score     int                   // expected delivered quality, ranks the rungs
+	estBits   int64                 // committed/estimated bitrate for ABR metadata
+	height    int                   // target height for ABR metadata
+	desc      string                // human-readable, for logs
 }
 
 // tierTargets returns the per-tier bitrate targets derived from the primary
@@ -105,6 +105,9 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 	t0 := state.tier0Prepared
 	t0Key := t0.plan.Video.SourceKey()
 	audioKey := t0.plan.Audio.SourceKey()
+	if state.active != nil && state.active.prepared != nil {
+		audioKey = state.active.prepared.plan.Audio.SourceKey()
+	}
 	if audioKey == "" || audioKey == t0Key {
 		audioKey = ""
 	}

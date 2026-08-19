@@ -471,6 +471,24 @@ func (c *composer) sourceByKey(sourceKey string) *sourceState {
 	return nil
 }
 
+// withAudio builds a temporary pairing that preserves an already-playing
+// audio source while the recovery coordinator tries a different video source.
+// It is intentionally not part of ranked/cursor state: failing this pairing
+// must not mark a healthy audio source as unusable for the normal fallback.
+func (c *composer) withAudio(video *sourceState, audioKey string) *composition {
+	audio := c.sourceByKey(audioKey)
+	if video == nil || audio == nil || video.failed || audio.failed {
+		return nil
+	}
+	return &composition{
+		video:   video,
+		audio:   audio,
+		single:  video == audio,
+		lenient: c.lenient,
+		ordinal: -1,
+	}
+}
+
 func (m *Muxer) composerFor(job *model.MuxJob, state *playbackState) *composer {
 	state.mu.Lock()
 	defer state.mu.Unlock()
