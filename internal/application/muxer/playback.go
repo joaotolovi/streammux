@@ -1539,7 +1539,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		// Film timeline (possibly truncated by the error tail).
 		segs := computeEqualLengthSegments(segDur, duration)
 		first := base
-		last := base + len(segs) - 1
+		last := len(segs) - 1
 		if errGen != nil && errStart <= last {
 			last = errStart - 1
 		}
@@ -1550,7 +1550,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 			if discSet[i] {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
-			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segs[i-base]))
+			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segs[i]))
 			b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
 		}
 		if errGen != nil {
@@ -1700,7 +1700,6 @@ func (m *Muxer) segmentPath(job *model.MuxJob, segment int, audio bool) string {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	duration := state.duration
-	base := state.filmBase
 	errGen := state.errorGeneration
 	errStart := state.errorStart
 	all := append([]*generation(nil), state.all...)
@@ -1716,7 +1715,7 @@ func (m *Muxer) segmentPath(job *model.MuxJob, segment int, audio bool) string {
 		if segment >= errStart+m.errorSegmentCount() {
 			return ""
 		}
-	} else if segment >= base+vodSegmentCount(duration) {
+	} else if segment >= vodSegmentCount(duration) {
 		return ""
 	}
 	for i := len(all) - 1; i >= 0; i-- {
@@ -1978,7 +1977,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	state.mu.Lock()
 	count := 0
 	if state.duration > 0 {
-		count = state.filmBase + vodSegmentCount(state.duration)
+		count = vodSegmentCount(state.duration)
 	}
 	hasError := state.errorGeneration != nil
 	state.mu.Unlock()
