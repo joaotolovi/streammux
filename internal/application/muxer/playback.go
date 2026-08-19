@@ -53,10 +53,11 @@ type playbackState struct {
 
 	// placeholder is the live intro playing while the film prepares.
 	// retiredPlaceholder keeps its segments servable after the handoff.
-	placeholder        *generation
-	retiredPlaceholder *generation
-	placeholderStarted bool
-	placeholderWait    chan struct{}
+	placeholder         *generation
+	retiredPlaceholder  *generation
+	placeholderPlaylist []byte
+	placeholderStarted  bool
+	placeholderWait     chan struct{}
 
 	// filmBase is the public segment index where film content 0:00 lives
 	// (nonzero when a placeholder played first). While >= 0 the placeholder
@@ -514,13 +515,20 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		// last common segment. The session keeps running until the film
 		// takes over (rendering caps at filmBase-1), so the media sequence
 		// can only move forward — players reject sequence regression.
-		state.mu.Lock()
 		base := 0
 		if ph != nil {
 			if common := lastCommonSegment(ph); common >= 0 {
 				base = common + 1
 			}
+		}
+		var frozenPlaceholder []byte
+		if ph != nil {
+			frozenPlaceholder, _ = synchronizedLiveWindow(ph, base-1)
+		}
+		state.mu.Lock()
+		if ph != nil {
 			state.placeholderLive = false
+			state.placeholderPlaylist = frozenPlaceholder
 		}
 		state.filmBase = base
 		state.mu.Unlock()
@@ -1491,6 +1499,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	activeTier := state.activeTier
 	tierBusy := state.tierBusy
 	lastRequested := state.lastRequested
+	frozenPlaceholder := append([]byte(nil), state.placeholderPlaylist...)
 	state.mu.Unlock()
 
 	// A tier > 0 that is not yet active: ensure the downgrade ladder spins up
@@ -1505,6 +1514,9 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// Live placeholder phase: synchronized sliding window of both renditions,
 	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
+		if len(frozenPlaceholder) > 0 {
+			return frozenPlaceholder, true
+		}
 		return synchronizedLiveWindow(placeholder, base-1)
 	}
 
