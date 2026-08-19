@@ -215,7 +215,13 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 		}
 	}
 	ladder := make([]*tierStrategy, 0, len(ranked_list))
-	for _, r := range ranked_list {
+	log.Printf("mux: tier %d ladder target=%dk primary=%dk candidates=%d", tier, target/1000, t0Bits/1000, len(ranked_list))
+	for i, r := range ranked_list {
+		kind := "source"
+		if r.s.kind == stratTranscode {
+			kind = "transcode"
+		}
+		log.Printf("mux: tier %d rank#%d kind=%s %s bitrate=%dk height=%dp score=%d distance=%dk", tier, i+1, kind, r.s.desc, r.s.estBits/1000, r.s.height, r.s.score, r.dist/1000)
 		ladder = append(ladder, r.s)
 	}
 	return ladder
