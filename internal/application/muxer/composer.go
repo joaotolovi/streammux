@@ -36,6 +36,8 @@ type sourceState struct {
 	trackDone bool // audio track selection attempted (strict)
 	track     int  // strict target-language audio track (-1 = none)
 	trackLeni int  // lenient track (-1 = none)
+	leniDone  bool // lenient selection attempted (distinguishes "rejected in
+	// lenient" from "not yet evaluated" — the latter must still be tried last)
 }
 
 type failClass int
@@ -315,9 +317,11 @@ func (c *composer) acquireWithin(maxBits int64) *composition {
 			continue
 		}
 		// Skip audio sources confirmed to lack the target language in the
-		// current pass (the lenient pass may still find one).
+		// current pass. A source not yet evaluated in the lenient pass is NOT
+		// skipped here: it is acquired so its lenient track is computed and,
+		// failing that, it is skipped on every subsequent encounter.
 		if c.lenient {
-			if comp.audio.trackDone && comp.audio.trackLeni < 0 {
+			if comp.audio.trackDone && comp.audio.leniDone && comp.audio.trackLeni < 0 {
 				c.cursor++
 				continue
 			}
@@ -338,13 +342,16 @@ func (c *composer) acquireWithin(maxBits int64) *composition {
 }
 
 // hasLenientCandidates reports whether any ranked composition could succeed
-// in the lenient pass (audio track not yet confirmed as absent).
+// in the lenient pass. A source is a lenient candidate until it has actually
+// been evaluated in the lenient pass (leniDone): only then can we know whether
+// it offers an untagged/und track. Sources rejected in the strict pass are not
+// discarded — they are deferred to the end of the queue.
 func (c *composer) hasLenientCandidates() bool {
 	for _, comp := range c.ranked {
 		if comp.video.failed || comp.audio.failed {
 			continue
 		}
-		if comp.audio.trackDone && comp.audio.trackLeni >= 0 {
+		if comp.audio.trackDone && !comp.audio.leniDone {
 			return true
 		}
 		if !comp.audio.trackDone {
@@ -442,6 +449,7 @@ func (c *composer) reset() {
 			s.trackDone = false
 			s.track = 0
 			s.trackLeni = 0
+			s.leniDone = false
 		}
 	}
 }
@@ -499,7 +507,9 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 		// pairings (and the lenient pass) remain possible.
 		return nil, failNoTrack, fmt.Errorf("source has no confirmed %s audio track", job.TargetLanguage)
 	}
-	log.Printf("mux: composition %d selected audio track a:%d (of %d tracks) from %s", comp.ordinal, track, len(audio.probe.AudioTracks), audio.stream.SourceKey())
+	lang, title := trackMeta(audio.probe.AudioTracks, track)
+	log.Printf("mux: composition %d selected audio track a:%d (of %d, lang=%s title=%s) from %s lenient=%v",
+		comp.ordinal, track, len(audio.probe.AudioTracks), lang, title, audio.stream.SourceKey(), comp.isLenient())
 
 	if comp.video.probe.Duration <= 0 {
 		return nil, failVideo, fmt.Errorf("video source has no probeable duration")
@@ -625,6 +635,7 @@ func (s *sourceState) selectTrack(job *model.MuxJob, lenient bool) {
 	}
 	if lenient {
 		s.trackLeni = targetAudioTrackStrict(s.probe.AudioTracks, job.TargetLanguage, s.stream, true)
+		s.leniDone = true
 		return
 	}
 	if !s.trackDone {
@@ -644,6 +655,17 @@ func (s *sourceState) selectedTrack(lenient bool) int {
 		return s.track
 	}
 	return s.trackLeni
+}
+
+// trackMeta returns the language tag and title of a selected audio track for
+// logging (empty strings when the track is not found).
+func trackMeta(tracks []ffmpeg.AudioTrack, index int) (lang, title string) {
+	for _, t := range tracks {
+		if t.Index == index {
+			return t.Language, t.Title
+		}
+	}
+	return "", ""
 }
 
 // makeCompositionPlan builds the synthetic PlaybackPlan for a composition so

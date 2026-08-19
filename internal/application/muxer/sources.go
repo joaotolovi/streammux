@@ -383,12 +383,11 @@ func targetAudioTrack(tracks []ffmpeg.AudioTrack, targetLanguage string, source 
 // targetAudioTrackStrict picks the audio track for a dubbed source.
 //
 // Strict mode (lenient=false) only accepts a track it can be confident about:
-// an explicit language tag, a title mentioning the language, or a source that
-// is identified as dubbed in the target language and carries exactly one audio
-// track (then the track is used as-is without further verification).
+// an explicit language tag, a title mentioning the language, or a single-track
+// source whose track tag does not contradict the target language.
 //
-// Lenient mode (lenient=true) is the last resort: it also accepts an undefined
-// or untagged track from a dubbed multiaudio source, since many "DUAL" remuxes
+// Lenient mode (lenient=true) is the end of the queue: it also accepts an
+// undefined or untagged track from a dubbed source, since many "DUAL" remuxes
 // tag the dubbed audio as `und` or leave it empty. It is only used after every
 // strict plan has failed.
 func targetAudioTrackStrict(tracks []ffmpeg.AudioTrack, targetLanguage string, source model.CollectedStream, lenient bool) int {
@@ -403,11 +402,26 @@ func targetAudioTrackStrict(tracks []ffmpeg.AudioTrack, targetLanguage string, s
 		}
 	}
 
-	// A source identified as dubbed with a single audio track is used as-is:
-	// with only one track there is nothing else to select, so the tag (or lack
-	// of one) is irrelevant.
+	// A source identified as dubbed with a single audio track. Accept the
+	// track only when its own tag does not contradict the target language:
+	//   - an explicit foreign-language tag (e.g. "eng" on a source flagged as
+	//     Portuguese) is authoritative — the addon flag is wrong and the source
+	//     is rejected rather than played in the wrong language;
+	//   - an untagged/und track is not rejected, merely deferred: strict mode
+	//     returns -1 so the composer tries confirmed sources first, and the
+	//     lenient pass (the end of the queue) picks it up last.
 	if len(tracks) == 1 && analyzer.MatchesLanguage(source, targetLanguage) {
-		return tracks[0].Index
+		lang := strings.TrimSpace(tracks[0].Language)
+		if lang == "" || lang == "und" {
+			if lenient {
+				return tracks[0].Index
+			}
+			return -1
+		}
+		if ffmpeg.LanguageCode(lang) == code {
+			return tracks[0].Index
+		}
+		return -1
 	}
 
 	// Lenient: accept an undefined/empty track from a dubbed multiaudio source.

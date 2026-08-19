@@ -54,9 +54,11 @@ func TestHealthTrackerHealthyWindowResetsSlowState(t *testing.T) {
 	}
 }
 
-func TestTargetAudioTrackUsesSingleTrackOfDubbedSource(t *testing.T) {
-	// A source identified as dubbed with exactly one audio track is used as-is,
-	// no language verification needed.
+func TestTargetAudioTrackDefersUntaggedSingleTrackToLenient(t *testing.T) {
+	// A source identified as dubbed with exactly one UNTAGGED audio track is
+	// not selected in strict mode: without metadata there is no proof it is in
+	// the target language, so it is deferred to the end of the queue (lenient
+	// pass) rather than discarding it.
 	tracks := []ffmpeg.AudioTrack{
 		{Index: 2, Language: ""},
 	}
@@ -65,8 +67,11 @@ func TestTargetAudioTrackUsesSingleTrackOfDubbedSource(t *testing.T) {
 		IsDubbed:      true,
 		Language:      "Portuguese (Brazil)",
 	}
-	if got := targetAudioTrack(tracks, "Portuguese (Brazil)", source); got != 2 {
-		t.Fatalf("targetAudioTrack() = %d, want 2 (single dubbed track)", got)
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, false); got != -1 {
+		t.Fatalf("strict targetAudioTrack() = %d, want -1 (untagged single track deferred)", got)
+	}
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, true); got != 2 {
+		t.Fatalf("lenient targetAudioTrack() = %d, want 2 (single untagged track at end of queue)", got)
 	}
 }
 
@@ -134,11 +139,49 @@ func TestTargetAudioTrackNeverFallsBackForUnknownMultiaudio(t *testing.T) {
 	}
 }
 
-func TestTargetAudioTrackAcceptsSingleUntaggedDubbedTrack(t *testing.T) {
-	tracks := []ffmpeg.AudioTrack{{Index: 2}}
-	source := model.CollectedStream{AddonLanguage: "Portuguese (Brazil)"}
-	if got := targetAudioTrack(tracks, "Portuguese (Brazil)", source); got != 2 {
-		t.Fatalf("targetAudioTrack() = %d, want 2", got)
+func TestTargetAudioTrackRejectsSingleForeignTrack(t *testing.T) {
+	// A source flagged as Portuguese whose single audio track is explicitly
+	// tagged English: the tag is authoritative and overrides the addon flag —
+	// the source is rejected in both passes rather than played in English.
+	tracks := []ffmpeg.AudioTrack{{Index: 2, Language: "eng"}}
+	source := model.CollectedStream{
+		AddonLanguage: "Portuguese (Brazil)",
+		IsDubbed:      true,
+		Language:      "Portuguese (Brazil)",
+	}
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, false); got != -1 {
+		t.Fatalf("strict targetAudioTrack() = %d, want -1 (explicit eng tag rejects source)", got)
+	}
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, true); got != -1 {
+		t.Fatalf("lenient targetAudioTrack() = %d, want -1 (explicit eng tag rejects source)", got)
+	}
+}
+
+func TestTargetAudioTrackAcceptsSingleTaggedPorTrack(t *testing.T) {
+	// A single track explicitly tagged Portuguese is selected directly.
+	tracks := []ffmpeg.AudioTrack{{Index: 1, Language: "por"}}
+	source := model.CollectedStream{
+		AddonLanguage: "Portuguese (Brazil)",
+		IsDubbed:      true,
+	}
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, false); got != 1 {
+		t.Fatalf("strict targetAudioTrack() = %d, want 1 (single por track)", got)
+	}
+}
+
+func TestTargetAudioTrackLenientAcceptsUndSingleTrack(t *testing.T) {
+	// An und-tagged single track keeps its place at the end of the queue:
+	// rejected in strict mode, accepted in the lenient last-resort pass.
+	tracks := []ffmpeg.AudioTrack{{Index: 3, Language: "und"}}
+	source := model.CollectedStream{
+		AddonLanguage: "Portuguese (Brazil)",
+		IsDubbed:      true,
+	}
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, false); got != -1 {
+		t.Fatalf("strict targetAudioTrack() = %d, want -1 (und deferred)", got)
+	}
+	if got := targetAudioTrackStrict(tracks, "Portuguese (Brazil)", source, true); got != 3 {
+		t.Fatalf("lenient targetAudioTrack() = %d, want 3 (und single track)", got)
 	}
 }
 
