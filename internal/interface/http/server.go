@@ -253,14 +253,26 @@ func (s *Server) serveVodPlaylist(w http.ResponseWriter, r *http.Request, render
 		writeError(w, http.StatusBadGateway, "playlist not ready")
 		return
 	}
-	data, ok := render(job)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, "playlist not ready")
-		return
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		data, ok := render(job)
+		if ok {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Write(data)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			writeError(w, http.StatusBadGateway, "playlist request canceled")
+			return
+		case <-deadline.C:
+			writeError(w, http.StatusBadGateway, "playlist not ready")
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Write(data)
 }
 
 // countingWriter tracks how many bytes were actually written to the player,
