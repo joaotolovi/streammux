@@ -1060,7 +1060,13 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return m.renderMaster(job, bandwidth, active.prepared.videoWidth, active.prepared.videoHeight, job.TargetLanguage), true
 	}
 	if placeholder != nil || (active != nil && active.isError) {
-		// Small placeholder/error rendition.
+		// Advertise the complete virtual ladder from the first master request.
+		// The lower tiers remain lazy and do not consume debrid slots until the
+		// player requests one of their namespaced segments.
+		if placeholder != nil && tiers > 1 {
+			return m.renderMasterABR(job, job.TierMetas, job.TargetLanguage), true
+		}
+		// Small terminal error rendition.
 		return m.renderMaster(job, 3_000_000, 0, 0, job.TargetLanguage), true
 	}
 	return nil, false
@@ -1539,13 +1545,13 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
 			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segs[i]))
-			b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
+			b.WriteString(tierSegmentURI(tier, i))
 		}
 		if errGen != nil {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 			for i := errStart; i < errStart+m.errorSegmentCount(); i++ {
 				b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
-				b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
+				b.WriteString(tierSegmentURI(tier, i))
 			}
 		}
 		b.WriteString("#EXT-X-ENDLIST\n")
@@ -1559,14 +1565,14 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 		for i := 0; i < errStart; i++ {
 			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
-			b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
+			b.WriteString(tierSegmentURI(tier, i))
 		}
 		if errStart > 0 {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 		}
 		for i := errStart; i < errStart+m.errorSegmentCount(); i++ {
 			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
-			b.WriteString(fmt.Sprintf("seg_%05d.ts\n", i))
+			b.WriteString(tierSegmentURI(tier, i))
 		}
 		b.WriteString("#EXT-X-ENDLIST\n")
 		return []byte(b.String()), true
@@ -1574,6 +1580,13 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 
 	_ = retired
 	return nil, false
+}
+
+func tierSegmentURI(tier, segment int) string {
+	if tier > 0 {
+		return fmt.Sprintf("v%d/seg_%05d.ts\n", tier, segment)
+	}
+	return fmt.Sprintf("seg_%05d.ts\n", segment)
 }
 
 // synchronizedLiveWindow renders the common A/V window of a live generation
@@ -1675,12 +1688,22 @@ func (m *Muxer) SegmentPath(job *model.MuxJob, segment int) string {
 	return m.segmentPath(job, segment, false)
 }
 
+// SegmentPathTier resolves a video segment only from the requested ABR tier.
+// This prevents a cached primary segment from satisfying a lower-tier URL.
+func (m *Muxer) SegmentPathTier(job *model.MuxJob, segment, tier int) string {
+	return m.segmentPathTier(job, segment, false, tier)
+}
+
 // AudioSegmentPath resolves a public audio segment index to a file.
 func (m *Muxer) AudioSegmentPath(job *model.MuxJob, segment int) string {
 	return m.segmentPath(job, segment, true)
 }
 
 func (m *Muxer) segmentPath(job *model.MuxJob, segment int, audio bool) string {
+	return m.segmentPathTier(job, segment, audio, -1)
+}
+
+func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier int) string {
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return ""
@@ -1707,6 +1730,9 @@ func (m *Muxer) segmentPath(job *model.MuxJob, segment int, audio bool) string {
 		return ""
 	}
 	for i := len(all) - 1; i >= 0; i-- {
+		if !audio && tier >= 0 && all[i].tier != tier {
+			continue
+		}
 		var path string
 		if audio {
 			path = generationAudioSegmentPath(all[i], segment)
@@ -1935,7 +1961,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	if err := m.EnsurePlaylist(ctx, job); err != nil {
 		return "", err
 	}
-	if path := m.segmentPath(job, segment, audio); path != "" {
+	if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
 		return path, nil
 	}
 
@@ -1977,7 +2003,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	defer cancel()
 
 	for {
-		if path := m.segmentPath(job, segment, audio); path != "" {
+		if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
 			return path, nil
 		}
 
@@ -2053,11 +2079,18 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			state.mu.Lock()
 			err := state.recoveryErr
 			state.mu.Unlock()
-			if err != nil && m.segmentPath(job, segment, audio) == "" {
+			if err != nil && m.mediaSegmentPath(job, segment, tier, audio) == "" {
 				return "", err
 			}
 		}
 	}
+}
+
+func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio bool) string {
+	if audio {
+		return m.segmentPath(job, segment, true)
+	}
+	return m.segmentPathTier(job, segment, false, tier)
 }
 
 // fastSeek relaunches the SAME sources at the requested offset — no composer

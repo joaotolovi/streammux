@@ -228,7 +228,11 @@ func (s *Server) handleHLSVideoPath(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	s.serveSegment(w, r, false)
+	tier := 0
+	if slash := strings.IndexByte(path, '/'); slash > 1 && path[0] == 'v' {
+		_, _ = fmt.Sscanf(path[:slash], "v%d", &tier)
+	}
+	s.serveSegment(w, r, false, tier)
 }
 
 func (s *Server) handleHLSAudioPlaylist(w http.ResponseWriter, r *http.Request) {
@@ -277,11 +281,11 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 }
 
 func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
-	s.serveSegment(w, r, false)
+	s.serveSegment(w, r, false, 0)
 }
 
 func (s *Server) handleHLSAudioSegment(w http.ResponseWriter, r *http.Request) {
-	s.serveSegment(w, r, true)
+	s.serveSegment(w, r, true, 0)
 }
 
 func (s *Server) handleHLSAudioRenditionSegment(w http.ResponseWriter, r *http.Request) {
@@ -319,7 +323,7 @@ func (s *Server) handleHLSAudioRenditionSegment(w http.ResponseWriter, r *http.R
 	s.deliverSegment(w, r, job, path, true)
 }
 
-func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool) {
+func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool, tier int) {
 	jobID := r.PathValue("jobId")
 	// "path" is set by the video catch-all route; "segment" by the audio route.
 	segment := r.PathValue("path")
@@ -343,7 +347,7 @@ func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool
 	if audio {
 		cached = s.muxer.AudioSegmentPath(job, segIndex)
 	} else {
-		cached = s.muxer.SegmentPath(job, segIndex)
+		cached = s.muxer.SegmentPathTier(job, segIndex, tier)
 	}
 	if cached != "" {
 		s.deliverSegment(w, r, job, cached, audio)
@@ -362,7 +366,7 @@ func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool
 	if audio {
 		segPath, err = s.muxer.EnsureAudioSegment(r.Context(), job, segIndex)
 	} else {
-		segPath, err = s.muxer.EnsureSegment(r.Context(), job, segIndex, s.muxer.ActiveTier(job))
+		segPath, err = s.muxer.EnsureSegment(r.Context(), job, segIndex, tier)
 	}
 	if err != nil {
 		if errors.Is(err, muxer.ErrBeyondEnd) {

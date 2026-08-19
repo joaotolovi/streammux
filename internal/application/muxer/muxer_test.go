@@ -570,6 +570,45 @@ func TestMasterPlaylistSeparatesSameLanguageAlternativeForExoPlayer(t *testing.T
 	}
 }
 
+func TestPlaceholderMasterAdvertisesVirtualABRTiers(t *testing.T) {
+	state := &playbackState{placeholder: &generation{}}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{
+		ID:             "job",
+		TargetLanguage: "Portuguese (Brazil)",
+		TierMetas: []model.TierMeta{
+			{Bandwidth: 120_000_000, Width: 3840, Height: 2160},
+			{Bandwidth: 21_600_000, Width: 1920, Height: 1080},
+			{Bandwidth: 7_200_000, Width: 1280, Height: 720},
+		},
+	}
+
+	data, ok := mux.MasterPlaylist(job)
+	if !ok {
+		t.Fatal("MasterPlaylist() returned false")
+	}
+	playlist := string(data)
+	for _, uri := range []string{"video/video.m3u8", "video/v1.m3u8", "video/v2.m3u8"} {
+		if !strings.Contains(playlist, uri) {
+			t.Fatalf("placeholder master missing %s: %s", uri, playlist)
+		}
+	}
+}
+
+func TestVirtualTierPlaylistUsesNamespacedSegments(t *testing.T) {
+	state := &playbackState{duration: 12, lastRequested: -1}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+
+	data, ok := mux.VideoPlaylist(&model.MuxJob{ID: "job"}, 1)
+	if !ok {
+		t.Fatal("VideoPlaylist() returned false")
+	}
+	playlist := string(data)
+	if !strings.Contains(playlist, "v1/seg_00000.ts") {
+		t.Fatalf("tier playlist missing namespaced segment: %s", playlist)
+	}
+}
+
 func TestVodPlaylistServesFullDurationImmediately(t *testing.T) {
 	// A 2h film must expose 1800 segments from the very first request.
 	state := &playbackState{
@@ -637,6 +676,40 @@ func TestSegmentPathSearchesGenerationsNewestFirst(t *testing.T) {
 	// Requests beyond the film duration return nothing.
 	if path := mux.SegmentPath(job, 60); path != "" {
 		t.Fatalf("segment beyond end = %q, want empty", path)
+	}
+}
+
+func TestSegmentPathTierDoesNotServeAnotherTier(t *testing.T) {
+	tier0 := t.TempDir()
+	tier1 := t.TempDir()
+	for _, dir := range []string{tier0, tier1} {
+		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tier0Segment := filepath.Join(tier0, "video", "seg_00002.ts")
+	tier1Segment := filepath.Join(tier1, "video", "seg_00002.ts")
+	if err := os.WriteFile(tier0Segment, []byte("tier0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tier1Segment, []byte("tier1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := &playbackState{
+		duration: 120,
+		all: []*generation{
+			{dir: tier0, tier: 0},
+			{dir: tier1, tier: 1},
+		},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPathTier(job, 2, 0); path != tier0Segment {
+		t.Fatalf("tier 0 segment = %q, want %q", path, tier0Segment)
+	}
+	if path := mux.SegmentPathTier(job, 2, 1); path != tier1Segment {
+		t.Fatalf("tier 1 segment = %q, want %q", path, tier1Segment)
 	}
 }
 
