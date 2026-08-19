@@ -713,6 +713,91 @@ func TestSegmentPathTierDoesNotServeAnotherTier(t *testing.T) {
 	}
 }
 
+func TestMediaSegmentPathBridgesPendingTierToActiveGeneration(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	activeSegment := filepath.Join(dir, "video", "seg_00002.ts")
+	if err := os.WriteFile(activeSegment, []byte("active"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &playbackState{
+		duration:   120,
+		activeTier: 0,
+		active:     &generation{dir: dir, tier: 0},
+		all:        []*generation{{dir: dir, tier: 0}},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPathTier(job, 2, 1); path != "" {
+		t.Fatalf("pending tier must not expose an exact tier-1 path: %q", path)
+	}
+	if path := mux.mediaSegmentPath(job, 2, 1, false); path != activeSegment {
+		t.Fatalf("pending tier path = %q, want active segment %q", path, activeSegment)
+	}
+}
+
+func TestSegmentPathTierIgnoresRetiredTierAfterCutover(t *testing.T) {
+	tier0 := t.TempDir()
+	tier1 := t.TempDir()
+	for _, dir := range []string{tier0, tier1} {
+		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retired := filepath.Join(tier0, "video", "seg_00002.ts")
+	active := filepath.Join(tier1, "video", "seg_00002.ts")
+	if err := os.WriteFile(retired, []byte("retired"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(active, []byte("active"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &playbackState{
+		duration:   120,
+		activeTier: 1,
+		active:     &generation{dir: tier1, tier: 1},
+		all:        []*generation{{dir: tier0, tier: 0}, {dir: tier1, tier: 1}},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPathTier(job, 2, 0); path != "" {
+		t.Fatalf("retired tier path = %q, want empty", path)
+	}
+	if path := mux.mediaSegmentPath(job, 2, 0, false); path != active {
+		t.Fatalf("retired tier bridge = %q, want active segment %q", path, active)
+	}
+}
+
+func TestRequestTierHonorsCooldown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := &playbackState{
+		ctx:            ctx,
+		activeTier:     0,
+		tierPending:    -1,
+		tier0Prepared:  &preparedPlan{},
+		lastTierSwitch: time.Now(),
+	}
+	mux := &Muxer{
+		states: map[string]*playbackState{"job": state},
+		policy: Policy{TierSwitchCooldown: time.Minute},
+	}
+
+	mux.requestTier(&model.MuxJob{ID: "job"}, state, 1, 2)
+	state.mu.Lock()
+	busy := state.tierBusy
+	state.mu.Unlock()
+	if busy {
+		t.Fatal("tier switch started during cooldown")
+	}
+}
+
 func TestPlayerTooSlowRequiresAllWindowsSlow(t *testing.T) {
 	now := time.Unix(1000, 0)
 	required := 10_000_000.0 // 10 Mbps

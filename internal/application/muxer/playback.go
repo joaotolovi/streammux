@@ -88,14 +88,19 @@ type playbackState struct {
 	// ABR downgrade ladder: activeTier is the tier the player is currently
 	// consuming (0 = primary), tier0Prepared retains the primary plan for
 	// transcode strategies, tierBudgets are per-tier bitrate ceilings, and
-	// tierDisc marks per-tier video discontinuities (strategy switches).
-	activeTier    int
-	tierBusy      bool
-	tierWait      chan struct{}
-	tierErr       error
-	tier0Prepared *preparedPlan
-	tierBudgets   [tierCount]int64
-	tierDisc      [tierCount][]int
+	// tierDisc marks per-tier video discontinuities (strategy switches). A
+	// switch has only one pending generation; requests for it are bridged by
+	// the active generation until the cutover.
+	activeTier       int
+	tierBusy         bool
+	tierPending      int
+	tierSwitchCancel context.CancelFunc
+	tierWait         chan struct{}
+	tierErr          error
+	lastTierSwitch   time.Time
+	tier0Prepared    *preparedPlan
+	tierBudgets      [tierCount]int64
+	tierDisc         [tierCount][]int
 
 	duration      float64 // film duration in seconds (from probe)
 	lastRequested int
@@ -170,6 +175,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		lastRequested:   -1,
 		maxRequested:    -1,
 		lastAccess:      time.Now(),
+		tierPending:     -1,
 		audioRenditions: make(map[string]*audioRendition),
 	}
 	m.states[job.ID] = state
@@ -738,6 +744,13 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 // be ready before returning (the initial handoff wants a deep cushion, lazy
 // tier switches and seeks want speed).
 func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIndex int, prepared *preparedPlan, tier, startNumber int, startTime float64, minBuffer time.Duration) (*generation, error) {
+	return m.launchGenerationContext(job, state, state.ctx, planIndex, prepared, tier, startNumber, startTime, minBuffer)
+}
+
+// launchGenerationContext is launchGeneration with a caller-owned parent
+// context. Tier switches use it to cancel a pending generation when the player
+// changes its mind; ordinary startup, recovery and seeks use state.ctx.
+func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState, parent context.Context, planIndex int, prepared *preparedPlan, tier, startNumber int, startTime float64, minBuffer time.Duration) (*generation, error) {
 	// Seeks do a remote input seek on a large file (MKV cues, byte-range
 	// request to the debrid), which can take much longer than a fresh start
 	// before the first segment appears.
@@ -745,7 +758,7 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 	if startTime > 0 {
 		attemptBudget = m.policy.StartupTimeout
 	}
-	attemptCtx, cancel := context.WithTimeout(state.ctx, attemptBudget)
+	attemptCtx, cancel := context.WithTimeout(parent, attemptBudget)
 	defer cancel()
 
 	state.mu.Lock()
@@ -766,6 +779,10 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 		audioOffset = offset
 	}
 
+	// Keep a successful generation attached to the job context, not the
+	// short-lived switch context. The latter is cancelled as soon as the
+	// handoff is committed; attemptCtx above still cancels an in-flight
+	// generation before its first segment is ready.
 	session, err := m.ffmpeg.StartSession(state.ctx, ffmpeg.SessionSpec{
 		VideoURL:        prepared.videoURL,
 		AudioURL:        prepared.audioURL,
@@ -1495,16 +1512,14 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	errGen := state.errorGeneration
 	errStart := state.errorStart
 	activeTier := state.activeTier
-	tierBusy := state.tierBusy
 	lastRequested := state.lastRequested
 	state.mu.Unlock()
 
-	// A tier > 0 that is not yet active: ensure the downgrade ladder spins up
-	// at the player's position. The playlist this call returns is the same
-	// shared VOD timeline (the ladder's first segment carries a
-	// DISCONTINUITY); the player does not see the tier namespace.
-	if tier > 0 && tier != activeTier && !tierBusy && lastRequested >= 0 {
-		m.ensureTier(job, state, tier, lastRequested+1)
+	// A tier request is only a signal to prepare a switch. The playlist remains
+	// immediately available and segment requests are bridged to the active
+	// generation until the target has enough buffer.
+	if tier != activeTier && lastRequested >= 0 {
+		m.requestTier(job, state, tier, lastRequested+1)
 	}
 
 	_ = retired
@@ -1713,6 +1728,8 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 	duration := state.duration
 	errGen := state.errorGeneration
 	errStart := state.errorStart
+	active := state.active
+	activeTier := state.activeTier
 	all := append([]*generation(nil), state.all...)
 	state.mu.Unlock()
 
@@ -1727,6 +1744,13 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 			return ""
 		}
 	} else if segment >= vodSegmentCount(duration) {
+		return ""
+	}
+	// Once a tier switch completes, the active generation is authoritative.
+	// Do not serve stale files from a retired tier. mediaSegmentPath can still
+	// bridge a request to the active generation while a new tier is warming up
+	// or while the switch cooldown is active.
+	if !audio && tier >= 0 && active != nil && tier != activeTier {
 		return ""
 	}
 	for i := len(all) - 1; i >= 0; i-- {
@@ -1961,34 +1985,29 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	if err := m.EnsurePlaylist(ctx, job); err != nil {
 		return "", err
 	}
-	if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
-		return path, nil
-	}
 
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return "", fmt.Errorf("playback state not found")
 	}
 
-	// A tier > 0 not yet active: spin up the downgrade ladder at the
-	// player's position before falling through to the normal wait/seek
-	// logic. The ladder's first segment carries a DISCONTINUITY.
-	if !audio && tier > 0 {
+	// Register the request before looking for a cached path. This is important
+	// because mediaSegmentPath intentionally bridges a not-yet-ready tier to
+	// the active generation; looking first would otherwise make the first
+	// bridged request skip starting the background switch.
+	if !audio {
 		state.mu.Lock()
-		busy := state.tierBusy
-		activeTier := state.activeTier
 		lastRequested := state.lastRequested
 		state.mu.Unlock()
-		if !busy && activeTier != tier {
-			// On the first tier request there is no previous segment. Start
-			// at the requested segment, otherwise a saved seek would make the
-			// new source encode from segment zero until the request times out.
-			at := segment
-			if lastRequested >= 0 {
-				at = lastRequested + 1
-			}
-			m.ensureTier(job, state, tier, at)
+		at := segment
+		if lastRequested >= 0 && lastRequested+1 > at {
+			at = lastRequested + 1
 		}
+		m.requestTier(job, state, tier, at)
+	}
+
+	if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
+		return path, nil
 	}
 
 	state.mu.Lock()
@@ -2093,7 +2112,30 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 	if audio {
 		return m.segmentPath(job, segment, true)
 	}
-	return m.segmentPathTier(job, segment, false, tier)
+	if path := m.segmentPathTier(job, segment, false, tier); path != "" {
+		return path
+	}
+	// A requested ABR namespace is only a URL contract. While its generation
+	// is being prepared, or while the switch cooldown is active, keep serving
+	// the exact segment from the active generation. This makes the handoff
+	// invisible to the player and ensures a missing target segment never
+	// blocks the current stream.
+	state := m.lookupState(job.ID)
+	if state == nil || tier < 0 {
+		return ""
+	}
+	state.mu.Lock()
+	active := state.active
+	activeTier := state.activeTier
+	state.mu.Unlock()
+	if active == nil || activeTier == tier {
+		return ""
+	}
+	path := generationSegmentPath(active, segment)
+	if fileExists(path) {
+		return path
+	}
+	return ""
 }
 
 // fastSeek relaunches the SAME sources at the requested offset — no composer

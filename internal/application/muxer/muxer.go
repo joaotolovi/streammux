@@ -59,8 +59,13 @@ type Policy struct {
 	// tier switch: smaller than the startup cushion so the switch is fast,
 	// but nonzero so the first segment is already out before the player
 	// resumes.
-	TierSwitchBuffer  time.Duration
-	DurationTolerance float64
+	TierSwitchBuffer time.Duration
+	// TierSwitchCooldown prevents the player from bouncing between virtual
+	// renditions while its ABR estimate settles. During the cooldown the
+	// active generation is served under the requested tier URL and no second
+	// generation is started.
+	TierSwitchCooldown time.Duration
+	DurationTolerance  float64
 	// PlaceholderMinTime is how long the placeholder must play before the
 	// film takes over, even when the film is ready sooner.
 	PlaceholderMinTime time.Duration
@@ -88,6 +93,7 @@ func defaultPolicy() Policy {
 		MinPublishedAhead:  12 * time.Second,
 		MinHandoffBuffer:   20 * time.Second,
 		TierSwitchBuffer:   8 * time.Second,
+		TierSwitchCooldown: 30 * time.Second,
 		DurationTolerance:  0.002,
 		PlaceholderMinTime: 8 * time.Second,
 		CacheMaxBytes:      8 * 1024 * 1024 * 1024,

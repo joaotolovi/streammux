@@ -2,6 +2,7 @@ package muxer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -296,37 +297,70 @@ func (m *Muxer) prepareTierStrategy(ctx context.Context, job *model.MuxJob, stat
 	return nil, fmt.Errorf("unknown strategy kind")
 }
 
-// ensureTier activates a tier lazily: the first request for a tier's segment
-// or playlist switches the active generation to that tier's ladder winner at
-// the player's position.
-func (m *Muxer) ensureTier(job *model.MuxJob, state *playbackState, tier, atSegment int) {
+// requestTier records an ABR request and starts at most one background switch.
+// The active generation continues serving the requested namespace until the
+// target is ready. A request for the active tier cancels a pending switch;
+// this avoids preparing a rendition the player has already abandoned.
+func (m *Muxer) requestTier(job *model.MuxJob, state *playbackState, tier, atSegment int) {
+	if tier < 0 || tier >= tierCount {
+		return
+	}
+
+	var cancel context.CancelFunc
 	state.mu.Lock()
-	if state.closed || state.tierBusy || state.activeTier == tier || state.tier0Prepared == nil {
+	if state.closed || state.recovering || state.tier0Prepared == nil {
 		state.mu.Unlock()
 		return
 	}
+	if state.tierBusy {
+		if state.tierPending != tier {
+			cancel = state.tierSwitchCancel
+		}
+		state.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		return
+	}
+	if state.activeTier == tier {
+		state.mu.Unlock()
+		return
+	}
+	if !state.lastTierSwitch.IsZero() && time.Since(state.lastTierSwitch) < m.policy.TierSwitchCooldown {
+		state.mu.Unlock()
+		return
+	}
+
+	switchCtx, switchCancel := context.WithCancel(state.ctx)
 	state.tierBusy = true
+	state.tierPending = tier
+	state.tierSwitchCancel = switchCancel
 	state.tierWait = make(chan struct{})
+	state.tierErr = nil
 	state.mu.Unlock()
 
-	go m.runTierSwitch(job, state, tier, atSegment)
+	go m.runTierSwitch(job, state, tier, atSegment, switchCtx, switchCancel)
 }
 
 // runTierSwitch walks the tier's ladder at the player's position, falling
 // through to deeper tiers' ladders when a whole tier is exhausted. The
 // resulting generation serves the requesting tier's namespace regardless of
 // which ladder ultimately supplied it.
-func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, tier, atSegment int) {
+func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, tier, atSegment int, switchCtx context.Context, switchCancel context.CancelFunc) {
 	start := time.Now()
-	winner, fromTier, err := m.launchTierStrategy(job, state, tier, atSegment)
+	winner, fromTier, err := m.launchTierStrategy(job, state, tier, atSegment, switchCtx)
+	switchCancel()
 
 	state.mu.Lock()
 	wait := state.tierWait
 	old := state.active
-	if err == nil && !state.closed {
+	committed := false
+	if err == nil && !state.closed && state.tierPending == tier {
+		committed = true
 		state.active = winner
 		state.all = append(state.all, winner)
 		state.activeTier = tier
+		state.lastTierSwitch = time.Now()
 		state.deliveries = nil // samples measured the previous tier's bitrate
 		if old != nil && old != winner && old.prepared != nil && winner.prepared != nil {
 			// Mark the cutover in this tier's video playlist; the shared
@@ -340,20 +374,30 @@ func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, tier, atS
 		state.tierErr = err
 	}
 	state.tierBusy = false
+	state.tierPending = -1
+	state.tierSwitchCancel = nil
 	state.tierWait = nil
 	state.mu.Unlock()
 
 	if wait != nil {
 		close(wait)
 	}
-	if err != nil {
-		log.Printf("mux: tier %d switch failed after %s: %v", tier, time.Since(start).Round(time.Millisecond), err)
+	if err != nil || !committed {
+		if !committed && winner != nil {
+			winner.session.Cancel()
+			m.removeGenerationWhenStopped(winner)
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("mux: tier %d switch failed after %s: %v", tier, time.Since(start).Round(time.Millisecond), err)
+		}
 		return
 	}
 	if old != nil && old != winner {
-		// Grace-cancel the abandoned tier's session: the player may bounce
-		// between tiers for a few seconds while its ABR settles.
-		go m.cancelAfterGrace(old, 20*time.Second, winner)
+		// The target has a buffered segment at the cutover. Stop the old
+		// generation immediately so a tier switch never leaves three sessions
+		// alive and the normal state returns to one generation.
+		old.session.Cancel()
+		m.removeGenerationWhenStopped(old)
 	}
 	log.Printf("mux: tier %d -> %s (ladder tier %d) at segment %d in %s",
 		tier, strategyDesc(winner.prepared), fromTier, atSegment, time.Since(start).Round(time.Millisecond))
@@ -362,15 +406,18 @@ func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, tier, atS
 
 // launchTierStrategy tries every rung of the tier's ladder, then deeper
 // tiers' ladders, returning the first generation that produces a segment.
-func (m *Muxer) launchTierStrategy(job *model.MuxJob, state *playbackState, tier, atSegment int) (*generation, int, error) {
+func (m *Muxer) launchTierStrategy(job *model.MuxJob, state *playbackState, tier, atSegment int, switchCtx context.Context) (*generation, int, error) {
 	var lastErr error
 	for t := tier; t < tierCount; t++ {
 		ladder := buildTierLadder(state, t)
 		for _, s := range ladder {
-			ctx, cancel := context.WithTimeout(state.ctx, m.policy.StartupTimeout)
+			ctx, cancel := context.WithTimeout(switchCtx, m.policy.StartupTimeout)
 			prepared, err := m.prepareTierStrategy(ctx, job, state, s)
 			if err != nil {
 				cancel()
+				if errors.Is(err, context.Canceled) || errors.Is(switchCtx.Err(), context.Canceled) {
+					return nil, tier, context.Canceled
+				}
 				lastErr = err
 				log.Printf("mux: tier %d strategy %s failed to prepare: %v", tier, s.desc, err)
 				continue
@@ -379,10 +426,13 @@ func (m *Muxer) launchTierStrategy(job *model.MuxJob, state *playbackState, tier
 			if startTime < 0 {
 				startTime = 0
 			}
-			gen, err := m.launchGeneration(job, state, 1000+t, prepared, tier, atSegment, startTime, m.policy.TierSwitchBuffer)
+			gen, err := m.launchGenerationContext(job, state, switchCtx, 1000+t, prepared, tier, atSegment, startTime, m.policy.TierSwitchBuffer)
 			cancel()
 			if err != nil {
 				lastErr = err
+				if errors.Is(err, context.Canceled) || errors.Is(switchCtx.Err(), context.Canceled) {
+					return nil, tier, context.Canceled
+				}
 				log.Printf("mux: tier %d strategy %s failed to launch: %v", tier, s.desc, err)
 				continue
 			}
@@ -393,16 +443,6 @@ func (m *Muxer) launchTierStrategy(job *model.MuxJob, state *playbackState, tier
 		lastErr = fmt.Errorf("no strategies available")
 	}
 	return nil, tier, lastErr
-}
-
-// cancelAfterGrace cancels a superseded session after the grace period unless
-// the player came back to it (it is the active generation again).
-func (m *Muxer) cancelAfterGrace(gen *generation, grace time.Duration, replacement *generation) {
-	time.Sleep(grace)
-	if gen == replacement {
-		return
-	}
-	gen.session.Cancel()
 }
 
 func strategyDesc(p *preparedPlan) string {
