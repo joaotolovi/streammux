@@ -126,6 +126,13 @@ func newComposer(job *model.MuxJob) *composer {
 			}
 		}
 	}
+	for _, stream := range job.VideoCandidates {
+		key := stream.SourceKey()
+		if key != "" && !seenVideo[key] {
+			seenVideo[key] = true
+			c.videos = append(c.videos, getState(stream))
+		}
+	}
 
 	sort.SliceStable(c.videos, func(i, j int) bool {
 		a, b := c.videos[i].stream, c.videos[j].stream

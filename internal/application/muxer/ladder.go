@@ -203,7 +203,9 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 		for j := i; j > 0; j-- {
 			a, b := ranked_list[j-1], ranked_list[j]
 			swap := false
-			if b.dist < a.dist {
+			if strategyUnderBudget(b.s, target) != strategyUnderBudget(a.s, target) {
+				swap = strategyUnderBudget(b.s, target)
+			} else if b.dist < a.dist {
 				swap = true
 			} else if b.dist == a.dist && b.s.score > a.s.score {
 				swap = true
@@ -219,6 +221,13 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 		ladder = append(ladder, r.s)
 	}
 	return ladder
+}
+
+// strategyUnderBudget prefers a real source that already satisfies the tier's
+// bitrate budget over a realtime transcode. This avoids spending CPU when the
+// addon already supplied a usable lighter rendition.
+func strategyUnderBudget(strategy *tierStrategy, target int64) bool {
+	return strategy.kind == stratSource && strategy.estBits <= target
 }
 
 // resolutionHeight maps a parsed resolution string to pixels for ABR metadata.

@@ -187,7 +187,10 @@ type MuxJob struct {
 	TargetLanguage string         `json:"targetLanguage"`
 	Title          string         `json:"title"`
 	Plans          []PlaybackPlan `json:"-"`
-	Config         Config         `json:"-"`
+	// VideoCandidates keeps all collected video sources available to the lazy
+	// ABR ladder even when playback plans are capped for startup fallback.
+	VideoCandidates []CollectedStream `json:"-"`
+	Config          Config            `json:"-"`
 
 	// Runtime fields are managed by the muxer and never serialized.
 	CacheDir      string  `json:"-"`

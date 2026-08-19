@@ -24,6 +24,18 @@ type Planner struct{}
 
 func New() *Planner { return &Planner{} }
 
+// VideoCandidates returns every deduplicated collected source for the lazy ABR
+// ladder. This is metadata only; resolution and playback remain lazy.
+func (p *Planner) VideoCandidates(streams []model.CollectedStream, targetLanguage string) []model.CollectedStream {
+	candidates := scoreStreams(deduplicate(streams, targetLanguage))
+	sort.Slice(candidates, func(i, j int) bool { return videoCandidateLess(candidates[i], candidates[j]) })
+	out := make([]model.CollectedStream, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, candidate.stream)
+	}
+	return out
+}
+
 type candidate struct {
 	stream     model.CollectedStream
 	videoScore int

@@ -28,6 +28,7 @@ type streamCollector interface {
 
 type playbackPlanner interface {
 	Build([]model.CollectedStream, string) []model.PlaybackPlan
+	VideoCandidates([]model.CollectedStream, string) []model.CollectedStream
 }
 
 type mediaEngine interface {
@@ -396,12 +397,13 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	}
 
 	job := &model.MuxJob{
-		TargetLanguage: cfg.Language,
-		Title:          primary.Video.AddonName + " + " + primary.Audio.AddonName,
-		Plans:          plans,
-		Config:         *cfg,
-		ContentType:    contentType,
-		ContentID:      contentID,
+		TargetLanguage:  cfg.Language,
+		Title:           primary.Video.AddonName + " + " + primary.Audio.AddonName,
+		Plans:           plans,
+		VideoCandidates: m.planner.VideoCandidates(streams, cfg.Language),
+		Config:          *cfg,
+		ContentType:     contentType,
+		ContentID:       contentID,
 	}
 
 	jobID := m.store.Save(job)
