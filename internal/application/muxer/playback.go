@@ -1980,9 +1980,12 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		lastRequested := state.lastRequested
 		state.mu.Unlock()
 		if !busy && activeTier != tier {
-			at := lastRequested + 1
-			if at < 0 {
-				at = segment
+			// On the first tier request there is no previous segment. Start
+			// at the requested segment, otherwise a saved seek would make the
+			// new source encode from segment zero until the request times out.
+			at := segment
+			if lastRequested >= 0 {
+				at = lastRequested + 1
 			}
 			m.ensureTier(job, state, tier, at)
 		}
