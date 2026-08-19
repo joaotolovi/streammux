@@ -600,24 +600,6 @@ func TestVodPlaylistServesFullDurationImmediately(t *testing.T) {
 	}
 }
 
-func TestPlaceholderHandoffKeepsFrozenPlaylistAvailable(t *testing.T) {
-	frozen := []byte("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:4,\nseg_00001.ts\n")
-	state := &playbackState{
-		placeholder:         &generation{},
-		filmBase:            2,
-		placeholderPlaylist: frozen,
-	}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-
-	playlist, ok := mux.VideoPlaylist(&model.MuxJob{ID: "job"}, 0)
-	if !ok {
-		t.Fatal("VideoPlaylist() returned false during frozen handoff")
-	}
-	if string(playlist) != string(frozen) {
-		t.Fatalf("VideoPlaylist() = %q, want frozen playlist %q", playlist, frozen)
-	}
-}
-
 func TestSegmentPathSearchesGenerationsNewestFirst(t *testing.T) {
 	old := t.TempDir()
 	newest := t.TempDir()

@@ -21,11 +21,6 @@ const segDuration = 4.0
 // without allowing a full film to accumulate in the server's temporary disk.
 const hlsWindowSegments = 12
 
-// initialReadBurst lets startup fill the handoff buffer at source speed. After
-// this amount of media FFmpeg settles at readrate=1 and cannot run through the
-// whole film ahead of the player.
-const initialReadBurst = 20.0
-
 const stderrTailSize = 32 * 1024
 
 // AudioMode controls how the selected audio stream is written to HLS.
@@ -257,7 +252,7 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if offset < 0 {
 		offset = 0
 	}
-	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y", "-readrate", "1", "-readrate_initial_burst", fmtDuration(initialReadBurst)}
+	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y", "-re"}
 	if spec.AudioOffset != 0 {
 		args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
 	}
@@ -312,8 +307,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		"-stats_period", "1",
 		"-progress", "pipe:1",
 		"-y",
-		"-readrate", "1",
-		"-readrate_initial_burst", fmtDuration(initialReadBurst),
+		"-re",
 		"-ss", fmtDuration(offset),
 	}
 	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
@@ -329,7 +323,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 			// audio to re-align it with the video content.
 			args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
 		}
-		args = append(args, "-readrate", "1", "-readrate_initial_burst", fmtDuration(initialReadBurst), "-ss", fmtDuration(offset))
+		args = append(args, "-re", "-ss", fmtDuration(offset))
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)
 		}
