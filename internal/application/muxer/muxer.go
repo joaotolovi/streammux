@@ -85,7 +85,7 @@ func defaultPolicy() Policy {
 		RetryCooldown:      30 * time.Second,
 		MinRealtime:        1.0,
 		MinPublishedAhead:  12 * time.Second,
-		MinHandoffBuffer:   20 * time.Second,
+		MinHandoffBuffer:   4 * time.Second,
 		TierSwitchBuffer:   8 * time.Second,
 		DurationTolerance:  0.002,
 		PlaceholderMinTime: 8 * time.Second,

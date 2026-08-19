@@ -301,7 +301,8 @@ func TestRenderMediaPlaylistVodWithDiscontinuity(t *testing.T) {
 }
 
 func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
-	// The film occupies [2..7) of the public timeline (28s = 7 segments).
+	// Seven film segments start after the two-segment placeholder, so the
+	// public film range is [2..9).
 	state := &playbackState{
 		duration:        28,
 		filmBase:        2,
@@ -324,8 +325,33 @@ func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
 	if strings.Contains(playlist, "seg_00000.ts") || strings.Contains(playlist, "seg_00001.ts") {
 		t.Fatalf("playlist must not list placeholder segments: %s", playlist)
 	}
-	if !strings.Contains(playlist, "seg_00006.ts") || strings.Contains(playlist, "seg_00007.ts") {
+	if !strings.Contains(playlist, "seg_00008.ts") || strings.Contains(playlist, "seg_00009.ts") {
 		t.Fatalf("playlist must list exactly the film range: %s", playlist)
+	}
+}
+
+func TestSegmentPathAllowsFullFilmRangeAfterPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	last := filepath.Join(dir, "video", "seg_00008.ts")
+	if err := os.WriteFile(last, []byte("segment"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := &playbackState{
+		duration: 28,
+		filmBase: 2,
+		all:      []*generation{{dir: dir}},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	if path := mux.SegmentPath(job, 8); path != last {
+		t.Fatalf("SegmentPath(last film segment) = %q, want %q", path, last)
+	}
+	if path := mux.SegmentPath(job, 9); path != "" {
+		t.Fatalf("SegmentPath(after film) = %q, want empty", path)
 	}
 }
 
