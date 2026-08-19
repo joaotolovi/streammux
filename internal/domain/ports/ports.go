@@ -17,6 +17,17 @@ type UserRepository interface {
 	Delete(ctx context.Context, uuid, encryptedPassword string) error
 }
 
+// AdminRepository stores the password and the single configuration managed by
+// the web administration panel. Stremio user credentials remain separate so
+// existing installation URLs keep working unchanged.
+type AdminRepository interface {
+	HasAdminPassword(ctx context.Context) (bool, error)
+	SetAdminPassword(ctx context.Context, password string) error
+	VerifyAdminPassword(ctx context.Context, password string) (bool, error)
+	GetAdminUser(ctx context.Context) (uuid, encryptedPassword string, ok bool, err error)
+	SetAdminUser(ctx context.Context, uuid, encryptedPassword string) error
+}
+
 type MuxStore interface {
 	Save(job *model.MuxJob) string
 	Get(id string) (*model.MuxJob, bool)

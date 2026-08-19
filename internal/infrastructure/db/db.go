@@ -47,6 +47,70 @@ func (r *SQLiteUserRepository) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.Exec(`CREATE TABLE IF NOT EXISTS admin (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		password TEXT NOT NULL,
+		user_uuid TEXT,
+		user_password TEXT
+	)`)
+	return err
+}
+
+func (r *SQLiteUserRepository) HasAdminPassword(ctx context.Context) (bool, error) {
+	var password string
+	err := r.db.QueryRowContext(ctx, "SELECT password FROM admin WHERE id = 1").Scan(&password)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && password != "", err
+}
+
+func (r *SQLiteUserRepository) SetAdminPassword(ctx context.Context, password string) error {
+	encPwd, err := r.enc.Encrypt(password)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `INSERT INTO admin (id, password) VALUES (1, ?)
+		ON CONFLICT(id) DO UPDATE SET password = excluded.password`, encPwd)
+	return err
+}
+
+func (r *SQLiteUserRepository) VerifyAdminPassword(ctx context.Context, password string) (bool, error) {
+	var encrypted string
+	if err := r.db.QueryRowContext(ctx, "SELECT password FROM admin WHERE id = 1").Scan(&encrypted); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	stored, err := r.enc.Decrypt(encrypted)
+	if err != nil {
+		return false, err
+	}
+	return stored == password, nil
+}
+
+func (r *SQLiteUserRepository) GetAdminUser(ctx context.Context) (string, string, bool, error) {
+	var uuid, password sql.NullString
+	if err := r.db.QueryRowContext(ctx, "SELECT user_uuid, user_password FROM admin WHERE id = 1").Scan(&uuid, &password); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	if !uuid.Valid || !password.Valid || uuid.String == "" || password.String == "" {
+		return "", "", false, nil
+	}
+	return uuid.String, password.String, true, nil
+}
+
+func (r *SQLiteUserRepository) SetAdminUser(ctx context.Context, uuid, encryptedPassword string) error {
+	_, err := r.db.ExecContext(ctx, `INSERT INTO admin (id, password, user_uuid, user_password)
+		VALUES (1, '', ?, ?)
+		ON CONFLICT(id) DO UPDATE SET user_uuid = excluded.user_uuid, user_password = excluded.user_password`, uuid, encryptedPassword)
 	return err
 }
 

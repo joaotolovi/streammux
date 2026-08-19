@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/base/buttons/button';
 import { Input } from '@/components/base/input/input';
 import { InputNumber } from '@/components/base/input/input-number';
@@ -49,6 +49,10 @@ export default function App() {
   const [encryptedPassword, setEncryptedPassword] = useState('');
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState('');
+
+  if (window.location.pathname.startsWith('/admin')) {
+    return <AdminPanel />;
+  }
 
   const set = (patch: Partial<Config>) => {
     setConfig((prev) => ({ ...prev, ...patch }));
@@ -130,7 +134,143 @@ export default function App() {
   );
 }
 
-function Header({ saved, onSave, hasPassword }: { saved: boolean; onSave: () => void; hasPassword: boolean }) {
+function AdminPanel() {
+  const [configured, setConfigured] = useState(false);
+  const [authenticated, setAuthenticated] = useState(false);
+  const [authPassword, setAuthPassword] = useState('');
+  const [config, setConfig] = useState<Config>(DEFAULT_CONFIG);
+  const [installUrl, setInstallUrl] = useState('');
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    const response = await fetch('/api/v1/admin/status');
+    const status = await response.json();
+    if (!response.ok) throw new Error(status.error?.message || 'Admin indisponível');
+    setConfigured(status.configured);
+    setAuthenticated(status.authenticated);
+    if (status.authenticated) {
+      const configResponse = await fetch('/api/v1/admin/config');
+      const data = await configResponse.json();
+      if (!configResponse.ok) throw new Error(data.error?.message || 'Configuração indisponível');
+      setConfig({ ...DEFAULT_CONFIG, ...data.config });
+      if (data.uuid && data.encryptedPassword) {
+        setInstallUrl(`${window.location.origin}/stremio/${data.uuid}/${data.encryptedPassword}/manifest.json`);
+      }
+    }
+  };
+
+  useEffect(() => {
+    refresh().catch((e) => setError((e as Error).message)).finally(() => setLoading(false));
+  }, []);
+
+  const authenticate = async () => {
+    setError('');
+    try {
+      const endpoint = configured ? '/api/v1/admin/login' : '/api/v1/admin/setup';
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: authPassword }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        setError(data.error?.message || 'Senha inválida');
+        return;
+      }
+      setAuthPassword('');
+      await refresh();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const set = (patch: Partial<Config>) => {
+    setConfig((previous) => ({ ...previous, ...patch }));
+    setSaved(false);
+    setError('');
+  };
+
+  const save = async () => {
+    setError('');
+    const response = await fetch('/api/v1/admin/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setError(data.error?.message || 'Não foi possível salvar');
+      return;
+    }
+    setInstallUrl(`${window.location.origin}/stremio/${data.uuid}/${data.encryptedPassword}/manifest.json`);
+    setSaved(true);
+  };
+
+  if (loading) {
+    return <AdminShell><p className="text-sm text-[var(--color-text-tertiary)]">Carregando painel...</p></AdminShell>;
+  }
+  if (!authenticated) {
+    return (
+      <AdminShell>
+        <div className="mx-auto max-w-md">
+          <SectionCard
+            icon={<Settings01 className="size-5" />}
+            title={configured ? 'Acesso administrativo' : 'Configurar acesso administrativo'}
+            description={configured ? 'Informe a senha para acessar a configuração do addon.' : 'Defina uma senha com pelo menos 8 caracteres para proteger este painel.'}
+          >
+            <div className="space-y-4">
+              <Input
+                label="Senha administrativa"
+                type="password"
+                value={authPassword}
+                onChange={(value) => setAuthPassword(String(value))}
+                onKeyDown={(event) => { if (event.key === 'Enter') authenticate(); }}
+              />
+              <Button color="primary" onPress={authenticate} isDisabled={authPassword.length < 8}>
+                {configured ? 'Entrar' : 'Criar acesso'}
+              </Button>
+              {error && <p className="text-sm text-[var(--color-text-error-primary)]">{error}</p>}
+            </div>
+          </SectionCard>
+        </div>
+      </AdminShell>
+    );
+  }
+
+  return (
+    <AdminShell saved={saved} onSave={save}>
+      <div className="space-y-6">
+        <LanguageSection value={config.language || DEFAULT_CONFIG.language} onChange={(language) => set({ language })} />
+        <ServicesSection services={config.services || []} onChange={(services) => set({ services })} />
+        <AddonsSection addons={config.addons || []} onChange={(addons) => set({ addons })} />
+        <SaveSection password="configured" setPassword={() => undefined} onSave={save} saved={saved} error={error} installUrl={installUrl} admin />
+      </div>
+    </AdminShell>
+  );
+}
+
+function AdminShell({ children, saved, onSave }: { children: React.ReactNode; saved?: boolean; onSave?: () => void }) {
+  return (
+    <div className="min-h-screen bg-[var(--color-bg-primary)] text-[var(--color-text-primary)]">
+      <Header saved={saved ?? false} onSave={onSave ?? (() => undefined)} hasPassword={!!onSave} admin />
+      <main className="mx-auto max-w-3xl px-4 py-8 sm:px-6">
+        <div className="mb-8 text-center">
+          <div className="mb-4 inline-flex items-center gap-2 rounded-full bg-brand-500/10 px-4 py-1.5 text-sm font-medium text-brand-600 ring-1 ring-brand-500/20">
+            <Settings01 className="size-4" />
+            Administração do StreamMux
+          </div>
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Configuração protegida</h1>
+          <p className="mx-auto mt-3 max-w-xl text-md text-[var(--color-text-tertiary)]">Gerencie addons, serviços e idioma do addon sem expor suas credenciais publicamente.</p>
+        </div>
+        {children}
+      </main>
+    </div>
+  );
+}
+
+function Header({ saved, onSave, hasPassword, admin = false }: { saved: boolean; onSave: () => void; hasPassword: boolean; admin?: boolean }) {
   return (
     <header className="sticky top-0 z-10 border-b border-[var(--color-border-secondary)] bg-[var(--color-bg-primary)]/80 backdrop-blur">
       <div className="mx-auto flex h-16 max-w-3xl items-center justify-between px-4 sm:px-6">
@@ -148,8 +288,13 @@ function Header({ saved, onSave, hasPassword }: { saved: boolean; onSave: () => 
             </span>
           )}
           <Button color="primary" size="md" isDisabled={!hasPassword} onPress={onSave}>
-            Salvar
+            {admin ? 'Salvar configuração' : 'Salvar'}
           </Button>
+          {!admin && (
+            <a href="/admin" className="text-sm font-medium text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]">
+              Administração
+            </a>
+          )}
         </div>
       </div>
     </header>
@@ -445,6 +590,7 @@ function SaveSection({
   saved,
   error,
   installUrl,
+  admin = false,
 }: {
   password: string;
   setPassword: (v: string) => void;
@@ -452,22 +598,23 @@ function SaveSection({
   saved: boolean;
   error: string;
   installUrl: string;
+  admin?: boolean;
 }) {
   return (
     <SectionCard
       icon={<Settings01 className="size-5" />}
       title="Salvar & Instalar"
-      description="Proteja sua configuração com uma senha e instale no Stremio."
+      description={admin ? 'A configuração é protegida pela senha administrativa e pode ser atualizada a qualquer momento.' : 'Proteja sua configuração com uma senha e instale no Stremio.'}
     >
-      <Input
+      {!admin && <Input
         label="Senha"
         type="password"
         placeholder="Escolha uma senha"
         value={password}
         onChange={(v) => setPassword(String(v))}
-      />
+      />}
       <div className="flex gap-3">
-        <Button color="primary" size="md" isDisabled={!password} onPress={onSave}>
+        <Button color="primary" size="md" isDisabled={!admin && !password} onPress={onSave}>
           Salvar configuração
         </Button>
       </div>

@@ -1,8 +1,10 @@
 package muxer
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,6 +40,31 @@ func TestHealthTrackerRequiresTwoSlowNonOverlappingWindows(t *testing.T) {
 	second := tracker.observe(ffmpeg.ProgressSample{At: start.Add(8 * time.Second), OutTime: 3 * time.Second})
 	if !second.downgrade {
 		t.Fatalf("two slow windows should request downgrade; realtime %.2f", second.realtime)
+	}
+}
+
+func TestPruneGenerationBytesRemovesOldestCompleteSegments(t *testing.T) {
+	dir := t.TempDir()
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := 0; index < 3; index++ {
+		for _, media := range []string{"video", "audio"} {
+			path := filepath.Join(dir, media, fmt.Sprintf("seg_%05d.ts", index))
+			if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, 100), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	pruneGenerationBytes(dir, 400)
+	if fileExists(filepath.Join(dir, "video", "seg_00000.ts")) || fileExists(filepath.Join(dir, "audio", "seg_00000.ts")) {
+		t.Fatal("oldest segment pair was not removed")
+	}
+	if !fileExists(filepath.Join(dir, "video", "seg_00002.ts")) || !fileExists(filepath.Join(dir, "audio", "seg_00002.ts")) {
+		t.Fatal("newest segment pair was removed")
 	}
 }
 

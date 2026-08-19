@@ -1,6 +1,8 @@
 package http
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/streammux/streammux/internal/application/muxer"
@@ -18,12 +21,15 @@ import (
 )
 
 type Server struct {
-	users   ports.UserRepository
-	store   ports.MuxStore
-	muxer   *muxer.Muxer
-	baseURL string
-	web     fs.FS
-	mux     *http.ServeMux
+	users     ports.UserRepository
+	store     ports.MuxStore
+	muxer     *muxer.Muxer
+	admin     ports.AdminRepository
+	baseURL   string
+	web       fs.FS
+	mux       *http.ServeMux
+	sessionMu sync.Mutex
+	sessions  map[string]time.Time
 }
 
 type Options struct {
@@ -33,12 +39,14 @@ type Options struct {
 
 func New(users ports.UserRepository, store ports.MuxStore, mux *muxer.Muxer, opts Options) *Server {
 	s := &Server{
-		users:   users,
-		store:   store,
-		muxer:   mux,
-		baseURL: opts.BaseURL,
-		web:     opts.WebFS,
-		mux:     http.NewServeMux(),
+		users:    users,
+		admin:    adminRepository(users),
+		store:    store,
+		muxer:    mux,
+		baseURL:  opts.BaseURL,
+		web:      opts.WebFS,
+		mux:      http.NewServeMux(),
+		sessions: make(map[string]time.Time),
 	}
 	s.routes()
 	return s
@@ -68,6 +76,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/user", s.handleGetUser)
 	s.mux.HandleFunc("PUT /api/v1/user", s.handleUpdateUser)
 	s.mux.HandleFunc("DELETE /api/v1/user", s.handleDeleteUser)
+	s.mux.HandleFunc("GET /api/v1/admin/status", s.handleAdminStatus)
+	s.mux.HandleFunc("POST /api/v1/admin/setup", s.handleAdminSetup)
+	s.mux.HandleFunc("POST /api/v1/admin/login", s.handleAdminLogin)
+	s.mux.HandleFunc("POST /api/v1/admin/logout", s.handleAdminLogout)
+	s.mux.HandleFunc("GET /api/v1/admin/config", s.handleAdminGetConfig)
+	s.mux.HandleFunc("PUT /api/v1/admin/config", s.handleAdminUpdateConfig)
 
 	// Static / SPA
 	s.mux.Handle("/", s.spaHandler())
@@ -383,6 +397,207 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"version": "1.0.0",
 		"channel": "stable",
 	})
+}
+
+func adminRepository(users ports.UserRepository) ports.AdminRepository {
+	repo, _ := users.(ports.AdminRepository)
+	return repo
+}
+
+func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	if s.admin == nil {
+		writeError(w, http.StatusNotImplemented, "admin repository unavailable")
+		return
+	}
+	configured, err := s.admin.HasAdminPassword(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin status unavailable")
+		return
+	}
+	writeJSON(w, map[string]bool{
+		"configured":    configured,
+		"authenticated": s.adminAuthenticated(r),
+	})
+}
+
+func (s *Server) handleAdminSetup(w http.ResponseWriter, r *http.Request) {
+	if s.admin == nil {
+		writeError(w, http.StatusNotImplemented, "admin repository unavailable")
+		return
+	}
+	configured, err := s.admin.HasAdminPassword(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin status unavailable")
+		return
+	}
+	if configured {
+		writeError(w, http.StatusConflict, "admin password already configured")
+		return
+	}
+	password := decodePassword(r)
+	if len(password) < 8 {
+		writeError(w, http.StatusBadRequest, "admin password must contain at least 8 characters")
+		return
+	}
+	if err := s.admin.SetAdminPassword(r.Context(), password); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not save admin password")
+		return
+	}
+	if err := s.issueAdminSession(w); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create admin session")
+		return
+	}
+	writeJSON(w, map[string]bool{"success": true})
+}
+
+func (s *Server) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
+	if s.admin == nil {
+		writeError(w, http.StatusNotImplemented, "admin repository unavailable")
+		return
+	}
+	password := decodePassword(r)
+	valid, err := s.admin.VerifyAdminPassword(r.Context(), password)
+	if err != nil || !valid {
+		writeError(w, http.StatusUnauthorized, "invalid admin password")
+		return
+	}
+	if err := s.issueAdminSession(w); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create admin session")
+		return
+	}
+	writeJSON(w, map[string]bool{"success": true})
+}
+
+func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
+	if token, err := r.Cookie("streammux_admin"); err == nil {
+		s.sessionMu.Lock()
+		delete(s.sessions, token.Value)
+		s.sessionMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "streammux_admin", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	writeJSON(w, map[string]bool{"success": true})
+}
+
+func (s *Server) handleAdminGetConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	uuid, password, ok, err := s.admin.GetAdminUser(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin config unavailable")
+		return
+	}
+	if !ok {
+		writeJSON(w, map[string]any{"config": model.Config{}})
+		return
+	}
+	cfg, err := s.users.Get(r.Context(), uuid, password)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin config unavailable")
+		return
+	}
+	writeJSON(w, map[string]any{"config": cfg, "uuid": uuid, "encryptedPassword": password})
+}
+
+func (s *Server) handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	var body struct {
+		Config model.Config `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if body.Config.Language == "" {
+		writeError(w, http.StatusBadRequest, "language is required")
+		return
+	}
+	uuid, password, ok, err := s.admin.GetAdminUser(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "admin config unavailable")
+		return
+	}
+	if ok {
+		if err := s.users.Update(r.Context(), uuid, password, &body.Config); err != nil {
+			writeError(w, http.StatusInternalServerError, "could not update admin config")
+			return
+		}
+	} else {
+		ownerPassword, err := randomToken()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not create admin config")
+			return
+		}
+		uuid, password, err = s.users.Create(r.Context(), &body.Config, ownerPassword)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not create admin config")
+			return
+		}
+		if err := s.admin.SetAdminUser(r.Context(), uuid, password); err != nil {
+			writeError(w, http.StatusInternalServerError, "could not link admin config")
+			return
+		}
+	}
+	writeJSON(w, map[string]string{"uuid": uuid, "encryptedPassword": password})
+}
+
+func decodePassword(r *http.Request) string {
+	var body struct {
+		Password string `json:"password"`
+	}
+	if json.NewDecoder(r.Body).Decode(&body) != nil {
+		return ""
+	}
+	return body.Password
+}
+
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.admin == nil {
+		writeError(w, http.StatusNotImplemented, "admin repository unavailable")
+		return false
+	}
+	if !s.adminAuthenticated(r) {
+		writeError(w, http.StatusUnauthorized, "admin authentication required")
+		return false
+	}
+	return true
+}
+
+func (s *Server) adminAuthenticated(r *http.Request) bool {
+	cookie, err := r.Cookie("streammux_admin")
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	s.sessionMu.Lock()
+	expires, ok := s.sessions[cookie.Value]
+	if ok && time.Now().After(expires) {
+		delete(s.sessions, cookie.Value)
+		ok = false
+	}
+	s.sessionMu.Unlock()
+	return ok
+}
+
+func (s *Server) issueAdminSession(w http.ResponseWriter) error {
+	token, err := randomToken()
+	if err != nil {
+		return err
+	}
+	s.sessionMu.Lock()
+	s.sessions[token] = time.Now().Add(12 * time.Hour)
+	s.sessionMu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "streammux_admin", Value: token, Path: "/", MaxAge: 12 * 60 * 60, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	return nil
+}
+
+func randomToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
