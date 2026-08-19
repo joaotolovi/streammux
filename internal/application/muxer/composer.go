@@ -210,10 +210,10 @@ func newComposer(job *model.MuxJob) *composer {
 
 	log.Printf("mux: composer videos=%d audios=%d compositions=%d", len(c.videos), len(c.audios), len(c.ranked))
 	for i, s := range c.videos {
-		log.Printf("mux:   video#%d score=%d key=%s", i, analyzer.VideoScore(s.stream), s.stream.SourceKey())
+		log.Printf("mux:   video#%d score=%d size=%s key=%s", i, analyzer.VideoScore(s.stream), streamSizeLabel(s.stream), s.stream.SourceKey())
 	}
 	for i, s := range c.audios {
-		log.Printf("mux:   audio#%d conf=%d score=%d key=%s", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), s.stream.SourceKey())
+		log.Printf("mux:   audio#%d conf=%d score=%d size=%s key=%s", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), streamSizeLabel(s.stream), s.stream.SourceKey())
 	}
 	for i, comp := range c.ranked {
 		if i >= 8 {
@@ -226,6 +226,13 @@ func newComposer(job *model.MuxJob) *composer {
 		log.Printf("mux:   rank#%d video#%d(=%d) audio#%d(=%d,conf=%d) single=%v", comp.ordinal, comp.video.videoPos, vs, comp.audio.audioPos, as, conf, comp.single)
 	}
 	return c
+}
+
+func streamSizeLabel(stream model.CollectedStream) string {
+	if stream.Size <= 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%.2fGB(%dB)", float64(stream.Size)/(1024*1024*1024), stream.Size)
 }
 
 // audioConfidence scores how trustworthy a source's target-language claim is

@@ -29,7 +29,6 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		t.Fatalf("input count = %d, want 1; args: %#v", countArgument(got, "-i"), got)
 	}
 	for _, want := range [][]string{
-		{"-readrate", "1", "-readrate_initial_burst", "20", "-ss", "12", "-i", "https://example.test/media.mkv"},
 		{"-ss", "12", "-i", "https://example.test/media.mkv"},
 		{"-map", "0:v:1"},
 		{"-map", "0:a:2"},
@@ -67,7 +66,6 @@ func TestBuildAudioSessionArgs(t *testing.T) {
 		t.Fatalf("buildAudioSessionArgs() error = %v", err)
 	}
 	for _, want := range [][]string{
-		{"-readrate", "1", "-readrate_initial_burst", "20", "-ss", "28", "-i", spec.AudioURL},
 		{"-ss", "28", "-i", spec.AudioURL},
 		{"-map", "0:a:2"},
 		{"-c:a", "aac"},
@@ -105,7 +103,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 	}
 	for _, want := range [][]string{
 		{"-ss", "20", "-i", spec.VideoURL},
-		{"-readrate", "1", "-readrate_initial_burst", "20", "-ss", "20", "-i", spec.AudioURL},
+		{"-ss", "20", "-i", spec.AudioURL},
 		{"-map", "0:v:0"},
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},

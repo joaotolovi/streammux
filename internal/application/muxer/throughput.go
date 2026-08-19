@@ -27,10 +27,10 @@ const (
 	deliveryWindow = 3
 )
 
-// ObserveDelivery records one completed video segment delivery to the player
-// and downgrades the active plan when the sustained player throughput cannot
-// keep up with the plan's bitrate. Audio segments are deliberately not
-// observed: they are tiny and would pollute the measurement.
+// ObserveDelivery records one completed video segment delivery to the player.
+// ABR decisions belong to the player, which selects a lower HLS variant from
+// the master playlist. Audio segments are deliberately not observed: they are
+// tiny and would pollute the measurement.
 func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Duration) {
 	if sent <= 0 || elapsed <= 0 {
 		return
@@ -59,35 +59,18 @@ func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Dura
 		// probed peak bitrate) to avoid a three-way stacking.
 		required *= 1.10
 	}
-	tooSlow := playerTooSlow(samples, required)
-
-	segment := state.lastRequested
-	recovering := state.recovering
-	cooldown := time.Since(state.lastRecovery) >= m.policy.RecoveryCooldown
 	state.mu.Unlock()
 
-	if !tooSlow {
-		// Diagnostics: log the latest delivery throughput whenever it is
-		// below the required bitrate so player-side bottlenecks (network
-		// or decode) are visible in the logs even before a downgrade
-		// accumulates enough evidence.
-		last := samples[len(samples)-1]
-		if required > 0 && last.bytes > 0 && float64(last.bytes*8)/last.seconds < required {
-			sustained := windowThroughput(samples)
-			log.Printf("mux: delivery %.1f Mbps below required %.1f Mbps (%.1f MB in %.1fs; window %d/%d sustained %.1f Mbps)",
-				float64(last.bytes*8)/last.seconds/1e6, required/1e6,
-				float64(last.bytes)/1e6, last.seconds, len(samples), deliveryWindow, sustained/1e6)
-		}
-		return
+	// Keep this as diagnostics only. A server-side source switch changes the
+	// media characteristics behind the player's current variant and can cause
+	// buffering; the player's HLS ABR must perform bandwidth adaptation.
+	last := samples[len(samples)-1]
+	if required > 0 && last.bytes > 0 && float64(last.bytes*8)/last.seconds < required {
+		sustained := windowThroughput(samples)
+		log.Printf("mux: delivery %.1f Mbps below required %.1f Mbps (%.1f MB in %.1fs; window %d/%d sustained %.1f Mbps)",
+			float64(last.bytes*8)/last.seconds/1e6, required/1e6,
+			float64(last.bytes)/1e6, last.seconds, len(samples), deliveryWindow, sustained/1e6)
 	}
-	if recovering || !cooldown || segment < 0 {
-		log.Printf("mux: player throughput below %.1f Mbps sustained but downgrade deferred (recovering=%v cooldown=%v segment=%d)",
-			required/1e6, recovering, !cooldown, segment)
-		return
-	}
-	log.Printf("mux: player throughput below %.1f Mbps sustained; downgrading to lighter sources at segment %d",
-		required/1e6, segment)
-	m.ensureRecovery(job, state, segment, "player throughput")
 }
 
 // appendDeliverySample appends one delivery to the window, resetting the
