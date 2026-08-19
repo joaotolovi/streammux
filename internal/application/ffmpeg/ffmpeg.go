@@ -252,7 +252,7 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if offset < 0 {
 		offset = 0
 	}
-	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y", "-re"}
+	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y"}
 	if spec.AudioOffset != 0 {
 		args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
 	}
@@ -307,7 +307,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		"-stats_period", "1",
 		"-progress", "pipe:1",
 		"-y",
-		"-re",
 		"-ss", fmtDuration(offset),
 	}
 	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
@@ -323,7 +322,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 			// audio to re-align it with the video content.
 			args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
 		}
-		args = append(args, "-re", "-ss", fmtDuration(offset))
+		args = append(args, "-ss", fmtDuration(offset))
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)
 		}
