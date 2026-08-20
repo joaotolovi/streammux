@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,11 +117,8 @@ type Session struct {
 	// stderrTail retains the last ffmpeg stderr bytes for diagnostics.
 	stderrTail *tailBuffer
 
-	mu               sync.RWMutex
-	err              error
-	overlayEndpoint  string
-	overlayStartedAt time.Time
-	overlayMu        sync.Mutex
+	mu  sync.RWMutex
+	err error
 }
 
 // InitDone initialises the internal done channel. It exists for tests that
@@ -565,7 +561,7 @@ func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, rea
 	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "", "", "")
 }
 
-func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, overlayEndpoint string) []string {
+func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, _ string) []string {
 	const (
 		startT       = 5.0
 		duration     = 0.8
@@ -591,7 +587,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	)
 	outputLabel := "v"
 	if cardPath != "" {
-		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint) + "[card]"
+		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath) + "[card]"
 		outputLabel = "card"
 	}
 
@@ -689,7 +685,7 @@ func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, star
 	return buildPlaceholderArgsWithCards(path, outputDir, realtime, startSegment, cardPath, "", "", "")
 }
 
-func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, overlayEndpoint string) []string {
+func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, _ string) []string {
 	preset := "ultrafast"
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
@@ -709,7 +705,7 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		args = append(args, "-stream_loop", "-1", "-i", spinnerPath)
 	}
 	if cardPath != "" || useSpinner {
-		textFilter := placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint)
+		textFilter := placeholderDrawtextFilter(cardPath, metadataPath, detailsPath)
 		if !realtime {
 			args = append(args, "-vf", textFilter)
 		} else if useSpinner {
@@ -749,11 +745,8 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	return args
 }
 
-func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint string) string {
+func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath string) string {
 	filters := []string{"fade=t=in:st=0:d=0.7"}
-	if overlayEndpoint != "" {
-		filters = append(filters, "zmq=b='"+escapeFilterPath(overlayEndpoint)+"'")
-	}
 	if metadataPath != "" {
 		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:boxw=360:text_align=center:x=848:y=498:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(metadataPath)))
 	}
@@ -807,22 +800,11 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 	if err := os.MkdirAll(filepath.Join(spec.OutputDir, "audio"), 0755); err != nil {
 		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
 	}
-	overlayEndpoint := ""
-	if spec.CardPath != "" {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, fmt.Errorf("placeholder overlay socket: %w", err)
-		}
-		port := listener.Addr().(*net.TCPAddr).Port
-		_ = listener.Close()
-		overlayEndpoint = fmt.Sprintf("tcp://127.0.0.1:%d", port)
-	}
-
 	var args []string
 	if spec.ImagePath != "" {
-		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, overlayEndpoint)
+		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, "")
 	} else {
-		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, overlayEndpoint)
+		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, "")
 	}
 
 	sessCtx, cancel := context.WithCancel(ctx)
@@ -842,8 +824,6 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 		progress:         make(chan ProgressSample, 1),
 		startN:           spec.StartSegment,
 		stderrTail:       stderr,
-		overlayEndpoint:  overlayEndpoint,
-		overlayStartedAt: time.Now(),
 	}
 
 	if err := cmd.Start(); err != nil {

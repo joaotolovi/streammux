@@ -456,10 +456,6 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		case <-ticker.C:
 		}
 	}
-	if err := session.AnimateOverlay(); err != nil {
-		log.Printf("mux: placeholder overlay animation unavailable: %v", err)
-	}
-
 	state.mu.Lock()
 	if state.active != nil || state.closed {
 		gen.session.Cancel()
