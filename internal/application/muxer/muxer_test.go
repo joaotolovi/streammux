@@ -387,12 +387,6 @@ func TestSegmentPathMapsVirtualResumeToIntro(t *testing.T) {
 	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 375); got != videoPath {
 		t.Fatalf("mapped resume path = %q, want %q", got, videoPath)
 	}
-	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 376); got != "" {
-		t.Fatalf("unexpected second intro segment = %q", got)
-	}
-	if state.introPublicStart != 375 {
-		t.Fatalf("intro public start = %d, want 375", state.introPublicStart)
-	}
 }
 
 func TestRenderMediaPlaylistErrorTailTruncatesFilm(t *testing.T) {

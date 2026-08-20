@@ -1680,9 +1680,9 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 			if discSet[i] {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
-			segmentDuration := segs[i-first]
-			if filmEnd < first {
-				segmentDuration = segs[i]
+			segmentDuration := segs[i]
+			if filmEnd >= first {
+				segmentDuration = segs[i-first]
 			}
 			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segmentDuration))
 			b.WriteString(tierSegmentURI(tier, i))
@@ -2248,7 +2248,14 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			// the local intro until the source is ready.
 			state.mu.Lock()
 			placeholder := state.placeholder
-			_ = placeholder
+			if placeholder != nil {
+				highest := highestCompleteSegment(placeholder.dir)
+				if segment > highest+8 && segment > state.resumeStart {
+					state.resumeStart = segment
+					state.introPublicStart = segment
+					log.Printf("mux: deferred resume request at segment %d while placeholder is active", segment)
+				}
+			}
 			state.mu.Unlock()
 
 			select {
