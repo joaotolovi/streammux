@@ -745,7 +745,7 @@ func placeholderDrawtextFilter(cardPath string, metadataPath ...string) string {
 		return stream
 	}
 	metadata := fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.48:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0]))
-	return metadata + ";" + stream
+	return metadata + "," + stream
 }
 
 func escapeFilterPath(path string) string {
