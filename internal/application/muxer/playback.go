@@ -65,10 +65,13 @@ type playbackState struct {
 	// (nonzero when a placeholder played first). While >= 0 the placeholder
 	// live window is frozen at [..filmBase-1] so the media sequence can only
 	// move forward across the handoff (players reject sequence regression).
-	filmBase        int
-	resumeStart     int // requested film segment to generate after the intro
-	placeholderLive bool
-	discontinuities []int
+	filmBase         int
+	resumeStart      int // requested film segment to generate after the intro
+	introPublicStart int // public index mapped to placeholder segment zero
+	filmStartTime    float64
+	filmEnd          int
+	placeholderLive  bool
+	discontinuities  []int
 
 	// errorGeneration is the terminal "no source worked" video.
 	errorGeneration *generation
@@ -150,8 +153,9 @@ type generation struct {
 	prepared     *preparedPlan
 	dir          string
 	session      *ffmpeg.Session
-	startSegment int // first public segment number this generation writes
-	tier         int // ABR tier namespace this generation serves (0 = primary)
+	startSegment int     // first public segment number this generation writes
+	startTime    float64 // source timestamp represented by startSegment
+	tier         int     // ABR tier namespace this generation serves (0 = primary)
 	startedAt    time.Time
 	isLocal      bool // placeholder or error video
 	isError      bool
@@ -193,6 +197,8 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		posterDir:         posterDir,
 		placeholderDiscAt: -1,
 		resumeStart:       -1,
+		introPublicStart:  -1,
+		filmEnd:           -1,
 		tierMetas:         tierMetas,
 		lastRequested:     -1,
 		maxRequested:      -1,
@@ -603,24 +609,24 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		// can only move forward — players reject sequence regression.
 		state.mu.Lock()
 		base := 0
+		introStart := state.introPublicStart
 		if ph != nil {
 			if common := lastCommonSegment(ph); common >= 0 {
 				base = common + 1
 			}
+			if introStart >= 0 {
+				base += introStart
+			}
 			state.placeholderLive = false
 		}
 		state.filmBase = base
-		resumeStart := -1
-		if state.resumeStart > base {
-			resumeStart = state.resumeStart
-		}
+		resumeStart := state.resumeStart
 		state.mu.Unlock()
 
 		startSegment := base
 		startTime := 0.0
 		if resumeStart >= 0 {
-			startSegment = resumeStart
-			startTime = float64(resumeStart-base) * ffmpeg.SegDuration()
+			startTime = float64(resumeStart) * ffmpeg.SegDuration()
 			log.Printf("mux: resuming after placeholder at segment %d (%.0fs)", startSegment, startTime)
 		}
 		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, startSegment, startTime, m.policy.MinHandoffBuffer)
@@ -668,14 +674,13 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.startErr = nil
 	state.directURL = ""
 	state.duration = winner.prepared.duration
+	state.filmStartTime = winner.startTime
+	state.filmEnd = winner.startSegment + vodSegmentCount(winner.prepared.duration-winner.startTime) - 1
 	state.lastRecovery = time.Now()
 	state.lastRequested = -1
 	state.maxRequested = -1
 	if state.filmBase > 0 {
 		state.discontinuities = append(state.discontinuities, state.filmBase)
-	}
-	if state.resumeStart > state.filmBase {
-		state.discontinuities = append(state.discontinuities, state.resumeStart)
 	}
 	base := state.filmBase
 	wait := state.startWait
@@ -908,6 +913,7 @@ func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState,
 		dir:          dir,
 		session:      session,
 		startSegment: startNumber,
+		startTime:    startTime,
 		tier:         tier,
 		startedAt:    time.Now(),
 	}
@@ -987,8 +993,9 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 	if prefer != nil && prefer.prepared != nil {
 		state.mu.Lock()
 		base := state.filmBase
+		filmStartTime := state.filmStartTime
 		state.mu.Unlock()
-		startTime := float64(startSegment-base) * ffmpeg.SegDuration()
+		startTime := filmStartTime + float64(startSegment-base)*ffmpeg.SegDuration()
 		if startTime < 0 {
 			startTime = 0
 		}
@@ -1033,8 +1040,9 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 			if err == nil {
 				state.mu.Lock()
 				base := state.filmBase
+				filmStartTime := state.filmStartTime
 				state.mu.Unlock()
-				startTime := float64(startSegment-base) * ffmpeg.SegDuration()
+				startTime := filmStartTime + float64(startSegment-base)*ffmpeg.SegDuration()
 				if startTime < 0 {
 					startTime = 0
 				}
@@ -1063,8 +1071,9 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 
 		state.mu.Lock()
 		base := state.filmBase
+		filmStartTime := state.filmStartTime
 		state.mu.Unlock()
-		startTime := float64(startSegment-base) * ffmpeg.SegDuration()
+		startTime := filmStartTime + float64(startSegment-base)*ffmpeg.SegDuration()
 		if startTime < 0 {
 			startTime = 0
 		}
@@ -1607,12 +1616,10 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	active := state.active
 	retired := state.retiredPlaceholder
 	base := state.filmBase
-	placeholderDiscAt := -1
-	if state.placeholderHasDisc {
-		placeholderDiscAt = state.placeholderDiscAt
-	}
 	duration := state.duration
-	resumeStart := state.resumeStart
+	metadataDuration := state.metadata.Duration
+	filmStartTime := state.filmStartTime
+	filmEnd := state.filmEnd
 	disc := append([]int(nil), state.discontinuities...)
 	if tier > 0 && tier < tierCount {
 		disc = append(disc, state.tierDisc[tier]...)
@@ -1634,7 +1641,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// Live placeholder phase: synchronized sliding window of both renditions,
 	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
-		return synchronizedLiveWindowWithDiscontinuity(placeholder, base-1, placeholderDiscAt)
+		return virtualPlaceholderPlaylist(metadataDuration, tier), true
 	}
 
 	segDur := ffmpeg.SegDuration()
@@ -1654,12 +1661,12 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 
 	if duration > 0 {
 		// Film timeline (possibly truncated by the error tail).
-		segs := computeEqualLengthSegments(segDur, duration)
+		segs := computeEqualLengthSegments(segDur, duration-filmStartTime)
 		first := base
-		if resumeStart > first {
-			first = resumeStart
-		}
 		last := len(segs) - 1
+		if filmEnd >= first {
+			last = filmEnd
+		}
 		if first > last {
 			first = last + 1
 		}
@@ -1673,7 +1680,11 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 			if discSet[i] {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
-			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segs[i]))
+			segmentDuration := segs[i]
+			if filmEnd >= first {
+				segmentDuration = segs[i-first]
+			}
+			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segmentDuration))
 			b.WriteString(tierSegmentURI(tier, i))
 		}
 		if errGen != nil {
@@ -1716,6 +1727,34 @@ func tierSegmentURI(tier, segment int) string {
 		return fmt.Sprintf("v%d/seg_%05d.ts\n", tier, segment)
 	}
 	return fmt.Sprintf("seg_%05d.ts\n", segment)
+}
+
+// virtualPlaceholderPlaylist is seekable from the first response. Stremio can
+// apply a saved position immediately; the requested public segment is then
+// mapped to placeholder segment zero by ensureMediaSegment.
+func virtualPlaceholderPlaylist(duration float64, tier int) []byte {
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4
+	}
+	if duration <= 0 {
+		duration = 6 * 60 * 60
+	}
+	count := vodSegmentCount(duration) + vodSegmentCount(2*60)
+	var b strings.Builder
+	b.Grow(count * 42)
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:6\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(segDur))))
+	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	for segment := 0; segment < count; segment++ {
+		b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
+		b.WriteString(tierSegmentURI(tier, segment))
+	}
+	b.WriteString("#EXT-X-ENDLIST\n")
+	return []byte(b.String())
 }
 
 // synchronizedLiveWindow renders the common A/V window of a live generation
@@ -1850,16 +1889,42 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 	}
 	state.mu.Lock()
 	state.lastAccess = time.Now()
+	if state.placeholder != nil && state.active == nil && state.introPublicStart < 0 && segment > 8 {
+		state.resumeStart = segment
+		state.introPublicStart = segment
+		log.Printf("mux: mapped saved position segment %d to intro start", segment)
+	}
 	duration := state.duration
+	filmEnd := state.filmEnd
 	errGen := state.errorGeneration
 	errStart := state.errorStart
 	active := state.active
 	activeTier := state.activeTier
+	placeholder := state.placeholder
+	retiredPlaceholder := state.retiredPlaceholder
+	introPublicStart := state.introPublicStart
+	filmBase := state.filmBase
 	all := append([]*generation(nil), state.all...)
 	state.mu.Unlock()
 
 	if segment < 0 {
 		return ""
+	}
+	intro := placeholder
+	if intro == nil {
+		intro = retiredPlaceholder
+	}
+	if intro != nil && introPublicStart >= 0 && segment >= introPublicStart && (placeholder != nil || segment < filmBase) {
+		physical := intro.startSegment + segment - introPublicStart
+		var path string
+		if audio {
+			path = generationAudioSegmentPath(intro, physical)
+		} else {
+			path = generationSegmentPath(intro, physical)
+		}
+		if fileExists(path) {
+			return path
+		}
 	}
 	// While the placeholder is live the timeline is open-ended.
 	if duration <= 0 && errGen == nil {
@@ -1868,7 +1933,7 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 		if segment >= errStart+m.errorSegmentCount() {
 			return ""
 		}
-	} else if segment >= vodSegmentCount(duration) {
+	} else if filmEnd >= 0 && segment > filmEnd {
 		return ""
 	}
 	// Once a tier switch completes, the active generation is authoritative.
@@ -2033,6 +2098,8 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 		r.starting = true
 		r.wait = make(chan struct{})
 		prepared := r.prepared
+		filmBase := state.filmBase
+		filmStartTime := state.filmStartTime
 		state.mu.Unlock()
 
 		if prepared == nil {
@@ -2062,7 +2129,7 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 		}
 		session, err := starter.StartAudioSession(state.ctx, ffmpeg.AudioSessionSpec{
 			AudioURL: prepared.audioURL, AudioTrackIndex: prepared.audioTrackIndex,
-			StartSegment: segment, StartTime: float64(segment-state.filmBase) * ffmpeg.SegDuration(),
+			StartSegment: segment, StartTime: filmStartTime + float64(segment-filmBase)*ffmpeg.SegDuration(),
 			OutputDir: dir, AudioMode: prepared.audioMode, AudioLanguage: id,
 			AudioTitle: id, UserAgent: browserUA, AudioOffset: audioOffsetForPrepared(m, prepared),
 		})
@@ -2137,7 +2204,9 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 
 	state.mu.Lock()
 	count := 0
-	if state.duration > 0 {
+	if state.filmEnd >= 0 {
+		count = state.filmEnd + 1
+	} else if state.duration > 0 {
 		count = vodSegmentCount(state.duration)
 	}
 	hasError := state.errorGeneration != nil
@@ -2183,6 +2252,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				highest := highestCompleteSegment(placeholder.dir)
 				if segment > highest+8 && segment > state.resumeStart {
 					state.resumeStart = segment
+					state.introPublicStart = segment
 					log.Printf("mux: deferred resume request at segment %d while placeholder is active", segment)
 				}
 			}
@@ -2300,10 +2370,12 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 
 	go func() {
 		base := 0
+		filmStartTime := 0.0
 		state.mu.Lock()
 		base = state.filmBase
+		filmStartTime = state.filmStartTime
 		state.mu.Unlock()
-		startTime := float64(targetSegment-base) * ffmpeg.SegDuration()
+		startTime := filmStartTime + float64(targetSegment-base)*ffmpeg.SegDuration()
 		if startTime < 0 {
 			startTime = 0
 		}

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/streammux/streammux/internal/application/ffmpeg"
 	"github.com/streammux/streammux/internal/domain/model"
 	"github.com/streammux/streammux/internal/infrastructure/store"
 )
