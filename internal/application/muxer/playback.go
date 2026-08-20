@@ -42,6 +42,7 @@ type playbackState struct {
 	posterDir        string // original poster cache, separate from the playback cache
 	cardPath         string
 	metadataCardPath string
+	detailsCardPath  string
 	metadata         contentMetadata
 
 	// active is the ffmpeg session currently encoding the film (or the
@@ -371,7 +372,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	if usePoster {
 		log.Printf("mux: starting image placeholder with poster %s", posterPath)
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-			VideoPath: m.placeholderPath, ImagePath: posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath,
+			VideoPath: m.placeholderPath, ImagePath: posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
 			OutputDir: dir, Realtime: true,
 		})
 		if err != nil {
@@ -385,7 +386,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	if !usePoster {
 		log.Printf("mux: starting plain placeholder")
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-			VideoPath: m.placeholderPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath,
+			VideoPath: m.placeholderPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
 			OutputDir: dir, Realtime: true,
 		})
 	}
@@ -525,7 +526,7 @@ func (m *Muxer) swapPlaceholder(job *model.MuxJob, state *playbackState, old *ge
 
 	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
 	session, err := engine.StartPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-		VideoPath: m.placeholderPath, ImagePath: state.posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath,
+		VideoPath: m.placeholderPath, ImagePath: state.posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
 		OutputDir: dir, Realtime: true, StartSegment: base,
 	})
 	if err != nil {

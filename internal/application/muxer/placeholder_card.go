@@ -42,25 +42,38 @@ func renderPlaceholderCard(metadata contentMetadata, plans []model.PlaybackPlan,
 			lines = append(lines, strings.Join(uniqueCardFacts(videoFacts), " • "))
 		}
 
-		audioLanguage := language
-		if audioLanguage == "" {
-			audioLanguage = primary.Audio.Language
-		}
-		languages := collectCardLanguages(plans)
-		audioLine := "Áudio no seu idioma"
-		if audioLanguage != "" {
-			audioLine = "Áudio: " + audioLanguage
-		}
-		if len(languages) > 1 {
-			audioLine += fmt.Sprintf(" • +%d idiomas disponíveis", len(languages)-1)
-		}
-		lines = append(lines, audioLine)
-		lines = append(lines, "qualidade máxima • remux automático")
 		return strings.Join(lines, "\n")
 	}
-
-	lines = append(lines, "Preparando fontes...")
 	return strings.Join(lines, "\n")
+}
+
+func renderPlaceholderDetails(metadata contentMetadata, plans []model.PlaybackPlan, language string) string {
+	var primary *model.PlaybackPlan
+	for i := range plans {
+		if plans[i].HasTargetAudio {
+			primary = &plans[i]
+			break
+		}
+	}
+	if primary == nil && len(plans) > 0 {
+		primary = &plans[0]
+	}
+	if primary == nil {
+		return ""
+	}
+	audioLanguage := language
+	if audioLanguage == "" {
+		audioLanguage = primary.Audio.Language
+	}
+	languages := collectCardLanguages(plans)
+	line := audioLanguage
+	if line == "" {
+		line = "Idioma não identificado"
+	}
+	if len(languages) > 1 {
+		line += fmt.Sprintf(" • +%d idiomas", len(languages)-1)
+	}
+	return line
 }
 
 func renderPlaceholderMetadata(metadata contentMetadata) string {

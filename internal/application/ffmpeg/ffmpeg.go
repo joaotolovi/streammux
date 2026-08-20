@@ -100,6 +100,7 @@ type PlaceholderSpec struct {
 	ImagePath    string
 	CardPath     string
 	MetadataPath string
+	DetailsPath  string
 	OutputDir    string
 	Realtime     bool
 	StartSegment int
@@ -558,10 +559,10 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 }
 
 func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath string) []string {
-	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "")
+	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "", "")
 }
 
-func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath string) []string {
+func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath string) []string {
 	const (
 		startT       = 2.5
 		duration     = 0.8
@@ -597,7 +598,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	)
 	outputLabel := "v"
 	if cardPath != "" {
-		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath) + "[card]"
+		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath) + "[card]"
 		outputLabel = "card"
 	}
 
@@ -690,10 +691,10 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 }
 
 func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, startSegment int, cardPath string) []string {
-	return buildPlaceholderArgsWithCards(path, outputDir, realtime, startSegment, cardPath, "")
+	return buildPlaceholderArgsWithCards(path, outputDir, realtime, startSegment, cardPath, "", "")
 }
 
-func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath string) []string {
+func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath string) []string {
 	preset := "veryfast"
 	if !realtime {
 		preset = "ultrafast"
@@ -710,7 +711,7 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	}
 	args = append(args, "-i", path)
 	if cardPath != "" {
-		args = append(args, "-vf", placeholderDrawtextFilter(cardPath, metadataPath))
+		args = append(args, "-vf", placeholderDrawtextFilter(cardPath, metadataPath, detailsPath))
 	}
 	args = append(args,
 		"-map", "0:v:0",
@@ -740,12 +741,17 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 }
 
 func placeholderDrawtextFilter(cardPath string, metadataPath ...string) string {
-	stream := fmt.Sprintf("fade=t=in:st=0:d=0.7,drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=34:box=1:boxcolor=black@0.55:boxborderw=18:x=48:y=h-150", escapeFilterPath(cardPath))
-	if len(metadataPath) == 0 || metadataPath[0] == "" {
-		return stream
+	filters := []string{"fade=t=in:st=0:d=0.7"}
+	if len(metadataPath) > 0 && metadataPath[0] != "" {
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.48:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0])))
 	}
-	metadata := fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.48:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0]))
-	return metadata + "," + stream
+	if cardPath != "" {
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=24:box=1:boxcolor=black@0.42:boxborderw=10:x=48:y=48:alpha='if(lt(t,0.8),t/0.8,1)'", escapeFilterPath(cardPath)))
+	}
+	if len(metadataPath) > 1 && metadataPath[1] != "" {
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=24:box=1:boxcolor=black@0.42:boxborderw=10:x=48:y=86:alpha='if(lt(t,1.1),0,if(lt(t,1.8),(t-1.1)/0.7,1))'", escapeFilterPath(metadataPath[1])))
+	}
+	return strings.Join(filters, ",")
 }
 
 func escapeFilterPath(path string) string {
@@ -792,9 +798,9 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 
 	var args []string
 	if spec.ImagePath != "" {
-		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath)
+		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath)
 	} else {
-		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath)
+		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath)
 	}
 
 	sessCtx, cancel := context.WithCancel(ctx)

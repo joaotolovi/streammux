@@ -131,7 +131,11 @@ func TestProcessReturnsBeforeAddonPreparationAndUsesCinemetaIdentity(t *testing.
 		if readErr != nil {
 			t.Fatalf("read placeholder card: %v", readErr)
 		}
-		if !strings.Contains(string(card), "1080p") || !strings.Contains(string(card), "HDR") || !strings.Contains(string(card), "idiomas disponíveis") {
+		details, detailsErr := os.ReadFile(state.detailsCardPath)
+		if detailsErr != nil {
+			t.Fatalf("read placeholder details: %v", detailsErr)
+		}
+		if !strings.Contains(string(card), "1080p") || !strings.Contains(string(card), "HDR") || !strings.Contains(string(details), "idiomas") {
 			t.Fatalf("card did not receive source metadata: %q", card)
 		}
 		mux.CleanupJob(job)
