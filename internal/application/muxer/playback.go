@@ -1813,6 +1813,7 @@ func (p livePlaylist) renderWithDiscontinuity(first, last, discontinuityAt int) 
 	if !insertedSequence {
 		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", first))
 	}
+	out = append(out, "#EXT-X-START:TIME-OFFSET=0:PRECISE=YES")
 	for segment := first; segment <= last; segment++ {
 		if segment == discontinuityAt {
 			out = append(out, "#EXT-X-DISCONTINUITY")
