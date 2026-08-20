@@ -65,13 +65,10 @@ type playbackState struct {
 	// (nonzero when a placeholder played first). While >= 0 the placeholder
 	// live window is frozen at [..filmBase-1] so the media sequence can only
 	// move forward across the handoff (players reject sequence regression).
-	filmBase         int
-	resumeStart      int // requested film segment to generate after the intro
-	placeholderStart int // public segment mapped to placeholder segment zero on resume
-	filmEnd          int // last public segment generated for the active film
-	filmStartTime    float64
-	placeholderLive  bool
-	discontinuities  []int
+	filmBase        int
+	resumeStart     int // requested film segment to generate after the intro
+	placeholderLive bool
+	discontinuities []int
 
 	// errorGeneration is the terminal "no source worked" video.
 	errorGeneration *generation
@@ -153,9 +150,8 @@ type generation struct {
 	prepared     *preparedPlan
 	dir          string
 	session      *ffmpeg.Session
-	startSegment int     // first public segment number this generation writes
-	startTime    float64 // source timestamp for startSegment
-	tier         int     // ABR tier namespace this generation serves (0 = primary)
+	startSegment int // first public segment number this generation writes
+	tier         int // ABR tier namespace this generation serves (0 = primary)
 	startedAt    time.Time
 	isLocal      bool // placeholder or error video
 	isError      bool
@@ -197,8 +193,6 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		posterDir:         posterDir,
 		placeholderDiscAt: -1,
 		resumeStart:       -1,
-		placeholderStart:  -1,
-		filmEnd:           -1,
 		tierMetas:         tierMetas,
 		lastRequested:     -1,
 		maxRequested:      -1,
@@ -620,22 +614,15 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		if state.resumeStart > base {
 			resumeStart = state.resumeStart
 		}
-		placeholderStart := state.placeholderStart
 		state.mu.Unlock()
 
 		startSegment := base
 		startTime := 0.0
 		if resumeStart >= 0 {
-			startSegment = resumeStart + base
-			if placeholderStart >= 0 {
-				startSegment = resumeStart + base - placeholderStart
-			}
-			startTime = float64(resumeStart) * ffmpeg.SegDuration()
+			startSegment = resumeStart
+			startTime = float64(resumeStart-base) * ffmpeg.SegDuration()
 			log.Printf("mux: resuming after placeholder at segment %d (%.0fs)", startSegment, startTime)
 		}
-		state.mu.Lock()
-		state.filmBase = startSegment
-		state.mu.Unlock()
 		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, startSegment, startTime, m.policy.MinHandoffBuffer)
 		if err == nil {
 			winner = gen
@@ -681,13 +668,14 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.startErr = nil
 	state.directURL = ""
 	state.duration = winner.prepared.duration
-	state.filmStartTime = winner.startTime
-	state.filmEnd = winner.startSegment + vodSegmentCount(winner.prepared.duration-winner.startTime) - 1
 	state.lastRecovery = time.Now()
 	state.lastRequested = -1
 	state.maxRequested = -1
 	if state.filmBase > 0 {
 		state.discontinuities = append(state.discontinuities, state.filmBase)
+	}
+	if state.resumeStart > state.filmBase {
+		state.discontinuities = append(state.discontinuities, state.resumeStart)
 	}
 	base := state.filmBase
 	wait := state.startWait
@@ -920,7 +908,6 @@ func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState,
 		dir:          dir,
 		session:      session,
 		startSegment: startNumber,
-		startTime:    startTime,
 		tier:         tier,
 		startedAt:    time.Now(),
 	}
@@ -1625,8 +1612,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		placeholderDiscAt = state.placeholderDiscAt
 	}
 	duration := state.duration
-	filmStartTime := state.filmStartTime
-	filmEnd := state.filmEnd
+	resumeStart := state.resumeStart
 	disc := append([]int(nil), state.discontinuities...)
 	if tier > 0 && tier < tierCount {
 		disc = append(disc, state.tierDisc[tier]...)
@@ -1668,12 +1654,12 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 
 	if duration > 0 {
 		// Film timeline (possibly truncated by the error tail).
-		segs := computeEqualLengthSegments(segDur, duration-filmStartTime)
+		segs := computeEqualLengthSegments(segDur, duration)
 		first := base
-		last := len(segs) - 1
-		if filmEnd > 0 {
-			last = filmEnd
+		if resumeStart > first {
+			first = resumeStart
 		}
+		last := len(segs) - 1
 		if first > last {
 			first = last + 1
 		}
@@ -1687,11 +1673,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 			if discSet[i] {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
 			}
-			segmentDuration := segs[i-first]
-			if filmEnd <= 0 {
-				segmentDuration = segs[i]
-			}
-			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segmentDuration))
+			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segs[i]))
 			b.WriteString(tierSegmentURI(tier, i))
 		}
 		if errGen != nil {
@@ -1869,13 +1851,10 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	duration := state.duration
-	filmEnd := state.filmEnd
 	errGen := state.errorGeneration
 	errStart := state.errorStart
 	active := state.active
 	activeTier := state.activeTier
-	placeholder := state.placeholder
-	placeholderStart := state.placeholderStart
 	all := append([]*generation(nil), state.all...)
 	state.mu.Unlock()
 
@@ -1889,22 +1868,8 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 		if segment >= errStart+m.errorSegmentCount() {
 			return ""
 		}
-	} else if filmEnd > 0 && segment > filmEnd {
+	} else if segment >= vodSegmentCount(duration) {
 		return ""
-	}
-	// A resumed Stremio player asks for its old segment number immediately.
-	// Map that public range onto the local intro until its handoff is ready.
-	if placeholder != nil && placeholderStart >= 0 && segment >= placeholderStart {
-		placeholderSegment := placeholder.startSegment + segment - placeholderStart
-		var path string
-		if audio {
-			path = generationAudioSegmentPath(placeholder, placeholderSegment)
-		} else {
-			path = generationSegmentPath(placeholder, placeholderSegment)
-		}
-		if fileExists(path) {
-			return path
-		}
 	}
 	// Once a tier switch completes, the active generation is authoritative.
 	// Do not serve stale files from a retired tier. mediaSegmentPath can still
@@ -2218,7 +2183,6 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				highest := highestCompleteSegment(placeholder.dir)
 				if segment > highest+8 && segment > state.resumeStart {
 					state.resumeStart = segment
-					state.placeholderStart = segment
 					log.Printf("mux: deferred resume request at segment %d while placeholder is active", segment)
 				}
 			}
