@@ -14,22 +14,7 @@ import (
 // returned anything. Once plans arrive, it adds the best-known source and
 // audio facts without pretending that an unprobed stream is guaranteed.
 func renderPlaceholderCard(metadata contentMetadata, plans []model.PlaybackPlan, language string) string {
-	title := contentDisplayTitle(metadata)
-	lines := []string{"▶ " + title}
-	if metadata.SeriesTitle != "" && metadata.Title != "" && metadata.Title != metadata.SeriesTitle {
-		lines = append(lines, metadata.Title)
-	}
-	var identity []string
-	if metadata.Year != "" {
-		identity = append(identity, metadata.Year)
-	}
-	if metadata.Rating != "" {
-		identity = append(identity, "★ "+metadata.Rating)
-	}
-	if len(identity) > 0 {
-		lines = append(lines, strings.Join(identity, " • "))
-	}
-
+	lines := []string{}
 	var primary *model.PlaybackPlan
 	for i := range plans {
 		if plans[i].HasTargetAudio {
@@ -75,6 +60,24 @@ func renderPlaceholderCard(metadata contentMetadata, plans []model.PlaybackPlan,
 	}
 
 	lines = append(lines, "Preparando fontes...")
+	return strings.Join(lines, "\n")
+}
+
+func renderPlaceholderMetadata(metadata contentMetadata) string {
+	lines := []string{"▶ " + contentDisplayTitle(metadata)}
+	if metadata.SeriesTitle != "" && metadata.Title != "" && metadata.Title != metadata.SeriesTitle {
+		lines = append(lines, metadata.Title)
+	}
+	var identity []string
+	if metadata.Year != "" {
+		identity = append(identity, metadata.Year)
+	}
+	if metadata.Rating != "" {
+		identity = append(identity, "★ "+metadata.Rating)
+	}
+	if len(identity) > 0 {
+		lines = append(lines, strings.Join(identity, " • "))
+	}
 	return strings.Join(lines, "\n")
 }
 

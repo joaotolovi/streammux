@@ -99,6 +99,7 @@ type PlaceholderSpec struct {
 	VideoPath    string
 	ImagePath    string
 	CardPath     string
+	MetadataPath string
 	OutputDir    string
 	Realtime     bool
 	StartSegment int
@@ -557,6 +558,10 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 }
 
 func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath string) []string {
+	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "")
+}
+
+func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath string) []string {
 	const (
 		startT       = 2.5
 		duration     = 0.8
@@ -592,7 +597,7 @@ func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, rea
 	)
 	outputLabel := "v"
 	if cardPath != "" {
-		filter += ";[v]" + placeholderDrawtextFilter(cardPath) + "[card]"
+		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath) + "[card]"
 		outputLabel = "card"
 	}
 
@@ -685,6 +690,10 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 }
 
 func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, startSegment int, cardPath string) []string {
+	return buildPlaceholderArgsWithCards(path, outputDir, realtime, startSegment, cardPath, "")
+}
+
+func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath string) []string {
 	preset := "veryfast"
 	if !realtime {
 		preset = "ultrafast"
@@ -701,7 +710,7 @@ func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, star
 	}
 	args = append(args, "-i", path)
 	if cardPath != "" {
-		args = append(args, "-vf", placeholderDrawtextFilter(cardPath))
+		args = append(args, "-vf", placeholderDrawtextFilter(cardPath, metadataPath))
 	}
 	args = append(args,
 		"-map", "0:v:0",
@@ -730,8 +739,13 @@ func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, star
 	return args
 }
 
-func placeholderDrawtextFilter(cardPath string) string {
-	return fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=34:box=1:boxcolor=black@0.55:boxborderw=18:x=48:y=h-150", escapeFilterPath(cardPath))
+func placeholderDrawtextFilter(cardPath string, metadataPath ...string) string {
+	stream := fmt.Sprintf("fade=t=in:st=0:d=0.7,drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=34:box=1:boxcolor=black@0.55:boxborderw=18:x=48:y=h-150", escapeFilterPath(cardPath))
+	if len(metadataPath) == 0 || metadataPath[0] == "" {
+		return stream
+	}
+	metadata := fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.48:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0]))
+	return metadata + ";" + stream
 }
 
 func escapeFilterPath(path string) string {
@@ -778,9 +792,9 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 
 	var args []string
 	if spec.ImagePath != "" {
-		args = buildImagePlaceholderArgsWithOptions(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath)
+		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath)
 	} else {
-		args = buildPlaceholderArgsWithOptions(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath)
+		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath)
 	}
 
 	sessCtx, cancel := context.WithCancel(ctx)

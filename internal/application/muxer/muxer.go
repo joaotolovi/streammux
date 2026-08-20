@@ -425,12 +425,16 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	state.mu.Lock()
 	state.metadata = metadata
 	state.cardPath = filepath.Join(state.cacheDir, "placeholder-card.txt")
+	state.metadataCardPath = filepath.Join(state.cacheDir, "placeholder-metadata.txt")
 	state.preparationWait = make(chan struct{})
 	state.tierMetas = append([]model.TierMeta(nil), job.TierMetas...)
 	state.mu.Unlock()
 	job.Title = contentDisplayTitle(metadata)
 	if err := writePlaceholderCard(state.cardPath, renderPlaceholderCard(metadata, nil, cfg.Language)); err != nil {
 		log.Printf("mux: cannot initialize placeholder card: %v", err)
+	}
+	if err := writePlaceholderCard(state.metadataCardPath, renderPlaceholderMetadata(metadata)); err != nil {
+		log.Printf("mux: cannot initialize placeholder metadata: %v", err)
 	}
 
 	if metadata.PosterURL != "" && state.posterPath != "" {
@@ -504,6 +508,7 @@ func (m *Muxer) prepareJob(job *model.MuxJob, state *playbackState, addons []mod
 
 	if len(plans) > 0 {
 		_ = writePlaceholderCard(state.cardPath, renderPlaceholderCard(state.metadata, plans, language))
+		_ = writePlaceholderCard(state.metadataCardPath, renderPlaceholderMetadata(state.metadata))
 	}
 	if wait != nil {
 		close(wait)
