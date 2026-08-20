@@ -42,7 +42,14 @@ func (s *Session) AnimateOverlay() error {
 
 func posterOverlayCommand(name string) string {
 	// Keep the poster hidden until five seconds, then slide it in through ZMQ.
-	return fmt.Sprintf("%s x if(lt(t,5),1280,max(947,1280-(t-5)*416.25))", name)
+	return fmt.Sprintf("%s x %s", name, posterXExpression())
+}
+
+func posterXExpression() string {
+	// Smoothstep gives the slide a natural ease-in/ease-out S curve.
+	u := "((t-5)/0.8)"
+	smooth := "(3*" + u + "*" + u + "-2*" + u + "*" + u + "*" + u + ")"
+	return "if(lt(t,5),1280,if(lt(t,5.8),1280-380*" + smooth + ",900))"
 }
 
 func overlayCommand(name, base string, y int) string {

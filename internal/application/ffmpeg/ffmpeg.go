@@ -573,7 +573,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		duration     = 0.8
 		posterW      = 256 // 320 * 0.8
 		posterH      = 384 // 480 * 0.8
-		posterY      = (720 - posterH) / 2
+		posterY      = 96
 	)
 
 	spinnerPath := findAsset(path, "loading_spinner.gif")
@@ -592,16 +592,16 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
 			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
-			"[shifted][poster]overlay@poster=x='if(lt(t,5),1280,max(947,1280-(t-5)*416.25))':y=%d[withposter];"+
-			"[withposter][border_scaled]overlay@poster_border=x='if(lt(t,5),1280,max(947,1280-(t-5)*416.25))':y=%d[withborder];"+
+			"[shifted][poster]overlay@poster=x='%s':y=%d[withposter];"+
+			"[withposter][border_scaled]overlay@poster_border=x='%s':y=%d[withborder];"+
 			spinnerInput,
 		posterW, posterH,
 		posterW, posterH,
 		posterW, posterH,
 		startT, duration,
 		baseVideo,
-		posterY,
-		posterY,
+		posterXExpression(), posterY,
+		posterXExpression(), posterY,
 	)
 	outputLabel := "v"
 	if cardPath != "" {
@@ -777,7 +777,7 @@ func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpo
 		filters = append(filters, "zmq=b='"+escapeFilterPath(overlayEndpoint)+"'")
 	}
 	if metadataPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=947:y=570:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(metadataPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=900:y=498:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(metadataPath)))
 	}
 	if cardPath != "" {
 		filters = append(filters, fmt.Sprintf("drawtext@quality=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(cardPath)))
