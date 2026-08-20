@@ -555,9 +555,9 @@ func tail(s string, n int) string {
 }
 
 // buildImagePlaceholderArgs encodes the local placeholder video composed with
-// a static poster image. The video shifts -140px to the left while a 256x384
-// poster slides in from x=1280 to x=947 between t=2.5s and t=3.3s. The poster
-// has rounded corners and a subtle gray border. The output is an HLS live
+// a static poster image. The poster is preloaded and its slide-in is controlled
+// through the named overlay filters and ZMQ. It has rounded corners and a subtle
+// gray border. The output is an HLS live
 // window identical to buildPlaceholderArgs, so the film handoff is unchanged.
 func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool) []string {
 	return buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir, realtime, 0, "")
@@ -573,19 +573,16 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		duration     = 0.8
 		posterW      = 256 // 320 * 0.8
 		posterH      = 384 // 480 * 0.8
-		posterX      = 1280 - posterW - 77
 		posterY      = (720 - posterH) / 2
-		posterSpeedX = 1280 - posterX
-		posterSpeed  = float64(posterSpeedX) / duration
 	)
 
 	spinnerPath := findAsset(path, "loading_spinner.gif")
 	useSpinner := realtime && assetExists(spinnerPath)
-	baseVideo := "[0:v]"
-	filterPrefix := "color=c=black:s=1280x720[base];"
-	if realtime {
-		filterPrefix += "[0:v]tpad=stop_mode=clone:stop_duration=114[basevideo];"
-		baseVideo = "[basevideo]"
+	baseVideo := "[basevideo]"
+	filterPrefix := "color=c=black:s=1280x720[base];[0:v]scale=1280:720[basevideo];"
+	spinnerInput := "[withborder]null[v]"
+	if useSpinner {
+		spinnerInput = "[4:v]scale=72:72,format=rgba[spinner];[withborder][spinner]overlay=x=1184:y=624:eof_action=repeat[v]"
 	}
 	filter := fmt.Sprintf(
 		filterPrefix+
@@ -595,22 +592,17 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
 			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
-			"[shifted][poster]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[withposter];"+
-			"[withposter][border_scaled]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[withborder];"+
-			"[withborder][spinner]overlay=x=1184:y=624:eof_action=repeat[v]",
+			"[shifted][poster]overlay@poster=x=1280:y=%d[withposter];"+
+			"[withposter][border_scaled]overlay@poster_border=x=1280:y=%d[withborder];"+
+			spinnerInput,
 		posterW, posterH,
 		posterW, posterH,
 		posterW, posterH,
 		startT, duration,
 		baseVideo,
-		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
-		posterY, startT,
-		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
-		posterY, startT,
+		posterY,
+		posterY,
 	)
-	if !useSpinner {
-		filter = strings.Replace(filter, "[withborder][spinner]overlay=x=1184:y=624:eof_action=repeat[v]", "[withborder]null[v]", 1)
-	}
 	outputLabel := "v"
 	if cardPath != "" {
 		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint) + "[card]"
@@ -656,12 +648,6 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "0:a:0",
-		"-af", func() string {
-			if realtime {
-				return "apad=pad_dur=114"
-			}
-			return "anull"
-		}(),
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
@@ -672,9 +658,6 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
 	)
-	if realtime {
-		args = append(args[:len(args)-1], "-t", "120", args[len(args)-1])
-	}
 	return args
 }
 
@@ -752,17 +735,14 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		if !realtime {
 			args = append(args, "-vf", textFilter)
 		} else if useSpinner {
-			filter := "[0:v]tpad=stop_mode=clone:stop_duration=114[intro];" +
-				"[1:v]format=rgba,scale=72:72[spinner];" +
-				"[intro][spinner]overlay=x=1184:y=624:eof_action=repeat[withspinner];" +
+			filter := "[1:v]format=rgba,scale=72:72[spinner];" +
+				"[0:v][spinner]overlay=x=1184:y=624:eof_action=repeat[withspinner];" +
 				"[withspinner]" + textFilter + "[v]"
 			args = append(args, "-filter_complex", filter)
 			videoMap = "[v]"
 		} else {
-			args = append(args, "-vf", "tpad=stop_mode=clone:stop_duration=114,"+textFilter)
+			args = append(args, "-vf", textFilter)
 		}
-	} else if realtime {
-		args = append(args, "-vf", "tpad=stop_mode=clone:stop_duration=114")
 	}
 	args = append(args,
 		"-map", videoMap,
@@ -778,12 +758,6 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "0:a:0",
-		"-af", func() string {
-			if realtime {
-				return "apad=pad_dur=114"
-			}
-			return "anull"
-		}(),
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
@@ -794,10 +768,6 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
 	)
-	if realtime {
-		// Keep both HLS outputs aligned with the 120-second frozen intro.
-		args = append(args[:len(args)-1], "-t", "120", args[len(args)-1])
-	}
 	return args
 }
 
@@ -807,13 +777,13 @@ func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpo
 		filters = append(filters, "zmq=b='"+escapeFilterPath(overlayEndpoint)+"'")
 	}
 	if metadataPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=947:y=570:alpha=1", escapeFilterPath(metadataPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=947:y=570:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(metadataPath)))
 	}
 	if cardPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext@quality=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha=1", escapeFilterPath(cardPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@quality=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(cardPath)))
 	}
 	if detailsPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext@languages=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=58:alpha=1", escapeFilterPath(detailsPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@languages=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=58:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(detailsPath)))
 	}
 	return strings.Join(filters, ",")
 }
@@ -834,7 +804,7 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputD
 
 // StartImagePlaceholderSession launches the local placeholder video composed
 // with a static poster image. The poster slides in from the right after a
-// short delay while the placeholder video slides slightly to the left. The
+// short delay while the opening video remains fixed. The
 // output is identical to a regular placeholder session, so the film handoff
 // works unchanged.
 func (m *Muxer) StartImagePlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {

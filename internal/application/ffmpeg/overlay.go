@@ -10,9 +10,8 @@ import (
 	"github.com/go-zeromq/zmq4"
 )
 
-// AnimateOverlay restarts the intro transition at the current FFmpeg time.
-// The text files remain the source of truth; ZMQ only changes the animation
-// expressions, so updates are atomic and do not require restarting FFmpeg.
+// AnimateOverlay applies the intro transition schedule through ZMQ. The text
+// files remain the source of truth, so updates do not require restarting FFmpeg.
 func (s *Session) AnimateOverlay() error {
 	s.mu.RLock()
 	endpoint := s.overlayEndpoint
@@ -30,8 +29,10 @@ func (s *Session) AnimateOverlay() error {
 	quality := overlayCommand("quality", base, 24)
 	languages := overlayCommand("languages", base, 58)
 	metadata := overlayCommand("metadata", base, 570)
+	poster := posterOverlayCommand("poster")
+	posterBorder := posterOverlayCommand("poster_border")
 	for attempt := 0; attempt < 5; attempt++ {
-		if err := sendOverlayCommand(endpoint, quality+"\n"+languages+"\n"+metadata); err == nil {
+		if err := sendOverlayCommand(endpoint, quality+"\n"+languages+"\n"+metadata+"\n"+poster+"\n"+posterBorder); err == nil {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -39,10 +40,14 @@ func (s *Session) AnimateOverlay() error {
 	return fmt.Errorf("overlay animation command failed")
 }
 
+func posterOverlayCommand(name string) string {
+	// Keep the poster hidden until five seconds, then slide it in through ZMQ.
+	return fmt.Sprintf("%s reinit x='if(lt(t,5),1280,max(947,1280-(t-5)*416.25))'", name)
+}
+
 func overlayCommand(name, base string, y int) string {
-	start, _ := strconv.ParseFloat(base, 64)
-	end := strconv.FormatFloat(start+0.8, 'f', 3, 64)
-	return fmt.Sprintf("%s reinit x=24:y=%d:alpha='if(lt(t,%s),0,if(lt(t,%s),(t-%s)/0.8,1))'", name, y, base, end, base)
+	_ = base
+	return fmt.Sprintf("%s reinit x=24:y=%d:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", name, y)
 }
 
 func sendOverlayCommand(endpoint, commands string) error {
