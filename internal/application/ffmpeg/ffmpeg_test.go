@@ -138,7 +138,7 @@ func TestBuildPlaceholderArgsSupportsCardAndNonZeroStart(t *testing.T) {
 		t.Fatalf("placeholder start number missing: %#v", args)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "drawtext=textfile='/tmp/card\\:with-colon.txt'") || !strings.Contains(joined, "reload=1") {
+	if (!strings.Contains(joined, "drawtext=textfile='/tmp/card\\:with-colon.txt'") && !strings.Contains(joined, "drawtext@quality=textfile='/tmp/card\\:with-colon.txt'")) || !strings.Contains(joined, "reload=1") {
 		t.Fatalf("placeholder card filter missing or not escaped: %s", joined)
 	}
 }

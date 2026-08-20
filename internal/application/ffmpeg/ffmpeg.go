@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +58,7 @@ type SessionSpec struct {
 	AudioTrackIndex int
 	// StartSegment is the first HLS segment number written (start_number).
 	StartSegment int
+	OverlayPort  int
 	// StartTime is the content offset in seconds (-ss). It is independent of
 	// StartSegment: the placeholder handoff numbers film segments from N while
 	// still playing content from 0:00.
@@ -116,8 +118,11 @@ type Session struct {
 	// stderrTail retains the last ffmpeg stderr bytes for diagnostics.
 	stderrTail *tailBuffer
 
-	mu  sync.RWMutex
-	err error
+	mu               sync.RWMutex
+	err              error
+	overlayEndpoint  string
+	overlayStartedAt time.Time
+	overlayMu        sync.Mutex
 }
 
 // InitDone initialises the internal done channel. It exists for tests that
@@ -559,10 +564,10 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 }
 
 func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath string) []string {
-	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "", "")
+	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "", "", "")
 }
 
-func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath string) []string {
+func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, overlayEndpoint string) []string {
 	const (
 		startT       = 2.5
 		duration     = 0.8
@@ -598,7 +603,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	)
 	outputLabel := "v"
 	if cardPath != "" {
-		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath) + "[card]"
+		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint) + "[card]"
 		outputLabel = "card"
 	}
 
@@ -691,10 +696,10 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 }
 
 func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, startSegment int, cardPath string) []string {
-	return buildPlaceholderArgsWithCards(path, outputDir, realtime, startSegment, cardPath, "", "")
+	return buildPlaceholderArgsWithCards(path, outputDir, realtime, startSegment, cardPath, "", "", "")
 }
 
-func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath string) []string {
+func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, overlayEndpoint string) []string {
 	preset := "veryfast"
 	if !realtime {
 		preset = "ultrafast"
@@ -711,7 +716,7 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	}
 	args = append(args, "-i", path)
 	if cardPath != "" {
-		args = append(args, "-vf", placeholderDrawtextFilter(cardPath, metadataPath, detailsPath))
+		args = append(args, "-vf", placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint))
 	}
 	args = append(args,
 		"-map", "0:v:0",
@@ -740,18 +745,19 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	return args
 }
 
-func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath string) string {
+func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint string) string {
 	filters := []string{"fade=t=in:st=0:d=0.7"}
-	// Repeat the entrance because HLS clients usually join the current segment,
-	// not the beginning of the placeholder timeline.
+	if overlayEndpoint != "" {
+		filters = append(filters, "zmq=b='"+escapeFilterPath(overlayEndpoint)+"'")
+	}
 	if metadataPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x='947+if(lt(mod(t,6),0.8),40*(1-mod(t,6)/0.8),0)':y=570:alpha='if(lt(mod(t,6),0.8),mod(t,6)/0.8,if(lt(mod(t,6),1.1),1,if(lt(mod(t,6),1.8),1-(mod(t,6)-1.1)/0.7,0)))'", escapeFilterPath(metadataPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=947:y=570:alpha=1", escapeFilterPath(metadataPath)))
 	}
 	if cardPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x='24-40*(1-min(mod(t,6)/0.8,1))':y=24:alpha='if(lt(mod(t,6),0.8),mod(t,6)/0.8,if(lt(mod(t,6),1.8),1,0))'", escapeFilterPath(cardPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@quality=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha=1", escapeFilterPath(cardPath)))
 	}
 	if detailsPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x='24-40*(1-min(max(mod(t,6)-0.7,0)/0.8,1))':y=58:alpha='if(lt(mod(t,6),0.7),0,if(lt(mod(t,6),1.5),(mod(t,6)-0.7)/0.8,if(lt(mod(t,6),1.8),1,0)))'", escapeFilterPath(detailsPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@languages=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=58:alpha=1", escapeFilterPath(detailsPath)))
 	}
 	return strings.Join(filters, ",")
 }
@@ -797,12 +803,22 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 	if err := os.MkdirAll(filepath.Join(spec.OutputDir, "audio"), 0755); err != nil {
 		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
 	}
+	overlayEndpoint := ""
+	if spec.CardPath != "" {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("placeholder overlay socket: %w", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		_ = listener.Close()
+		overlayEndpoint = fmt.Sprintf("tcp://127.0.0.1:%d", port)
+	}
 
 	var args []string
 	if spec.ImagePath != "" {
-		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath)
+		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, overlayEndpoint)
 	} else {
-		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath)
+		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, overlayEndpoint)
 	}
 
 	sessCtx, cancel := context.WithCancel(ctx)
@@ -817,11 +833,13 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 	}
 
 	s := &Session{
-		cancel:     cancel,
-		done:       make(chan struct{}),
-		progress:   make(chan ProgressSample, 1),
-		startN:     spec.StartSegment,
-		stderrTail: stderr,
+		cancel:           cancel,
+		done:             make(chan struct{}),
+		progress:         make(chan ProgressSample, 1),
+		startN:           spec.StartSegment,
+		stderrTail:       stderr,
+		overlayEndpoint:  overlayEndpoint,
+		overlayStartedAt: time.Now(),
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -847,6 +865,12 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 		close(s.progress)
 		close(s.done)
 	}()
+	if overlayEndpoint != "" {
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			_ = s.AnimateOverlay()
+		}()
+	}
 
 	return s, nil
 }

@@ -514,6 +514,14 @@ func (m *Muxer) prepareJob(job *model.MuxJob, state *playbackState, addons []mod
 		_ = writePlaceholderCard(state.cardPath, renderPlaceholderCard(state.metadata, plans, language))
 		_ = writePlaceholderCard(state.metadataCardPath, renderPlaceholderMetadata(state.metadata))
 		_ = writePlaceholderCard(state.detailsCardPath, renderPlaceholderDetails(state.metadata, plans, language))
+		state.mu.Lock()
+		placeholder := state.placeholder
+		state.mu.Unlock()
+		if placeholder != nil && placeholder.session != nil {
+			if err := placeholder.session.AnimateOverlay(); err != nil {
+				log.Printf("mux: placeholder overlay animation unavailable: %v", err)
+			}
+		}
 	}
 	if wait != nil {
 		close(wait)
