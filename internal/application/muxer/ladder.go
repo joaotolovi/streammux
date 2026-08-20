@@ -422,7 +422,7 @@ func (m *Muxer) launchTierStrategy(job *model.MuxJob, state *playbackState, tier
 				log.Printf("mux: tier %d strategy %s failed to prepare: %v", tier, s.desc, err)
 				continue
 			}
-			startTime := float64(atSegment-state.filmBase) * ffmpeg.SegDuration()
+			startTime := state.filmStartTime + float64(atSegment-state.filmBase)*ffmpeg.SegDuration()
 			if startTime < 0 {
 				startTime = 0
 			}
