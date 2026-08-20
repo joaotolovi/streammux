@@ -20,13 +20,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /streammux ./cmd/streammux
 
-# Runtime stage — uses static FFmpeg binaries with current filters/codecs.
-FROM mwader/static-ffmpeg:9.0 AS ffmpeg
-
-FROM alpine:3.23
-RUN apk add --no-cache ca-certificates fontconfig font-dejavu font-noto-emoji
-COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
+# Runtime stage — includes current FFmpeg and ffprobe for remuxing.
+FROM alpine:edge
+RUN apk add --no-cache ffmpeg ca-certificates font-dejavu font-noto-emoji
 COPY --from=builder /streammux /usr/local/bin/streammux
 
 ENV PORT=3001
