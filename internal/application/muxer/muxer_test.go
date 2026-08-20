@@ -332,8 +332,9 @@ func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
 func TestRenderMediaPlaylistAfterPlaceholderResume(t *testing.T) {
 	state := &playbackState{
 		duration:        28,
-		filmBase:        2,
-		resumeStart:     5,
+		filmBase:        5,
+		filmStartTime:   20,
+		filmEnd:         6,
 		discontinuities: []int{5},
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
@@ -352,6 +353,38 @@ func TestRenderMediaPlaylistAfterPlaceholderResume(t *testing.T) {
 	}
 	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n") || !strings.Contains(playlist, "seg_00005.ts") {
 		t.Fatalf("playlist missing resumed handoff: %s", playlist)
+	}
+}
+
+func TestSegmentPathMapsResumeRequestToPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	videoPath := filepath.Join(dir, "video", "seg_00000.ts")
+	audioPath := filepath.Join(dir, "audio", "seg_00000.ts")
+	if err := os.WriteFile(videoPath, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(audioPath, []byte("audio"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	placeholder := &generation{dir: dir, startSegment: 0}
+	mux := &Muxer{states: map[string]*playbackState{"job": {
+		placeholder:      placeholder,
+		placeholderStart: 375,
+		all:              []*generation{placeholder},
+		filmEnd:          -1,
+	}}}
+	job := &model.MuxJob{ID: "job"}
+	if got := mux.SegmentPath(job, 375); got != videoPath {
+		t.Fatalf("video resume segment = %q, want %q", got, videoPath)
+	}
+	if got := mux.AudioSegmentPath(job, 375); got != audioPath {
+		t.Fatalf("audio resume segment = %q, want %q", got, audioPath)
 	}
 }
 
