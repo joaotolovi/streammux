@@ -23,7 +23,7 @@ func TestBuildImagePlaceholderArgsContainsExpectedInputsAndFilter(t *testing.T) 
 	if !strings.Contains(joined, "filter_complex") {
 		t.Error("missing filter_complex flag")
 	}
-	if !strings.Contains(joined, "colorchannelmixer=aa=") {
+	if !strings.Contains(joined, "colorchannelmixer=aa=0.65") || !strings.Contains(joined, "fade=t=out:st=5:d=0.8:alpha=1") {
 		t.Error("missing video opacity animation")
 	}
 	if !strings.Contains(joined, "overlay") {

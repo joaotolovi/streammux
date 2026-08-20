@@ -593,8 +593,11 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 	filter := filterPrefix +
 		fmt.Sprintf("[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,format=rgba,fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[logo];", logoInput, logoW, logoH, startT, duration) +
 		backgroundFilter +
-		"[basevideo]colorchannelmixer=aa='if(lt(t,5),1,if(lt(t,5.8),1-(t-5)*0.35/0.8,0.65))'[opening];" +
-		"[composed][opening]overlay=x=0:y=0[withlogo];" +
+		"[basevideo]split[full][dim];" +
+		"[full]fade=t=out:st=5:d=0.8:alpha=1[fullfade];" +
+		"[dim]colorchannelmixer=aa=0.65,fade=t=in:st=5:d=0.8:alpha=1[dimfade];" +
+		"[composed][dimfade]overlay=x=0:y=0[dimmed];" +
+		"[dimmed][fullfade]overlay=x=0:y=0[withlogo];" +
 		spinnerInput
 	outputLabel := "v"
 	if cardPath != "" {
