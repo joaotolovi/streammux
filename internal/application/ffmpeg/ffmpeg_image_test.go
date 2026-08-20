@@ -17,11 +17,8 @@ func TestBuildImagePlaceholderArgsContainsExpectedInputsAndFilter(t *testing.T) 
 	if !strings.Contains(joined, "poster.jpg") {
 		t.Error("missing poster image input")
 	}
-	if !strings.Contains(joined, "poster_round_mask.png") {
-		t.Error("missing mask asset input")
-	}
-	if !strings.Contains(joined, "poster_round_border.png") {
-		t.Error("missing border asset input")
+	if !strings.Contains(joined, "scale=360:180") {
+		t.Error("missing logo scale")
 	}
 	if !strings.Contains(joined, "filter_complex") {
 		t.Error("missing filter_complex flag")
@@ -83,15 +80,13 @@ func TestShiftExprVideoStopsAtEndX(t *testing.T) {
 	}
 }
 
-func TestBuildImagePlaceholderArgsScalesMaskAndBorder(t *testing.T) {
+func TestBuildImagePlaceholderArgsUsesLogoFade(t *testing.T) {
 	args := buildImagePlaceholderArgs("placeholder.mp4", "poster.jpg", "/tmp/out", true)
 	joined := strings.Join(args, " ")
-	// The mask and border PNGs are 320x480 but the poster is 256x384 (20%
-	// smaller), so they must be scaled in the filter chain.
-	if !strings.Contains(joined, "[2:v]scale=256:384") {
-		t.Error("missing mask scale to 256x384")
+	if !strings.Contains(joined, "fade=t=in:st=5.00:d=0.80") {
+		t.Error("missing logo fade-in")
 	}
-	if !strings.Contains(joined, "[3:v]scale=256:384") {
-		t.Error("missing border scale to 256x384")
+	if strings.Contains(joined, "poster_round_mask.png") || strings.Contains(joined, "poster_round_border.png") {
+		t.Error("poster mask or border should not be used for logo")
 	}
 }

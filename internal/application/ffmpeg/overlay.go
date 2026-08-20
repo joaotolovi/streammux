@@ -29,11 +29,9 @@ func (s *Session) AnimateOverlay() error {
 	quality := overlayCommand("quality", base, 24)
 	languages := overlayCommand("languages", base, 58)
 	metadata := overlayCommand("metadata", base, 570)
-	poster := posterOverlayCommand("poster")
-	posterBorder := posterOverlayCommand("poster_border")
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
-		if err := sendOverlayCommand(endpoint, quality+"\n"+languages+"\n"+metadata+"\n"+poster+"\n"+posterBorder); err == nil {
+		if err := sendOverlayCommand(endpoint, quality+"\n"+languages+"\n"+metadata); err == nil {
 			return nil
 		} else {
 			lastErr = err
@@ -41,22 +39,6 @@ func (s *Session) AnimateOverlay() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("overlay animation command failed after retries: %w", lastErr)
-}
-
-func posterOverlayCommand(name string) string {
-	// Keep the poster hidden until five seconds, then slide it in through ZMQ.
-	return fmt.Sprintf("%s x %s", name, posterXExpression())
-}
-
-func posterXExpression() string {
-	// Smoothstep gives the slide a natural ease-in/ease-out S curve.
-	u := "((t-5)/0.8)"
-	smooth := "(3*" + u + "*" + u + "-2*" + u + "*" + u + "*" + u + ")"
-	return "if(lt(t,5),1280,if(lt(t,5.8),1280-380*" + smooth + ",900))"
-}
-
-func posterYExpression() string {
-	return "96"
 }
 
 func overlayCommand(name, base string, y int) string {

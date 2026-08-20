@@ -25,6 +25,7 @@ type cinemetaMeta struct {
 	Meta struct {
 		Name        string          `json:"name"`
 		Poster      string          `json:"poster"`
+		Logo        string          `json:"logo"`
 		ReleaseInfo string          `json:"releaseInfo"`
 		IMDBRating  json.RawMessage `json:"imdbRating"`
 		Videos      []struct {
@@ -43,7 +44,7 @@ type contentMetadata struct {
 	Episode     int
 	Year        string
 	Rating      string
-	PosterURL   string
+	LogoURL     string
 }
 
 func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string, languages ...string) (contentMetadata, error) {
@@ -122,7 +123,7 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		Episode:     episode,
 		Year:        firstReleaseYear(meta.Meta.ReleaseInfo),
 		Rating:      rating,
-		PosterURL:   normalizePosterURL(meta.Meta.Poster),
+		LogoURL:     normalizePosterURL(meta.Meta.Logo),
 	}, nil
 }
 
@@ -189,7 +190,7 @@ func normalizePosterURL(posterURL string) string {
 	return posterURL
 }
 
-// fetchPoster downloads the film poster for the given Stremio content type and
+// fetchPoster downloads the film logo for the given Stremio content type and
 // id to destPath. It uses the provided HTTP client with a short timeout so it
 // never blocks the caller for long. Errors are swallowed; the caller should
 // simply check whether the file was created.
@@ -198,11 +199,11 @@ func fetchPoster(ctx context.Context, client *http.Client, contentType, contentI
 	if err != nil {
 		return err
 	}
-	posterURL := metadata.PosterURL
-	if posterURL == "" {
-		return fmt.Errorf("cinemeta response has no poster")
+	logoURL := metadata.LogoURL
+	if logoURL == "" {
+		return fmt.Errorf("cinemeta response has no logo")
 	}
-	return downloadPoster(ctx, client, posterURL, destPath)
+	return downloadPoster(ctx, client, logoURL, destPath)
 }
 
 func downloadPoster(ctx context.Context, client *http.Client, posterURL, destPath string) error {
@@ -301,10 +302,10 @@ func (m *Muxer) prefetchPosterForContent(ctx context.Context, contentType, conte
 			log.Printf("mux: background Cinemeta metadata failed: %v", err)
 			return
 		}
-		if metadata.PosterURL == "" {
+		if metadata.LogoURL == "" {
 			return
 		}
-		if err := downloadPoster(prefetchCtx, m.httpClient, metadata.PosterURL, destPath); err != nil {
+		if err := downloadPoster(prefetchCtx, m.httpClient, metadata.LogoURL, destPath); err != nil {
 			log.Printf("mux: poster prefetch failed: %v", err)
 			return
 		}

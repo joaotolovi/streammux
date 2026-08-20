@@ -555,9 +555,7 @@ func tail(s string, n int) string {
 }
 
 // buildImagePlaceholderArgs encodes the local placeholder video composed with
-// a static poster image. The poster is preloaded and its slide-in is controlled
-// through the named overlay filters and ZMQ. It has rounded corners and a subtle
-// gray border. The output is an HLS live
+// a preloaded transparent logo that fades in at five seconds. The output is an HLS live
 // window identical to buildPlaceholderArgs, so the film handoff is unchanged.
 func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool) []string {
 	return buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir, realtime, 0, "")
@@ -571,36 +569,25 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	const (
 		startT       = 5.0
 		duration     = 0.8
-		posterW      = 256 // 320 * 0.8
-		posterH      = 384 // 480 * 0.8
+		logoW        = 360
+		logoH        = 180
 	)
 
 	spinnerPath := findAsset(path, "loading_spinner.gif")
 	useSpinner := realtime && assetExists(spinnerPath)
 	baseVideo := "[basevideo]"
 	filterPrefix := "color=c=black:s=1280x720[base];[0:v]scale=1280:720[basevideo];"
-	spinnerInput := "[withborder]null[v]"
+	spinnerInput := "[withlogo]null[v]"
 	if useSpinner {
-		spinnerInput = "[4:v]scale=72:72,format=rgba[spinner];[withborder][spinner]overlay=x=1184:y=624:eof_action=repeat[v]"
+		spinnerInput = "[4:v]scale=72:72,format=rgba[spinner];[withlogo][spinner]overlay=x=1184:y=624:eof_action=repeat[v]"
 	}
 	filter := fmt.Sprintf(
 		filterPrefix+
-			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
-			"[2:v]scale=%d:%d[mask_scaled];"+
-			"[3:v]scale=%d:%d[border_scaled];"+
-			"[poster_raw][mask_scaled]alphamerge[rounded];"+
-			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
+			"[1:v]scale=%d:%d:force_original_aspect_ratio=decrease,format=rgba,fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[logo];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
-			"[shifted][poster]overlay@poster=x='%s':y='%s'[withposter];"+
-			"[withposter][border_scaled]overlay@poster_border=x='%s':y='%s'[withborder];"+
+			"[shifted][logo]overlay@logo=x='1028-w/2':y='280-h/2'[withlogo];"+
 			spinnerInput,
-		posterW, posterH,
-		posterW, posterH,
-		posterW, posterH,
-		startT, duration,
-		baseVideo,
-		posterXExpression(), posterYExpression(),
-		posterXExpression(), posterYExpression(),
+		logoW, logoH, startT, duration, baseVideo,
 	)
 	outputLabel := "v"
 	if cardPath != "" {
@@ -623,8 +610,6 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	args = append(args,
 		"-i", path,
 		"-loop", "1", "-i", imagePath,
-		"-loop", "1", "-i", findAsset(path, "poster_round_mask.png"),
-		"-loop", "1", "-i", findAsset(path, "poster_round_border.png"),
 	)
 	if useSpinner {
 		args = append(args, "-stream_loop", "-1", "-i", spinnerPath)

@@ -21,9 +21,9 @@ import (
 // ErrBeyondEnd reports a segment request past the end of the film.
 var ErrBeyondEnd = errors.New("segment beyond end of film")
 
-// posterFileName is the local filename of the cached poster image in a job's
+// posterFileName is the local filename of the cached Cinemeta logo image in a job's
 // cache directory. It is downloaded from Cinemeta while sources are collected.
-const posterFileName = "poster.jpg"
+const posterFileName = "logo.png"
 
 // playbackState is the per-job VOD timeline. The public HLS timeline is
 // static once the film is ready: segment n always maps to file seg_%05d.ts of
@@ -38,7 +38,7 @@ type playbackState struct {
 	cancel context.CancelFunc
 
 	cacheDir         string
-	posterPath       string // absolute path to poster.jpg, set by stateFor from Process's poster dir
+	posterPath       string // absolute path to logo.png, set by stateFor from Process's poster dir
 	posterDir        string // original poster cache, separate from the playback cache
 	cardPath         string
 	metadataCardPath string
@@ -363,7 +363,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	// composition after playback has already started.
 	posterPath := state.posterPath
 	state.mu.Lock()
-	posterExpected := state.metadata.PosterURL != ""
+	posterExpected := state.metadata.LogoURL != ""
 	state.mu.Unlock()
 	if posterExpected && posterPath != "" && !fileExists(posterPath) {
 		deadline := time.NewTimer(4 * time.Second)
