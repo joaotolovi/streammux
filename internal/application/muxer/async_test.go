@@ -2,11 +2,9 @@ package muxer
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -141,93 +139,5 @@ func TestProcessReturnsBeforeAddonPreparationAndUsesCinemetaIdentity(t *testing.
 		mux.CleanupJob(job)
 	} else {
 		t.Fatalf("unexpected mux URL: %q", result.Dubbed.URL)
-	}
-}
-
-type dynamicPlaceholderFake struct {
-	fakeMediaEngine
-	specs []ffmpeg.PlaceholderSpec
-}
-
-func (f *dynamicPlaceholderFake) StartPlaceholderSession(_ context.Context, spec ffmpeg.PlaceholderSpec) (*ffmpeg.Session, error) {
-	f.specs = append(f.specs, spec)
-	session := &ffmpeg.Session{}
-	session.InitDone()
-	go func() {
-		_ = os.MkdirAll(filepath.Join(spec.OutputDir, "video"), 0755)
-		_ = os.MkdirAll(filepath.Join(spec.OutputDir, "audio"), 0755)
-		var video, audio strings.Builder
-		video.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:4\n")
-		audio.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:4\n")
-		for i := spec.StartSegment; i < spec.StartSegment+4; i++ {
-			_ = os.WriteFile(filepath.Join(spec.OutputDir, "video", segmentName(i)), []byte("video"), 0644)
-			_ = os.WriteFile(filepath.Join(spec.OutputDir, "audio", segmentName(i)), []byte("audio"), 0644)
-			video.WriteString("#EXTINF:4,\n" + segmentName(i) + "\n")
-			audio.WriteString("#EXTINF:4,\n" + segmentName(i) + "\n")
-		}
-		_ = os.WriteFile(filepath.Join(spec.OutputDir, "video", "video.m3u8"), []byte(video.String()), 0644)
-		_ = os.WriteFile(filepath.Join(spec.OutputDir, "audio", "audio.m3u8"), []byte(audio.String()), 0644)
-	}()
-	return session, nil
-}
-
-func segmentName(segment int) string {
-	return fmt.Sprintf("seg_%05d.ts", segment)
-}
-
-func TestLatePosterReplacementStartsAtNextPublicSegment(t *testing.T) {
-	engine := &dynamicPlaceholderFake{}
-	mux := &Muxer{ffmpeg: engine, policy: defaultPolicy(), states: make(map[string]*playbackState)}
-	mux.policy.TierSwitchBuffer = 0
-	job := &model.MuxJob{ID: "poster-job"}
-	oldDir := t.TempDir()
-	for _, media := range []string{"video", "audio"} {
-		_ = os.MkdirAll(filepath.Join(oldDir, media), 0755)
-	}
-	var playlist strings.Builder
-	playlist.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:4\n")
-	for i := 0; i < 3; i++ {
-		name := segmentName(i)
-		_ = os.WriteFile(filepath.Join(oldDir, "video", name), []byte("v"), 0644)
-		_ = os.WriteFile(filepath.Join(oldDir, "audio", name), []byte("a"), 0644)
-		playlist.WriteString("#EXTINF:4,\n" + name + "\n")
-	}
-	_ = os.WriteFile(filepath.Join(oldDir, "video", "video.m3u8"), []byte(playlist.String()), 0644)
-	_ = os.WriteFile(filepath.Join(oldDir, "audio", "audio.m3u8"), []byte(playlist.String()), 0644)
-	oldSession := &ffmpeg.Session{}
-	oldSession.InitDone()
-	posterPath := filepath.Join(t.TempDir(), "poster.jpg")
-	_ = os.WriteFile(posterPath, []byte("poster"), 0644)
-	old := &generation{dir: oldDir, session: oldSession, startSegment: 0, isLocal: true}
-	state := &playbackState{ctx: context.Background(), cacheDir: t.TempDir(), placeholder: old, all: []*generation{old}, posterPath: posterPath, tierMetas: placeholderTierMetas()}
-	mux.states[job.ID] = state
-
-	mux.swapPlaceholder(job, state, old)
-	deadline := time.After(time.Second)
-	for {
-		state.mu.Lock()
-		newGen := state.placeholder
-		disc := state.placeholderDiscAt
-		hasDisc := state.placeholderHasDisc
-		state.mu.Unlock()
-		if newGen != old {
-			if len(engine.specs) != 1 || engine.specs[0].StartSegment != 3 || engine.specs[0].ImagePath != posterPath {
-				t.Fatalf("unexpected late poster spec: %#v", engine.specs)
-			}
-			if !hasDisc || disc != 3 {
-				t.Fatalf("placeholder discontinuity = (%v, %d), want (true, 3)", hasDisc, disc)
-			}
-			data, ok := mux.renderMediaPlaylist(job, 0)
-			if !ok || !strings.Contains(string(data), "#EXT-X-DISCONTINUITY\n#EXTINF:4,\nseg_00003.ts") {
-				t.Fatalf("replacement playlist missing cutover discontinuity: %s", data)
-			}
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatal("late poster replacement did not complete")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
 	}
 }

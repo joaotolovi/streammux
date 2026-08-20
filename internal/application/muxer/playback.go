@@ -59,7 +59,6 @@ type playbackState struct {
 	placeholderWait    chan struct{}
 	placeholderDiscAt  int
 	placeholderHasDisc bool
-	placeholderSwap    bool
 
 	// filmBase is the public segment index where film content 0:00 lives
 	// (nonzero when a placeholder played first). While >= 0 the placeholder
@@ -490,8 +489,7 @@ func (m *Muxer) startPlaceholderSession(ctx context.Context, spec ffmpeg.Placeho
 	}
 	if spec.StartSegment != 0 || spec.CardPath != "" {
 		// The legacy methods do not expose a card or a non-zero start. They are
-		// still valid for old test engines and initial playback, but cannot
-		// safely perform the late replacement.
+		// still valid for old test engines and initial playback.
 		if spec.StartSegment != 0 {
 			return nil, fmt.Errorf("placeholder engine does not support non-zero segment starts")
 		}
@@ -500,113 +498,6 @@ func (m *Muxer) startPlaceholderSession(ctx context.Context, spec ffmpeg.Placeho
 		return m.ffmpeg.StartImagePlaceholderSession(ctx, spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime)
 	}
 	return m.ffmpeg.StartSinglePlaceholderSession(ctx, spec.VideoPath, spec.OutputDir, spec.Realtime)
-}
-
-func (m *Muxer) watchPoster(job *model.MuxJob, state *playbackState, old *generation) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if fileExists(state.posterPath) {
-			m.swapPlaceholder(job, state, old)
-			return
-		}
-		select {
-		case <-state.ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
-func (m *Muxer) swapPlaceholder(job *model.MuxJob, state *playbackState, old *generation) {
-	engine, ok := m.ffmpeg.(dynamicPlaceholderEngine)
-	if !ok {
-		return
-	}
-
-	state.mu.Lock()
-	if state.closed || state.active != nil || state.placeholder != old || state.placeholderSwap {
-		state.mu.Unlock()
-		return
-	}
-	base := lastCommonSegment(old) + 1
-	if base <= old.startSegment {
-		state.mu.Unlock()
-		return
-	}
-	state.placeholderSwap = true
-	state.nextGeneration++
-	generationID := state.nextGeneration
-	state.mu.Unlock()
-
-	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-	session, err := engine.StartPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-		VideoPath: m.placeholderPath, ImagePath: state.posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
-		OutputDir: dir, Realtime: true, StartSegment: base,
-	})
-	if err != nil {
-		state.mu.Lock()
-		state.placeholderSwap = false
-		state.mu.Unlock()
-		log.Printf("mux: late poster placeholder failed: %v", err)
-		return
-	}
-
-	gen := &generation{id: generationID, dir: dir, session: session, startSegment: base, startedAt: time.Now(), isLocal: true}
-	segDur := ffmpeg.SegDuration()
-	if segDur <= 0 {
-		segDur = 4
-	}
-	needed := int(math.Ceil(m.policy.TierSwitchBuffer.Seconds() / segDur))
-	if needed < 1 {
-		needed = 1
-	}
-	deadline := time.NewTimer(10 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(75 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		common := lastCommonSegment(gen)
-		if common >= base+needed && fileExists(generationVideoPlaylistPath(gen)) && fileExists(generationAudioPlaylistPath(gen)) {
-			break
-		}
-		select {
-		case <-state.ctx.Done():
-			session.Cancel()
-			return
-		case <-session.Done():
-			state.mu.Lock()
-			state.placeholderSwap = false
-			state.mu.Unlock()
-			return
-		case <-deadline.C:
-			session.Cancel()
-			state.mu.Lock()
-			state.placeholderSwap = false
-			state.mu.Unlock()
-			log.Printf("mux: late poster placeholder timed out before buffer")
-			return
-		case <-ticker.C:
-		}
-	}
-
-	state.mu.Lock()
-	if state.closed || state.active != nil || state.placeholder != old {
-		state.placeholderSwap = false
-		state.mu.Unlock()
-		session.Cancel()
-		return
-	}
-	state.placeholder = gen
-	state.retiredPlaceholder = old
-	state.placeholderHasDisc = true
-	state.placeholderDiscAt = base
-	state.placeholderSwap = false
-	state.all = append(state.all, gen)
-	state.mu.Unlock()
-	old.session.Cancel()
-	log.Printf("mux: placeholder poster switched at segment %d", base)
-	_ = job
 }
 
 // runStartup walks the composer's source compositions until one launches.
