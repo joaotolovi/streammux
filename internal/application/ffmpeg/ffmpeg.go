@@ -575,7 +575,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	filterPrefix := "color=c=black:s=1280x720[base];[0:v]scale=1280:720[basevideo];"
 	spinnerInput := "[withlogo]null[v]"
 	if useSpinner {
-		spinnerInput = "[4:v]scale=72:72,format=rgba[spinner];[withlogo][spinner]overlay=x=1184:y=624:eof_action=repeat[v]"
+		spinnerInput = "[2:v]scale=72:72,format=rgba[spinner];[withlogo][spinner]overlay=x=1184:y=624:eof_action=repeat[v]"
 	}
 	filter := fmt.Sprintf(
 		filterPrefix+
