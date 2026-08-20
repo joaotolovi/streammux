@@ -97,14 +97,15 @@ type AudioSessionSpec struct {
 // watched by drawtext with reload=1 so metadata can change without restarting
 // the session.
 type PlaceholderSpec struct {
-	VideoPath    string
-	ImagePath    string
-	CardPath     string
-	MetadataPath string
-	DetailsPath  string
-	OutputDir    string
-	Realtime     bool
-	StartSegment int
+	VideoPath      string
+	ImagePath      string // current transparent Cinemeta logo
+	BackgroundPath string // Cinemeta poster behind the opening video
+	CardPath       string
+	MetadataPath   string
+	DetailsPath    string
+	OutputDir      string
+	Realtime       bool
+	StartSegment   int
 }
 
 // Session is a single continuous FFmpeg run that produces HLS segments.
@@ -550,41 +551,51 @@ func tail(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-// buildImagePlaceholderArgs encodes the local placeholder video composed with
-// a preloaded transparent logo that fades in at five seconds. The output is an HLS live
-// window identical to buildPlaceholderArgs, so the film handoff is unchanged.
+// buildImagePlaceholderArgs encodes the local placeholder with a preloaded
+// transparent logo behind it. At five seconds the opening video becomes partly
+// transparent so the logo is revealed without changing the running session.
 func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool) []string {
 	return buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir, realtime, 0, "")
 }
 
 func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath string) []string {
-	return buildImagePlaceholderArgsWithCards(path, imagePath, outputDir, realtime, startSegment, cardPath, "", "", "")
+	return buildImagePlaceholderArgsWithBackground(path, imagePath, imagePath, outputDir, realtime, startSegment, cardPath, "", "")
 }
 
 func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, _ string) []string {
+	return buildImagePlaceholderArgsWithBackground(path, imagePath, imagePath, outputDir, realtime, startSegment, cardPath, metadataPath, detailsPath)
+}
+
+func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath string) []string {
 	const (
-		startT       = 5.0
-		duration     = 0.8
-		logoW        = 360
-		logoH        = 180
+		startT   = 5.0
+		duration = 0.8
+		logoW    = 360
+		logoH    = 180
 	)
 
 	spinnerPath := findAsset(path, "loading_spinner.gif")
 	useSpinner := realtime && assetExists(spinnerPath)
-	baseVideo := "[basevideo]"
-	filterPrefix := "color=c=black:s=1280x720[base];[0:v]scale=1280:720[basevideo];"
+	filterPrefix := "color=c=black:s=1280x720[base];[0:v]scale=1280:720,format=rgba[basevideo];"
+	logoInput := 1
+	backgroundFilter := "[base][logo]overlay@logo=x='1028-w/2':y='280-h/2'[composed];"
+	inputArgs := []string{"-i", path}
+	if backgroundPath != "" {
+		inputArgs = append(inputArgs, "-loop", "1", "-i", backgroundPath)
+		logoInput = 2
+		backgroundFilter = "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=rgba,colorchannelmixer=aa=0.55[poster];[base][poster]overlay=x=0:y=0[background];[background][logo]overlay@logo=x='1028-w/2':y='280-h/2'[composed];"
+	}
+	inputArgs = append(inputArgs, "-loop", "1", "-i", imagePath)
 	spinnerInput := "[withlogo]null[v]"
 	if useSpinner {
-		spinnerInput = "[2:v]scale=72:72,format=rgba[spinner];[withlogo][spinner]overlay=x=1184:y=624:eof_action=repeat[v]"
+		spinnerInput = fmt.Sprintf("[%d:v]scale=72:72,format=rgba[spinner];[withlogo][spinner]overlay=x=1184:y=624:eof_action=repeat[v]", logoInput+1)
 	}
-	filter := fmt.Sprintf(
-		filterPrefix+
-			"[1:v]scale=%d:%d:force_original_aspect_ratio=decrease,format=rgba,fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[logo];"+
-			"[base]%soverlay=x=0:y=0[shifted];"+
-			"[shifted][logo]overlay@logo=x='1028-w/2':y='280-h/2'[withlogo];"+
-			spinnerInput,
-		logoW, logoH, startT, duration, baseVideo,
-	)
+	filter := filterPrefix +
+		fmt.Sprintf("[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,format=rgba,fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[logo];", logoInput, logoW, logoH, startT, duration) +
+		backgroundFilter +
+		"[basevideo]colorchannelmixer=aa='if(lt(t,5),1,if(lt(t,5.8),1-(t-5)*0.35/0.8,0.65))'[opening];" +
+		"[composed][opening]overlay=x=0:y=0[withlogo];" +
+		spinnerInput
 	outputLabel := "v"
 	if cardPath != "" {
 		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath) + "[card]"
@@ -603,10 +614,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	if realtime {
 		args = append(args, "-readrate", "1", "-readrate_initial_burst", fmtDuration(segDuration))
 	}
-	args = append(args,
-		"-i", path,
-		"-loop", "1", "-i", imagePath,
-	)
+	args = append(args, inputArgs...)
 	if useSpinner {
 		args = append(args, "-stream_loop", "-1", "-i", spinnerPath)
 	}
@@ -802,7 +810,7 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 	}
 	var args []string
 	if spec.ImagePath != "" {
-		args = buildImagePlaceholderArgsWithCards(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, "")
+		args = buildImagePlaceholderArgsWithBackground(spec.VideoPath, spec.ImagePath, spec.BackgroundPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath)
 	} else {
 		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, "")
 	}
@@ -819,11 +827,11 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 	}
 
 	s := &Session{
-		cancel:           cancel,
-		done:             make(chan struct{}),
-		progress:         make(chan ProgressSample, 1),
-		startN:           spec.StartSegment,
-		stderrTail:       stderr,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		progress:   make(chan ProgressSample, 1),
+		startN:     spec.StartSegment,
+		stderrTail: stderr,
 	}
 
 	if err := cmd.Start(); err != nil {

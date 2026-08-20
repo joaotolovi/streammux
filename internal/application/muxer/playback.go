@@ -39,6 +39,7 @@ type playbackState struct {
 
 	cacheDir         string
 	posterPath       string // absolute path to logo.png, set by stateFor from Process's poster dir
+	backgroundPath   string // Cinemeta poster used behind the opening video
 	posterDir        string // original poster cache, separate from the playback cache
 	cardPath         string
 	metadataCardPath string
@@ -366,12 +367,14 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	posterPath := state.posterPath
 	state.mu.Lock()
 	posterExpected := state.metadata.LogoURL != ""
+	backgroundExpected := state.metadata.PosterURL != ""
+	cachedBackgroundPath := state.backgroundPath
 	state.mu.Unlock()
-	if posterExpected && posterPath != "" && !fileExists(posterPath) {
+	if (posterExpected && posterPath != "" && !fileExists(posterPath)) || (backgroundExpected && cachedBackgroundPath != "" && !fileExists(cachedBackgroundPath)) {
 		deadline := time.NewTimer(4 * time.Second)
 		ticker := time.NewTicker(50 * time.Millisecond)
 	waitPoster:
-		for !fileExists(posterPath) {
+		for (posterExpected && !fileExists(posterPath)) || (backgroundExpected && !fileExists(cachedBackgroundPath)) {
 			select {
 			case <-state.ctx.Done():
 				break waitPoster
@@ -385,13 +388,17 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		deadline.Stop()
 	}
 	usePoster := posterPath != "" && fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
+	backgroundPath := ""
+	if cachedBackgroundPath != "" && fileExists(cachedBackgroundPath) {
+		backgroundPath = cachedBackgroundPath
+	}
 
 	var session *ffmpeg.Session
 	var err error
 	if usePoster {
 		log.Printf("mux: starting opening video with poster %s", posterPath)
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-			VideoPath: m.placeholderPath, ImagePath: posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
+			VideoPath: m.placeholderPath, ImagePath: posterPath, BackgroundPath: backgroundPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
 			OutputDir: dir, Realtime: true,
 		})
 		if err != nil {

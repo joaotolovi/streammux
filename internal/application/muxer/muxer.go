@@ -424,6 +424,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 
 	state.mu.Lock()
 	state.metadata = metadata
+	state.backgroundPath = filepath.Join(state.cacheDir, "placeholder-background.jpg")
 	state.cardPath = filepath.Join(state.cacheDir, "placeholder-card.txt")
 	state.metadataCardPath = filepath.Join(state.cacheDir, "placeholder-metadata.txt")
 	state.detailsCardPath = filepath.Join(state.cacheDir, "placeholder-details.txt")
@@ -443,10 +444,14 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 
 	if metadata.LogoURL != "" && state.posterPath != "" {
 		m.prefetchPosterURL(state.ctx, metadata.LogoURL, state.posterPath)
-	} else if state.posterPath != "" && contentType != "" && contentID != "" {
+	}
+	if metadata.PosterURL != "" && state.backgroundPath != "" {
+		m.prefetchPosterURL(state.ctx, metadata.PosterURL, state.backgroundPath)
+	}
+	if metadata.LogoURL == "" || metadata.PosterURL == "" {
 		// If the short synchronous metadata budget expired, make one best-effort
 		// background attempt so the poster can still arrive during playback.
-		m.prefetchPosterForContent(state.ctx, contentType, contentID, state.posterPath)
+		m.prefetchImagesForContent(state.ctx, contentType, contentID, state.posterPath, state.backgroundPath)
 	}
 	go m.prepareJob(job, state, addons, cfg.Language)
 

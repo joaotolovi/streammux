@@ -23,8 +23,8 @@ func TestBuildImagePlaceholderArgsContainsExpectedInputsAndFilter(t *testing.T) 
 	if !strings.Contains(joined, "filter_complex") {
 		t.Error("missing filter_complex flag")
 	}
-	if !strings.Contains(joined, "alphamerge") {
-		t.Error("missing alphamerge filter for rounded corners")
+	if !strings.Contains(joined, "colorchannelmixer=aa=") {
+		t.Error("missing video opacity animation")
 	}
 	if !strings.Contains(joined, "overlay") {
 		t.Error("missing overlay filters")

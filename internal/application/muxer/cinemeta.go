@@ -45,6 +45,7 @@ type contentMetadata struct {
 	Year        string
 	Rating      string
 	LogoURL     string
+	PosterURL   string
 }
 
 func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string, languages ...string) (contentMetadata, error) {
@@ -124,6 +125,7 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		Year:        firstReleaseYear(meta.Meta.ReleaseInfo),
 		Rating:      rating,
 		LogoURL:     normalizePosterURL(meta.Meta.Logo),
+		PosterURL:   normalizePosterURL(meta.Meta.Poster),
 	}, nil
 }
 
@@ -292,6 +294,10 @@ func (m *Muxer) prefetchPosterURL(ctx context.Context, posterURL, destPath strin
 }
 
 func (m *Muxer) prefetchPosterForContent(ctx context.Context, contentType, contentID, destPath string) chan struct{} {
+	return m.prefetchImagesForContent(ctx, contentType, contentID, destPath, "")
+}
+
+func (m *Muxer) prefetchImagesForContent(ctx context.Context, contentType, contentID, logoPath, backgroundPath string) chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -302,14 +308,17 @@ func (m *Muxer) prefetchPosterForContent(ctx context.Context, contentType, conte
 			log.Printf("mux: background Cinemeta metadata failed: %v", err)
 			return
 		}
-		if metadata.LogoURL == "" {
-			return
+		if logoPath != "" && metadata.LogoURL != "" {
+			if err := downloadPoster(prefetchCtx, m.httpClient, metadata.LogoURL, logoPath); err != nil {
+				log.Printf("mux: logo prefetch failed: %v", err)
+			}
 		}
-		if err := downloadPoster(prefetchCtx, m.httpClient, metadata.LogoURL, destPath); err != nil {
-			log.Printf("mux: poster prefetch failed: %v", err)
-			return
+		if backgroundPath != "" && metadata.PosterURL != "" {
+			if err := downloadPoster(prefetchCtx, m.httpClient, metadata.PosterURL, backgroundPath); err != nil {
+				log.Printf("mux: background poster prefetch failed: %v", err)
+			}
 		}
-		log.Printf("mux: poster prefetch ok -> %s", destPath)
+		log.Printf("mux: image prefetch completed")
 	}()
 	return done
 }
