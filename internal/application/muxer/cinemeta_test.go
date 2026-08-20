@@ -101,7 +101,9 @@ func TestFetchPosterStripsEpisodeSuffixForSeries(t *testing.T) {
 }
 
 func TestFetchCinemetaMetadataExtractsPresentationFields(t *testing.T) {
+	var receivedLanguage string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedLanguage = r.URL.Query().Get("language")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"meta":{"name":"Oppenheimer","releaseInfo":"2023-2024","imdbRating":8.6,"videos":[{"season":1,"episode":1,"name":"Pilot"}]}}`))
 	}))
@@ -111,19 +113,22 @@ func TestFetchCinemetaMetadataExtractsPresentationFields(t *testing.T) {
 	cinemetaBaseURL = server.URL
 	defer func() { cinemetaBaseURL = oldBase }()
 
-	metadata, err := fetchCinemetaMetadata(context.Background(), server.Client(), "movie", "tt123")
+	metadata, err := fetchCinemetaMetadata(context.Background(), server.Client(), "movie", "tt123", "Portuguese (Brazil)")
 	if err != nil {
 		t.Fatalf("fetchCinemetaMetadata() error = %v", err)
 	}
 	if metadata.Title != "Oppenheimer" || metadata.Year != "2023" || metadata.Rating != "8.6" {
 		t.Fatalf("unexpected metadata: %#v", metadata)
 	}
+	if receivedLanguage != "pt-BR" {
+		t.Fatalf("language query = %q, want pt-BR", receivedLanguage)
+	}
 
 	metadata, err = fetchCinemetaMetadata(context.Background(), server.Client(), "series", "tt123:1:1")
 	if err != nil {
 		t.Fatalf("series metadata error = %v", err)
 	}
-	if metadata.Title != "Pilot" {
+	if metadata.Title != "Pilot" || metadata.SeriesTitle != "Oppenheimer" || metadata.Season != 1 || metadata.Episode != 1 {
 		t.Fatalf("episode title = %q, want Pilot", metadata.Title)
 	}
 }

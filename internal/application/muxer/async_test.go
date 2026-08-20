@@ -99,10 +99,10 @@ func TestProcessReturnsBeforeAddonPreparationAndUsesCinemetaIdentity(t *testing.
 	if result.Dubbed == nil {
 		t.Fatal("Process returned no stream")
 	}
-	if result.Dubbed.Name != "🎬 Oppenheimer • StreamMux MultiAudio" {
+	if result.Dubbed.Name != "▶ Oppenheimer • StreamMux MultiAudio" {
 		t.Fatalf("stream name = %q", result.Dubbed.Name)
 	}
-	if !strings.Contains(result.Dubbed.Description, "2023 • ⭐ 8.6") || !strings.Contains(result.Dubbed.Description, "qualidade máxima") {
+	if !strings.Contains(result.Dubbed.Description, "2023 • ★ 8.6") || !strings.Contains(result.Dubbed.Description, "qualidade máxima") {
 		t.Fatalf("unexpected stream description: %q", result.Dubbed.Description)
 	}
 

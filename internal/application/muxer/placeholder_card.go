@@ -14,11 +14,11 @@ import (
 // returned anything. Once plans arrive, it adds the best-known source and
 // audio facts without pretending that an unprobed stream is guaranteed.
 func renderPlaceholderCard(metadata contentMetadata, plans []model.PlaybackPlan, language string) string {
-	title := metadata.Title
-	if title == "" {
-		title = "StreamMux MultiAudio"
-	}
+	title := contentDisplayTitle(metadata)
 	lines := []string{"▶ " + title}
+	if metadata.SeriesTitle != "" && metadata.Title != "" && metadata.Title != metadata.SeriesTitle {
+		lines = append(lines, metadata.Title)
+	}
 	var identity []string
 	if metadata.Year != "" {
 		identity = append(identity, metadata.Year)
@@ -78,6 +78,16 @@ func renderPlaceholderCard(metadata contentMetadata, plans []model.PlaybackPlan,
 	return strings.Join(lines, "\n")
 }
 
+func contentDisplayTitle(metadata contentMetadata) string {
+	if metadata.SeriesTitle != "" && metadata.Season > 0 && metadata.Episode > 0 {
+		return fmt.Sprintf("%s S%02dE%d", metadata.SeriesTitle, metadata.Season, metadata.Episode)
+	}
+	if metadata.Title != "" {
+		return metadata.Title
+	}
+	return "StreamMux MultiAudio"
+}
+
 func uniqueCardFacts(facts []string) []string {
 	seen := make(map[string]struct{}, len(facts))
 	out := make([]string, 0, len(facts))
@@ -132,7 +142,8 @@ func writePlaceholderCard(path, contents string) error {
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	if _, err := tmp.WriteString(contents + "\n"); err != nil {
+	contents = strings.TrimRight(strings.ReplaceAll(contents, "\r", ""), "\n")
+	if _, err := tmp.WriteString(contents); err != nil {
 		_ = tmp.Close()
 		return err
 	}

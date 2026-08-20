@@ -415,7 +415,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	// slow Cinemeta response must not make autoplay feel like it is waiting for
 	// the old synchronous pipeline.
 	metadataCtx, metadataCancel := context.WithTimeout(ctx, 750*time.Millisecond)
-	if fetched, fetchErr := fetchCinemetaMetadata(metadataCtx, m.httpClient, contentType, contentID); fetchErr == nil {
+	if fetched, fetchErr := fetchCinemetaMetadata(metadataCtx, m.httpClient, contentType, contentID, cfg.Language); fetchErr == nil {
 		metadata = fetched
 	} else {
 		log.Printf("mux: Cinemeta metadata unavailable: %v", fetchErr)
@@ -428,7 +428,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	state.preparationWait = make(chan struct{})
 	state.tierMetas = append([]model.TierMeta(nil), job.TierMetas...)
 	state.mu.Unlock()
-	job.Title = metadata.Title
+	job.Title = contentDisplayTitle(metadata)
 	if err := writePlaceholderCard(state.cardPath, renderPlaceholderCard(metadata, nil, cfg.Language)); err != nil {
 		log.Printf("mux: cannot initialize placeholder card: %v", err)
 	}
@@ -454,9 +454,9 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 }
 
 func streamPresentation(metadata contentMetadata) (string, string) {
-	name := "🎬 StreamMux MultiAudio"
-	if metadata.Title != "" {
-		name = fmt.Sprintf("🎬 %s • StreamMux MultiAudio", metadata.Title)
+	name := "▶ StreamMux MultiAudio"
+	if title := contentDisplayTitle(metadata); title != "StreamMux MultiAudio" {
+		name = fmt.Sprintf("▶ %s • StreamMux MultiAudio", title)
 	}
 
 	var facts []string
@@ -464,7 +464,7 @@ func streamPresentation(metadata contentMetadata) (string, string) {
 		facts = append(facts, metadata.Year)
 	}
 	if metadata.Rating != "" {
-		facts = append(facts, "⭐ "+metadata.Rating)
+		facts = append(facts, "★ "+metadata.Rating)
 	}
 	lines := make([]string, 0, 2)
 	if len(facts) > 0 {

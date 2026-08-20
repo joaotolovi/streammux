@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,13 +37,16 @@ type cinemetaMeta struct {
 }
 
 type contentMetadata struct {
-	Title     string
-	Year      string
-	Rating    string
-	PosterURL string
+	Title       string
+	SeriesTitle string
+	Season      int
+	Episode     int
+	Year        string
+	Rating      string
+	PosterURL   string
 }
 
-func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string) (contentMetadata, error) {
+func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string, languages ...string) (contentMetadata, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -63,14 +67,22 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		}
 	}
 
-	url := fmt.Sprintf("%s/meta/%s/%s.json", strings.TrimSuffix(cinemetaBaseURL, "/"), contentType, cinemetaID)
+	metadataURL := fmt.Sprintf("%s/meta/%s/%s.json", strings.TrimSuffix(cinemetaBaseURL, "/"), contentType, cinemetaID)
+	if len(languages) > 0 {
+		if language := cinemetaLanguageCode(languages[0]); language != "" {
+			metadataURL += "?language=" + url.QueryEscape(language)
+		}
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, cinemetaMetadataTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, metadataURL, nil)
 	if err != nil {
 		return contentMetadata{}, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if len(languages) > 0 {
+		req.Header.Set("Accept-Language", cinemetaAcceptLanguage(languages[0]))
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return contentMetadata{}, err
@@ -85,7 +97,8 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		return contentMetadata{}, err
 	}
 
-	title := strings.TrimSpace(meta.Meta.Name)
+	seriesTitle := strings.TrimSpace(meta.Meta.Name)
+	title := seriesTitle
 	if season > 0 && episode > 0 {
 		for _, video := range meta.Meta.Videos {
 			if video.Season == season && video.Episode == episode {
@@ -103,11 +116,53 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		rating = ""
 	}
 	return contentMetadata{
-		Title:     title,
-		Year:      firstReleaseYear(meta.Meta.ReleaseInfo),
-		Rating:    rating,
-		PosterURL: normalizePosterURL(meta.Meta.Poster),
+		Title:       title,
+		SeriesTitle: seriesTitle,
+		Season:      season,
+		Episode:     episode,
+		Year:        firstReleaseYear(meta.Meta.ReleaseInfo),
+		Rating:      rating,
+		PosterURL:   normalizePosterURL(meta.Meta.Poster),
 	}, nil
+}
+
+func cinemetaAcceptLanguage(language string) string {
+	code := cinemetaLanguageCode(language)
+	if code == "" {
+		return "en"
+	}
+	return code + ",en;q=0.8"
+}
+
+func cinemetaLanguageCode(language string) string {
+	switch strings.ToLower(strings.TrimSpace(language)) {
+	case "portuguese (brazil)", "portuguese brazil", "pt-br", "pt_br":
+		return "pt-BR"
+	case "portuguese", "pt":
+		return "pt"
+	case "english", "en":
+		return "en"
+	case "spanish", "es":
+		return "es"
+	case "french", "fr":
+		return "fr"
+	case "german", "de":
+		return "de"
+	case "italian", "it":
+		return "it"
+	case "russian", "ru":
+		return "ru"
+	case "japanese", "ja":
+		return "ja"
+	case "korean", "ko":
+		return "ko"
+	default:
+		language = strings.TrimSpace(language)
+		if len(language) == 2 || (len(language) == 5 && language[2] == '-') {
+			return language
+		}
+		return ""
+	}
 }
 
 func firstReleaseYear(releaseInfo string) string {
