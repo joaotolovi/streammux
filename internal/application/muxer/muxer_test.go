@@ -329,6 +329,32 @@ func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
 	}
 }
 
+func TestRenderMediaPlaylistAfterPlaceholderResume(t *testing.T) {
+	state := &playbackState{
+		duration:        28,
+		filmBase:        2,
+		resumeStart:     5,
+		discontinuities: []int{5},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+
+	data, ok := mux.VideoPlaylist(job, 0)
+	if !ok {
+		t.Fatal("VideoPlaylist() returned false")
+	}
+	playlist := string(data)
+	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:5\n") {
+		t.Fatalf("playlist must start at the resumed segment: %s", playlist)
+	}
+	if strings.Contains(playlist, "seg_00002.ts") || strings.Contains(playlist, "seg_00004.ts") {
+		t.Fatalf("playlist must not advertise skipped film segments: %s", playlist)
+	}
+	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n") || !strings.Contains(playlist, "seg_00005.ts") {
+		t.Fatalf("playlist missing resumed handoff: %s", playlist)
+	}
+}
+
 func TestRenderMediaPlaylistErrorTailTruncatesFilm(t *testing.T) {
 	// Mid-playback failure at segment 4: film [0..4) + error [4..4+8).
 	state := &playbackState{

@@ -65,6 +65,7 @@ type playbackState struct {
 	// live window is frozen at [..filmBase-1] so the media sequence can only
 	// move forward across the handoff (players reject sequence regression).
 	filmBase        int
+	resumeStart     int // requested film segment to generate after the intro
 	placeholderLive bool
 	discontinuities []int
 
@@ -190,6 +191,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		posterPath:        posterPath,
 		posterDir:         posterDir,
 		placeholderDiscAt: -1,
+		resumeStart:       -1,
 		tierMetas:         tierMetas,
 		lastRequested:     -1,
 		maxRequested:      -1,
@@ -601,9 +603,20 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 			state.placeholderLive = false
 		}
 		state.filmBase = base
+		resumeStart := -1
+		if state.resumeStart > base {
+			resumeStart = state.resumeStart
+		}
 		state.mu.Unlock()
 
-		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, base, 0, m.policy.MinHandoffBuffer)
+		startSegment := base
+		startTime := 0.0
+		if resumeStart >= 0 {
+			startSegment = resumeStart
+			startTime = float64(resumeStart-base) * ffmpeg.SegDuration()
+			log.Printf("mux: resuming after placeholder at segment %d (%.0fs)", startSegment, startTime)
+		}
+		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, startSegment, startTime, m.policy.MinHandoffBuffer)
 		if err == nil {
 			winner = gen
 			break
@@ -653,6 +666,9 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.maxRequested = -1
 	if state.filmBase > 0 {
 		state.discontinuities = append(state.discontinuities, state.filmBase)
+	}
+	if state.resumeStart > state.filmBase {
+		state.discontinuities = append(state.discontinuities, state.resumeStart)
 	}
 	base := state.filmBase
 	wait := state.startWait
@@ -1589,6 +1605,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		placeholderDiscAt = state.placeholderDiscAt
 	}
 	duration := state.duration
+	resumeStart := state.resumeStart
 	disc := append([]int(nil), state.discontinuities...)
 	if tier > 0 && tier < tierCount {
 		disc = append(disc, state.tierDisc[tier]...)
@@ -1632,7 +1649,13 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		// Film timeline (possibly truncated by the error tail).
 		segs := computeEqualLengthSegments(segDur, duration)
 		first := base
+		if resumeStart > first {
+			first = resumeStart
+		}
 		last := len(segs) - 1
+		if first > last {
+			first = last + 1
+		}
 		if errGen != nil && errStart <= last {
 			last = errStart - 1
 		}
@@ -2144,7 +2167,20 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		state.mu.Unlock()
 
 		if placeholderActive {
-			// Film is preparing behind the placeholder; just wait.
+			// A resumed player can request its old film segment before the
+			// placeholder has handed off. Remember that target, but keep serving
+			// the local intro until the source is ready.
+			state.mu.Lock()
+			placeholder := state.placeholder
+			if placeholder != nil {
+				highest := highestCompleteSegment(placeholder.dir)
+				if segment > highest+8 && segment > state.resumeStart {
+					state.resumeStart = segment
+					log.Printf("mux: deferred resume request at segment %d while placeholder is active", segment)
+				}
+			}
+			state.mu.Unlock()
+
 			select {
 			case <-deadlineCtx.Done():
 				return "", fmt.Errorf("timeout waiting for placeholder segment %d: %w", segment, deadlineCtx.Err())
