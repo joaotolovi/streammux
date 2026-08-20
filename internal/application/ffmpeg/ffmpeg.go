@@ -587,10 +587,9 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		filterPrefix+
 			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
 			"[2:v]scale=%d:%d[mask_scaled];"+
-			"[3:v]scale=%d:%d[border_base];"+
-			"[border_base]scale=w='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame,crop=%d:%d:x='(iw-%d)/2':y='(ih-%d)/2'[border_scaled];"+
+			"[3:v]scale=%d:%d[border_scaled];"+
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
-			"[rounded]scale=w='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame,crop=%d:%d:x='(iw-%d)/2':y='(ih-%d)/2',fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
+			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
 			"[shifted][poster]overlay@poster=x='%s':y='%s'[withposter];"+
 			"[withposter][border_scaled]overlay@poster_border=x='%s':y='%s'[withborder];"+
@@ -598,8 +597,6 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		posterW, posterH,
 		posterW, posterH,
 		posterW, posterH,
-		posterW, posterH, posterW, posterH, posterW, posterH,
-		posterW, posterH, posterW, posterH, posterW, posterH,
 		startT, duration,
 		baseVideo,
 		posterXExpression(), posterYExpression(),
@@ -611,10 +608,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		outputLabel = "card"
 	}
 
-	preset := "veryfast"
-	if !realtime {
-		preset = "ultrafast"
-	}
+	preset := "ultrafast"
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
 	if realtime {
@@ -638,7 +632,7 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	args = append(args,
 		"-filter_complex", filter,
 		"-map", "["+outputLabel+"]",
-		"-c:v", "libx264", "-preset", preset, "-crf", "23",
+		"-c:v", "libx264", "-preset", preset, "-tune", "zerolatency", "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls",
@@ -711,10 +705,7 @@ func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, star
 }
 
 func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, overlayEndpoint string) []string {
-	preset := "veryfast"
-	if !realtime {
-		preset = "ultrafast"
-	}
+	preset := "ultrafast"
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
 	if realtime {
@@ -748,7 +739,7 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	}
 	args = append(args,
 		"-map", videoMap,
-		"-c:v", "libx264", "-preset", preset, "-crf", "23",
+		"-c:v", "libx264", "-preset", preset, "-tune", "zerolatency", "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls",
