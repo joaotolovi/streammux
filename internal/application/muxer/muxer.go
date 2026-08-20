@@ -462,9 +462,9 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 }
 
 func streamPresentation(metadata contentMetadata) (string, string) {
-	name := "▶ StreamMux MultiAudio"
+	name := "StreamMux MultiAudio"
 	if title := contentDisplayTitle(metadata); title != "StreamMux MultiAudio" {
-		name = fmt.Sprintf("▶ %s • StreamMux MultiAudio", title)
+		name = fmt.Sprintf("%s • StreamMux MultiAudio", title)
 	}
 
 	var facts []string

@@ -77,9 +77,9 @@ func renderPlaceholderDetails(metadata contentMetadata, plans []model.PlaybackPl
 }
 
 func renderPlaceholderMetadata(metadata contentMetadata) string {
-	lines := []string{"▶ " + contentDisplayTitle(metadata)}
+	lines := wrapMetadataText(contentDisplayTitle(metadata), 22)
 	if metadata.SeriesTitle != "" && metadata.Title != "" && metadata.Title != metadata.SeriesTitle {
-		lines = append(lines, metadata.Title)
+		lines = append(lines, wrapMetadataText(metadata.Title, 22)...)
 	}
 	var identity []string
 	if metadata.Year != "" {
@@ -92,6 +92,24 @@ func renderPlaceholderMetadata(metadata contentMetadata) string {
 		lines = append(lines, strings.Join(identity, " • "))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func wrapMetadataText(text string, maxChars int) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	lines := []string{}
+	line := words[0]
+	for _, word := range words[1:] {
+		if len([]rune(line))+1+len([]rune(word)) <= maxChars {
+			line += " " + word
+			continue
+		}
+		lines = append(lines, line)
+		line = word
+	}
+	return append(lines, line)
 }
 
 func contentDisplayTitle(metadata contentMetadata) string {

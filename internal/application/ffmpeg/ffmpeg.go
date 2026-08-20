@@ -573,7 +573,6 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		duration     = 0.8
 		posterW      = 256 // 320 * 0.8
 		posterH      = 384 // 480 * 0.8
-		posterY      = 96
 	)
 
 	spinnerPath := findAsset(path, "loading_spinner.gif")
@@ -586,22 +585,22 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	}
 	filter := fmt.Sprintf(
 		filterPrefix+
-			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
-			"[2:v]scale=%d:%d[mask_scaled];"+
-			"[3:v]scale=%d:%d[border_scaled];"+
+			"[1:v]scale=w='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame,format=yuva420p[poster_raw];"+
+			"[2:v]scale=w='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame[mask_scaled];"+
+			"[3:v]scale=w='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame[border_scaled];"+
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
 			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
-			"[shifted][poster]overlay@poster=x='%s':y=%d[withposter];"+
-			"[withposter][border_scaled]overlay@poster_border=x='%s':y=%d[withborder];"+
+			"[shifted][poster]overlay@poster=x='%s':y='%s'[withposter];"+
+			"[withposter][border_scaled]overlay@poster_border=x='%s':y='%s'[withborder];"+
 			spinnerInput,
 		posterW, posterH,
 		posterW, posterH,
 		posterW, posterH,
 		startT, duration,
 		baseVideo,
-		posterXExpression(), posterY,
-		posterXExpression(), posterY,
+		posterXExpression(), posterYExpression(),
+		posterXExpression(), posterYExpression(),
 	)
 	outputLabel := "v"
 	if cardPath != "" {
@@ -777,7 +776,7 @@ func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpo
 		filters = append(filters, "zmq=b='"+escapeFilterPath(overlayEndpoint)+"'")
 	}
 	if metadataPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=900:y=498:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(metadataPath)))
+		filters = append(filters, fmt.Sprintf("drawtext@metadata=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:boxw=360:text_align=center:x=848:y=498:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(metadataPath)))
 	}
 	if cardPath != "" {
 		filters = append(filters, fmt.Sprintf("drawtext@quality=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha='if(lt(t,5),0,if(lt(t,5.8),(t-5)/0.8,1))'", escapeFilterPath(cardPath)))
