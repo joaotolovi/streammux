@@ -405,7 +405,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		log.Printf("mux: starting opening video with poster %s", posterPath)
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
 			VideoPath: m.placeholderPath, ImagePath: posterPath, BackgroundPath: backgroundPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
-			OutputDir: dir, Realtime: true,
+			OutputDir: dir, Realtime: false,
 		})
 		if err != nil {
 			log.Printf("mux: composed opening failed, falling back to plain opening: %v", err)
@@ -418,7 +418,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		log.Printf("mux: starting opening video without poster")
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
 			VideoPath: m.placeholderPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
-			OutputDir: dir, Realtime: true,
+			OutputDir: dir, Realtime: false,
 		})
 	}
 
@@ -455,22 +455,24 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	audioPlPath := generationAudioPlaylistPath(gen)
 	ticker := time.NewTicker(75 * time.Millisecond)
 	defer ticker.Stop()
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for {
-		if fileExists(segmentPath) && fileExists(audioSegPath) && fileExists(masterPath) && fileExists(audioPlPath) {
-			break
-		}
 		select {
 		case <-session.Done():
-			fail("ended before first segment: %v", session.Err())
-			return
+			if session.Err() != nil || !fileExists(segmentPath) || !fileExists(audioSegPath) || !fileExists(masterPath) || !fileExists(audioPlPath) {
+				fail("ended before completing intro: %v", session.Err())
+				return
+			}
+			goto placeholderReady
 		case <-deadline:
 			session.Cancel()
-			fail("timed out before first segment")
+			fail("timed out before completing intro")
 			return
 		case <-ticker.C:
 		}
 	}
+
+placeholderReady:
 	state.mu.Lock()
 	if state.active != nil || state.closed {
 		gen.session.Cancel()
@@ -1648,6 +1650,13 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// Live placeholder phase: synchronized sliding window of both renditions,
 	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
+		select {
+		case <-placeholder.session.Done():
+			if placeholder.session.Err() == nil {
+				return completedPlaceholderPlaylist(placeholder, placeholderDiscAt)
+			}
+		default:
+		}
 		return synchronizedLiveWindowWithDiscontinuity(placeholder, base-1, placeholderDiscAt)
 	}
 
@@ -1767,6 +1776,55 @@ func synchronizedLiveWindowWithDiscontinuity(gen *generation, cap, discontinuity
 		return nil, false
 	}
 	return videoPlaylist.renderWithDiscontinuity(first, last, discontinuityAt), true
+}
+
+// completedPlaceholderPlaylist turns the local intro into a closed VOD
+// pre-roll. A resumed player must play this finite period before it receives
+// the film timeline and its stored position can be applied.
+func completedPlaceholderPlaylist(gen *generation, discontinuityAt int) ([]byte, bool) {
+	videoPlaylist, err := readLivePlaylist(generationVideoPlaylistPath(gen))
+	if err != nil {
+		return nil, false
+	}
+	audioPlaylist, err := readLivePlaylist(generationAudioPlaylistPath(gen))
+	if err != nil {
+		return nil, false
+	}
+	first := videoPlaylist.first
+	if audioPlaylist.first > first {
+		first = audioPlaylist.first
+	}
+	last := videoPlaylist.last
+	if audioPlaylist.last < last {
+		last = audioPlaylist.last
+	}
+	if first < 0 || last < first {
+		return nil, false
+	}
+
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4
+	}
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:6\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(segDur))))
+	b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", first))
+	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	b.WriteString("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n")
+	b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	for segment := first; segment <= last; segment++ {
+		if segment == discontinuityAt {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
+		for _, line := range videoPlaylist.segments[segment] {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	b.WriteString("#EXT-X-ENDLIST\n")
+	return []byte(b.String()), true
 }
 
 type livePlaylist struct {

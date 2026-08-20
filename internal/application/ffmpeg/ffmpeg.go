@@ -606,9 +606,11 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 	preset := "ultrafast"
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
+	hlsListSize := "0"
 	if realtime {
 		videoFlags += "+omit_endlist"
 		audioFlags += "+omit_endlist"
+		hlsListSize = "3"
 	}
 
 	args := []string{"-nostdin", "-hide_banner", "-nostats"}
@@ -627,7 +629,7 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "3",
+		"-hls_list_size", hlsListSize,
 		"-hls_allow_cache", "0",
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
@@ -637,7 +639,7 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "3",
+		"-hls_list_size", hlsListSize,
 		"-hls_allow_cache", "0",
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
@@ -698,9 +700,11 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	preset := "ultrafast"
 	videoFlags := "independent_segments+temp_file"
 	audioFlags := "independent_segments+temp_file+split_by_time"
+	hlsListSize := "0"
 	if realtime {
 		videoFlags += "+omit_endlist"
 		audioFlags += "+omit_endlist"
+		hlsListSize = "3"
 	}
 	args := []string{"-nostdin", "-hide_banner", "-nostats"}
 	if realtime {
@@ -734,7 +738,7 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "3",
+		"-hls_list_size", hlsListSize,
 		"-hls_allow_cache", "0",
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
@@ -744,7 +748,7 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "3",
+		"-hls_list_size", hlsListSize,
 		"-hls_allow_cache", "0",
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
