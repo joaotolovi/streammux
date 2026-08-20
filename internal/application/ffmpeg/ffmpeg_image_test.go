@@ -34,7 +34,7 @@ func TestBuildImagePlaceholderArgsBlendsCinemetaBackground(t *testing.T) {
 	if !strings.Contains(joined, "background.jpg") {
 		t.Error("missing Cinemeta background input")
 	}
-	if !strings.Contains(joined, "blend=all_expr=") || !strings.Contains(joined, "A*0.65+B*0.35") {
+	if !strings.Contains(joined, "colorchannelmixer=aa=0.35") || !strings.Contains(joined, "fade=t=in:st=5:d=0.8:alpha=1") {
 		t.Error("missing timed background blend")
 	}
 }

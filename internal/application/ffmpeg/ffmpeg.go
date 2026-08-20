@@ -584,7 +584,8 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 		inputArgs = append(inputArgs, "-loop", "1", "-i", backgroundPath)
 		logoInput = 2
 		compositionFilter = "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=rgba[background];" +
-			"[basevideo][background]blend=all_expr='if(lt(T,5),A,if(lt(T,5.8),A*(1-(T-5)*0.4375)+B*((T-5)*0.4375),A*0.65+B*0.35))'[mixed];" +
+			"[background]colorchannelmixer=aa=0.35,fade=t=in:st=5:d=0.8:alpha=1[backgroundfade];" +
+			"[basevideo][backgroundfade]overlay=x=0:y=0[mixed];" +
 			"[mixed][logo]overlay@logo=x='1028-w/2':y='280-h/2'[withlogo];"
 	}
 	inputArgs = append(inputArgs, "-loop", "1", "-i", imagePath)
