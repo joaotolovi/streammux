@@ -23,11 +23,19 @@ func TestBuildImagePlaceholderArgsContainsExpectedInputsAndFilter(t *testing.T) 
 	if !strings.Contains(joined, "filter_complex") {
 		t.Error("missing filter_complex flag")
 	}
-	if !strings.Contains(joined, "colorchannelmixer=aa=0.65") || !strings.Contains(joined, "fade=t=out:st=5:d=0.8:alpha=1") {
-		t.Error("missing video opacity animation")
-	}
 	if !strings.Contains(joined, "overlay") {
 		t.Error("missing overlay filters")
+	}
+}
+
+func TestBuildImagePlaceholderArgsBlendsCinemetaBackground(t *testing.T) {
+	args := buildImagePlaceholderArgsWithBackground("placeholder.mp4", "logo.png", "background.jpg", "/tmp/out", true, 0, "", "", "")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "background.jpg") {
+		t.Error("missing Cinemeta background input")
+	}
+	if !strings.Contains(joined, "blend=all_expr=") || !strings.Contains(joined, "A*0.65+B*0.35") {
+		t.Error("missing timed background blend")
 	}
 }
 

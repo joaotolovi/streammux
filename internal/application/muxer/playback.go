@@ -367,7 +367,7 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 	posterPath := state.posterPath
 	state.mu.Lock()
 	posterExpected := state.metadata.LogoURL != ""
-	backgroundExpected := state.metadata.PosterURL != ""
+	backgroundExpected := state.metadata.BackgroundURL != ""
 	cachedBackgroundPath := state.backgroundPath
 	state.mu.Unlock()
 	if (posterExpected && posterPath != "" && !fileExists(posterPath)) || (backgroundExpected && cachedBackgroundPath != "" && !fileExists(cachedBackgroundPath)) {

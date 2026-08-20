@@ -25,6 +25,7 @@ type cinemetaMeta struct {
 	Meta struct {
 		Name        string          `json:"name"`
 		Poster      string          `json:"poster"`
+		Background  string          `json:"background"`
 		Logo        string          `json:"logo"`
 		ReleaseInfo string          `json:"releaseInfo"`
 		IMDBRating  json.RawMessage `json:"imdbRating"`
@@ -38,14 +39,14 @@ type cinemetaMeta struct {
 }
 
 type contentMetadata struct {
-	Title       string
-	SeriesTitle string
-	Season      int
-	Episode     int
-	Year        string
-	Rating      string
-	LogoURL     string
-	PosterURL   string
+	Title         string
+	SeriesTitle   string
+	Season        int
+	Episode       int
+	Year          string
+	Rating        string
+	LogoURL       string
+	BackgroundURL string
 }
 
 func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string, languages ...string) (contentMetadata, error) {
@@ -118,14 +119,14 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		rating = ""
 	}
 	return contentMetadata{
-		Title:       title,
-		SeriesTitle: seriesTitle,
-		Season:      season,
-		Episode:     episode,
-		Year:        firstReleaseYear(meta.Meta.ReleaseInfo),
-		Rating:      rating,
-		LogoURL:     normalizePosterURL(meta.Meta.Logo),
-		PosterURL:   normalizePosterURL(meta.Meta.Poster),
+		Title:         title,
+		SeriesTitle:   seriesTitle,
+		Season:        season,
+		Episode:       episode,
+		Year:          firstReleaseYear(meta.Meta.ReleaseInfo),
+		Rating:        rating,
+		LogoURL:       normalizePosterURL(meta.Meta.Logo),
+		BackgroundURL: normalizePosterURL(meta.Meta.Background),
 	}, nil
 }
 
@@ -313,8 +314,8 @@ func (m *Muxer) prefetchImagesForContent(ctx context.Context, contentType, conte
 				log.Printf("mux: logo prefetch failed: %v", err)
 			}
 		}
-		if backgroundPath != "" && metadata.PosterURL != "" {
-			if err := downloadPoster(prefetchCtx, m.httpClient, metadata.PosterURL, backgroundPath); err != nil {
+		if backgroundPath != "" && metadata.BackgroundURL != "" {
+			if err := downloadPoster(prefetchCtx, m.httpClient, metadata.BackgroundURL, backgroundPath); err != nil {
 				log.Printf("mux: background poster prefetch failed: %v", err)
 			}
 		}

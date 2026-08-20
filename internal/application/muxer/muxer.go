@@ -445,10 +445,10 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 	if metadata.LogoURL != "" && state.posterPath != "" {
 		m.prefetchPosterURL(state.ctx, metadata.LogoURL, state.posterPath)
 	}
-	if metadata.PosterURL != "" && state.backgroundPath != "" {
-		m.prefetchPosterURL(state.ctx, metadata.PosterURL, state.backgroundPath)
+	if metadata.BackgroundURL != "" && state.backgroundPath != "" {
+		m.prefetchPosterURL(state.ctx, metadata.BackgroundURL, state.backgroundPath)
 	}
-	if metadata.LogoURL == "" || metadata.PosterURL == "" {
+	if metadata.LogoURL == "" || metadata.BackgroundURL == "" {
 		// If the short synchronous metadata budget expired, make one best-effort
 		// background attempt so the poster can still arrive during playback.
 		m.prefetchImagesForContent(state.ctx, contentType, contentID, state.posterPath, state.backgroundPath)

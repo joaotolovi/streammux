@@ -559,11 +559,11 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 }
 
 func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath string) []string {
-	return buildImagePlaceholderArgsWithBackground(path, imagePath, imagePath, outputDir, realtime, startSegment, cardPath, "", "")
+	return buildImagePlaceholderArgsWithBackground(path, imagePath, "", outputDir, realtime, startSegment, cardPath, "", "")
 }
 
 func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, _ string) []string {
-	return buildImagePlaceholderArgsWithBackground(path, imagePath, imagePath, outputDir, realtime, startSegment, cardPath, metadataPath, detailsPath)
+	return buildImagePlaceholderArgsWithBackground(path, imagePath, "", outputDir, realtime, startSegment, cardPath, metadataPath, detailsPath)
 }
 
 func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath string) []string {
@@ -576,14 +576,16 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 
 	spinnerPath := findAsset(path, "loading_spinner.gif")
 	useSpinner := realtime && assetExists(spinnerPath)
-	filterPrefix := "color=c=black:s=1280x720[base];[0:v]scale=1280:720,format=rgba[basevideo];"
+	filterPrefix := "[0:v]scale=1280:720,format=rgba[basevideo];"
 	logoInput := 1
-	backgroundFilter := "[base][logo]overlay@logo=x='1028-w/2':y='280-h/2'[composed];"
+	compositionFilter := "[basevideo][logo]overlay@logo=x='1028-w/2':y='280-h/2'[withlogo];"
 	inputArgs := []string{"-i", path}
 	if backgroundPath != "" {
 		inputArgs = append(inputArgs, "-loop", "1", "-i", backgroundPath)
 		logoInput = 2
-		backgroundFilter = "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=rgba,colorchannelmixer=aa=0.55[poster];[base][poster]overlay=x=0:y=0[background];[background][logo]overlay@logo=x='1028-w/2':y='280-h/2'[composed];"
+		compositionFilter = "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=rgba[background];" +
+			"[basevideo][background]blend=all_expr='if(lt(T,5),A,if(lt(T,5.8),A*(1-(T-5)*0.4375)+B*((T-5)*0.4375),A*0.65+B*0.35))'[mixed];" +
+			"[mixed][logo]overlay@logo=x='1028-w/2':y='280-h/2'[withlogo];"
 	}
 	inputArgs = append(inputArgs, "-loop", "1", "-i", imagePath)
 	spinnerInput := "[withlogo]null[v]"
@@ -592,12 +594,7 @@ func buildImagePlaceholderArgsWithBackground(path, imagePath, backgroundPath, ou
 	}
 	filter := filterPrefix +
 		fmt.Sprintf("[%d:v]scale=%d:%d:force_original_aspect_ratio=decrease,format=rgba,fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[logo];", logoInput, logoW, logoH, startT, duration) +
-		backgroundFilter +
-		"[basevideo]split[full][dim];" +
-		"[full]fade=t=out:st=5:d=0.8:alpha=1[fullfade];" +
-		"[dim]colorchannelmixer=aa=0.65,fade=t=in:st=5:d=0.8:alpha=1[dimfade];" +
-		"[composed][dimfade]overlay=x=0:y=0[dimmed];" +
-		"[dimmed][fullfade]overlay=x=0:y=0[withlogo];" +
+		compositionFilter +
 		spinnerInput
 	outputLabel := "v"
 	if cardPath != "" {
