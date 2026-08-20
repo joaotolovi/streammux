@@ -21,7 +21,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /streammux ./cmd/streammux
 
 # Runtime stage — includes current stable ffmpeg and ffprobe for remuxing.
-FROM alpine:3.23
+FROM alpine:edge
 RUN apk add --no-cache ffmpeg ca-certificates font-dejavu font-noto-emoji
 COPY --from=builder /streammux /usr/local/bin/streammux
 

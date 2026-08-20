@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"unicode"
 
 	"github.com/streammux/streammux/internal/domain/model"
 )
@@ -146,7 +145,7 @@ func writePlaceholderCard(path, contents string) error {
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
-	contents = normalizeCardText(contents)
+	contents = strings.TrimRight(strings.ReplaceAll(contents, "\r", ""), "\n")
 	if _, err := tmp.WriteString(contents); err != nil {
 		_ = tmp.Close()
 		return err
@@ -155,21 +154,4 @@ func writePlaceholderCard(path, contents string) error {
 		return err
 	}
 	return os.Rename(tmpPath, path)
-}
-
-func normalizeCardText(contents string) string {
-	contents = strings.TrimPrefix(contents, "\ufeff")
-	contents = strings.ReplaceAll(contents, "\r\n", "\n")
-	contents = strings.ReplaceAll(contents, "\r", "\n")
-	lines := strings.Split(contents, "\n")
-	for i, line := range lines {
-		line = strings.Map(func(r rune) rune {
-			if r == '\ufffd' || (unicode.IsControl(r) && r != '\t') {
-				return -1
-			}
-			return r
-		}, line)
-		lines[i] = strings.TrimRightFunc(line, unicode.IsSpace)
-	}
-	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
 }
