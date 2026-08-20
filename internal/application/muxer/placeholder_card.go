@@ -18,13 +18,13 @@ func renderPlaceholderCard(metadata contentMetadata, plans []model.PlaybackPlan,
 	if title == "" {
 		title = "StreamMux MultiAudio"
 	}
-	lines := []string{"🎬 " + title}
+	lines := []string{"▶ " + title}
 	var identity []string
 	if metadata.Year != "" {
 		identity = append(identity, metadata.Year)
 	}
 	if metadata.Rating != "" {
-		identity = append(identity, "⭐ "+metadata.Rating)
+		identity = append(identity, "★ "+metadata.Rating)
 	}
 	if len(identity) > 0 {
 		lines = append(lines, strings.Join(identity, " • "))
