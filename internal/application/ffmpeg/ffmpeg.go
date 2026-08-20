@@ -585,11 +585,12 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 	}
 	filter := fmt.Sprintf(
 		filterPrefix+
-			"[1:v]scale=w='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame,format=yuva420p[poster_raw];"+
-			"[2:v]scale=w='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame[mask_scaled];"+
-			"[3:v]scale=w='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame[border_scaled];"+
+			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
+			"[2:v]scale=%d:%d[mask_scaled];"+
+			"[3:v]scale=%d:%d[border_base];"+
+			"[border_base]scale=w='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame,crop=%d:%d:x='(iw-%d)/2':y='(ih-%d)/2'[border_scaled];"+
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
-			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
+			"[rounded]scale=w='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':h='trunc(%d*(1.018+0.018*sin(2*PI*t/2.4))/2)*2':eval=frame,crop=%d:%d:x='(iw-%d)/2':y='(ih-%d)/2',fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
 			"[shifted][poster]overlay@poster=x='%s':y='%s'[withposter];"+
 			"[withposter][border_scaled]overlay@poster_border=x='%s':y='%s'[withborder];"+
@@ -597,6 +598,8 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		posterW, posterH,
 		posterW, posterH,
 		posterW, posterH,
+		posterW, posterH, posterW, posterH, posterW, posterH,
+		posterW, posterH, posterW, posterH, posterW, posterH,
 		startT, duration,
 		baseVideo,
 		posterXExpression(), posterYExpression(),

@@ -49,12 +49,11 @@ func posterXExpression() string {
 	// Smoothstep gives the slide a natural ease-in/ease-out S curve.
 	u := "((t-5)/0.8)"
 	smooth := "(3*" + u + "*" + u + "-2*" + u + "*" + u + "*" + u + ")"
-	pulseOffset := "128*(0.018*sin(2*PI*t/2.4))"
-	return "if(lt(t,5),1280,if(lt(t,5.8),1280-380*" + smooth + "-" + pulseOffset + ",900-" + pulseOffset + "))"
+	return "if(lt(t,5),1280,if(lt(t,5.8),1280-380*" + smooth + ",900))"
 }
 
 func posterYExpression() string {
-	return "96-192*(0.018*sin(2*PI*t/2.4))"
+	return "96"
 }
 
 func overlayCommand(name, base string, y int) string {
