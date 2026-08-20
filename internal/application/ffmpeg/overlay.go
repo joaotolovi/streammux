@@ -31,13 +31,16 @@ func (s *Session) AnimateOverlay() error {
 	metadata := overlayCommand("metadata", base, 570)
 	poster := posterOverlayCommand("poster")
 	posterBorder := posterOverlayCommand("poster_border")
+	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		if err := sendOverlayCommand(endpoint, quality+"\n"+languages+"\n"+metadata+"\n"+poster+"\n"+posterBorder); err == nil {
 			return nil
+		} else {
+			lastErr = err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("overlay animation command failed")
+	return fmt.Errorf("overlay animation command failed after retries: %w", lastErr)
 }
 
 func posterOverlayCommand(name string) string {
@@ -67,14 +70,20 @@ func sendOverlayCommand(endpoint, commands string) error {
 	socket := zmq4.NewReq(ctx)
 	defer socket.Close()
 	if err := socket.Dial(endpoint); err != nil {
-		return err
+		return fmt.Errorf("dial: %w", err)
 	}
 	for _, command := range strings.Split(commands, "\n") {
 		if err := socket.Send(zmq4.NewMsgString(command)); err != nil {
-			return err
+			return fmt.Errorf("send %q: %w", command, err)
 		}
-		if _, err := socket.Recv(); err != nil {
-			return err
+		response, err := socket.Recv()
+		if err != nil {
+			return fmt.Errorf("receive response for %q: %w", command, err)
+		}
+		text := strings.TrimSpace(response.String())
+		upper := strings.ToUpper(text)
+		if strings.HasPrefix(upper, "ERROR") || strings.Contains(upper, "FAIL") {
+			return fmt.Errorf("ffmpeg rejected %q: %s", command, text)
 		}
 	}
 	return nil
