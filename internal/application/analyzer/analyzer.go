@@ -20,10 +20,8 @@ type RankedStream struct {
 func (a *Analyzer) RankVideo(streams []model.CollectedStream) []RankedStream {
 	var ranked []RankedStream
 	for _, s := range streams {
-		// Video candidates come only from addons configured for video (or both).
-		if s.AddonRole != "" && s.AddonRole != constants.RoleVideo && s.AddonRole != constants.RoleBoth {
-			continue
-		}
+		// AddonRole is a preference, not an eligibility filter. Complete media
+		// files can provide both picture and audio regardless of that preference.
 		score := VideoScore(s)
 		ranked = append(ranked, RankedStream{Stream: s, VideoScore: score})
 	}
@@ -42,10 +40,6 @@ func (a *Analyzer) RankVideo(streams []model.CollectedStream) []RankedStream {
 func (a *Analyzer) RankAudio(streams []model.CollectedStream, targetLanguage string) []RankedStream {
 	var ranked []RankedStream
 	for _, s := range streams {
-		// Audio candidates come only from addons configured for audio (or both).
-		if s.AddonRole != "" && s.AddonRole != constants.RoleAudio && s.AddonRole != constants.RoleBoth {
-			continue
-		}
 		if !MatchesLanguage(s, targetLanguage) {
 			continue
 		}

@@ -436,7 +436,7 @@ function AddonsSection({
     <SectionCard
       icon={<Film01 className="size-5" />}
       title="Addons de origem"
-      description="Cadastre os addons que fornecem streams. Cada um pode ser fonte de vídeo, de áudio, ou ambos."
+      description="Cadastre os addons que fornecem streams. A função define apenas a prioridade; toda fonte pode ser usada para vídeo e áudio."
       action={
         <Button color="secondary" size="sm" onPress={addAddon}>
           <Plus className="size-4" />
@@ -514,6 +514,7 @@ function AddonCard({
               {(Object.keys(ROLE_LABELS) as AddonRole[]).map((role) => (
                 <Select.Item key={role} id={role}>
                   {ROLE_LABELS[role].label}
+                  <Select.Item.Description>{ROLE_LABELS[role].description}</Select.Item.Description>
                 </Select.Item>
               ))}
             </Select>

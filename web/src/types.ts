@@ -61,16 +61,16 @@ export const ADDON_LANGUAGE_OPTIONS: { label: string; value: string }[] = [
 
 export const ROLE_LABELS: Record<AddonRole, { label: string; description: string }> = {
   video: {
-    label: 'Vídeo',
-    description: 'Fonte de melhor qualidade de imagem (geralmente inglês)',
+    label: 'Priorizar vídeo',
+    description: 'Tenta primeiro como vídeo, mas também pode fornecer áudio',
   },
   audio: {
-    label: 'Áudio',
-    description: 'Fonte de áudio no seu idioma (geralmente dublado)',
+    label: 'Priorizar áudio',
+    description: 'Tenta primeiro como áudio, mas também pode fornecer vídeo',
   },
   both: {
-    label: 'Vídeo + Áudio',
-    description: 'Pode ser usado para os dois (se dublado com ótima qualidade)',
+    label: 'Priorizar ambos',
+    description: 'Mesma prioridade para vídeo e áudio',
   },
 };
 
