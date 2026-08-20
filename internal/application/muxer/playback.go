@@ -437,6 +437,9 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		case <-ticker.C:
 		}
 	}
+	if err := session.AnimateOverlay(); err != nil {
+		log.Printf("mux: placeholder overlay animation unavailable: %v", err)
+	}
 
 	state.mu.Lock()
 	if state.active != nil || state.closed {
@@ -828,14 +831,6 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 	generationID := state.nextGeneration
 	ph := state.placeholder
 	state.mu.Unlock()
-
-	if ph != nil {
-		ph.session.Cancel()
-		state.mu.Lock()
-		state.placeholder = nil
-		state.retiredPlaceholder = ph
-		state.mu.Unlock()
-	}
 	start := 0
 	_ = atSeg // accepted for API symmetry; the error video resets the timeline
 
@@ -897,6 +892,16 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 		return nil
 	}
 
+	// Keep the intro serving while the error video is being prepared. Closing
+	// this generation only after its first segment prevents a playlist gap and
+	// client reconnect, which would restart the intro from zero.
+	if ph != nil {
+		ph.session.Cancel()
+		state.mu.Lock()
+		state.placeholder = nil
+		state.retiredPlaceholder = ph
+		state.mu.Unlock()
+	}
 	state.mu.Lock()
 	state.all = append(state.all, gen)
 	state.errorStart = start

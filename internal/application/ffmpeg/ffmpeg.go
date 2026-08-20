@@ -884,12 +884,5 @@ func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpe
 		close(s.progress)
 		close(s.done)
 	}()
-	if overlayEndpoint != "" {
-		go func() {
-			time.Sleep(300 * time.Millisecond)
-			_ = s.AnimateOverlay()
-		}()
-	}
-
 	return s, nil
 }
