@@ -360,9 +360,29 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 
 	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
 
-	// Prefer the composed placeholder when the poster is already present. A
-	// missing poster must never delay the first playable segment.
+	// Wait briefly for the expected poster so the opening never changes
+	// composition after playback has already started.
 	posterPath := state.posterPath
+	state.mu.Lock()
+	posterExpected := state.metadata.PosterURL != ""
+	state.mu.Unlock()
+	if posterExpected && posterPath != "" && !fileExists(posterPath) {
+		deadline := time.NewTimer(4 * time.Second)
+		ticker := time.NewTicker(50 * time.Millisecond)
+	waitPoster:
+		for !fileExists(posterPath) {
+			select {
+			case <-state.ctx.Done():
+				break waitPoster
+			case <-deadline.C:
+				log.Printf("mux: poster not ready before placeholder deadline")
+				break waitPoster
+			case <-ticker.C:
+			}
+		}
+		ticker.Stop()
+		deadline.Stop()
+	}
 	usePoster := posterPath != "" && fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
 
 	var session *ffmpeg.Session
@@ -461,11 +481,6 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		close(wait)
 	}
 	log.Printf("mux: placeholder playing")
-	if !usePoster && posterPath != "" {
-		if _, ok := m.ffmpeg.(dynamicPlaceholderEngine); ok {
-			go m.watchPoster(job, state, gen)
-		}
-	}
 
 }
 
