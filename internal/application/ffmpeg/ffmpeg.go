@@ -740,16 +740,18 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 	return args
 }
 
-func placeholderDrawtextFilter(cardPath string, metadataPath ...string) string {
+func placeholderDrawtextFilter(cardPath, metadataPath, detailsPath string) string {
 	filters := []string{"fade=t=in:st=0:d=0.7"}
-	if len(metadataPath) > 0 && metadataPath[0] != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0])))
+	// Repeat the entrance because HLS clients usually join the current segment,
+	// not the beginning of the placeholder timeline.
+	if metadataPath != "" {
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x='947+if(lt(mod(t,6),0.8),40*(1-mod(t,6)/0.8),0)':y=570:alpha='if(lt(mod(t,6),0.8),mod(t,6)/0.8,if(lt(mod(t,6),1.1),1,if(lt(mod(t,6),1.8),1-(mod(t,6)-1.1)/0.7,0)))'", escapeFilterPath(metadataPath)))
 	}
 	if cardPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha='if(lt(t,0.8),t/0.8,1)'", escapeFilterPath(cardPath)))
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x='24-40*(1-min(mod(t,6)/0.8,1))':y=24:alpha='if(lt(mod(t,6),0.8),mod(t,6)/0.8,if(lt(mod(t,6),1.8),1,0))'", escapeFilterPath(cardPath)))
 	}
-	if len(metadataPath) > 1 && metadataPath[1] != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=58:alpha='if(lt(t,1.1),0,if(lt(t,1.8),(t-1.1)/0.7,1))'", escapeFilterPath(metadataPath[1])))
+	if detailsPath != "" {
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x='24-40*(1-min(max(mod(t,6)-0.7,0)/0.8,1))':y=58:alpha='if(lt(mod(t,6),0.7),0,if(lt(mod(t,6),1.5),(mod(t,6)-0.7)/0.8,if(lt(mod(t,6),1.8),1,0)))'", escapeFilterPath(detailsPath)))
 	}
 	return strings.Join(filters, ",")
 }
