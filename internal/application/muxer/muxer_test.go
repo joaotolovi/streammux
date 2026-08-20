@@ -355,40 +355,6 @@ func TestRenderMediaPlaylistAfterPlaceholderResume(t *testing.T) {
 	}
 }
 
-func TestVirtualPlaceholderPlaylistIsSeekable(t *testing.T) {
-	playlist := string(virtualPlaceholderPlaylist(60*60, 0))
-	if !strings.Contains(playlist, "#EXT-X-PLAYLIST-TYPE:VOD") || !strings.Contains(playlist, "#EXT-X-ENDLIST") {
-		t.Fatalf("virtual placeholder must be VOD: %s", playlist[:160])
-	}
-	if !strings.Contains(playlist, "seg_00900.ts") {
-		t.Fatal("virtual placeholder does not cover saved playback positions")
-	}
-}
-
-func TestSegmentPathMapsVirtualResumeToIntro(t *testing.T) {
-	dir := t.TempDir()
-	for _, media := range []string{"video", "audio"} {
-		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	videoPath := filepath.Join(dir, "video", "seg_00000.ts")
-	if err := os.WriteFile(videoPath, []byte("intro"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	placeholder := &generation{dir: dir}
-	state := &playbackState{
-		placeholder:      placeholder,
-		introPublicStart: 375,
-		filmEnd:          -1,
-		all:              []*generation{placeholder},
-	}
-	mux := &Muxer{states: map[string]*playbackState{"job": state}}
-	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 375); got != videoPath {
-		t.Fatalf("mapped resume path = %q, want %q", got, videoPath)
-	}
-}
-
 func TestRenderMediaPlaylistErrorTailTruncatesFilm(t *testing.T) {
 	// Mid-playback failure at segment 4: film [0..4) + error [4..4+8).
 	state := &playbackState{

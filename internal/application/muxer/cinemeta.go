@@ -27,7 +27,6 @@ type cinemetaMeta struct {
 		Poster      string          `json:"poster"`
 		Background  string          `json:"background"`
 		Logo        string          `json:"logo"`
-		Runtime     string          `json:"runtime"`
 		ReleaseInfo string          `json:"releaseInfo"`
 		IMDBRating  json.RawMessage `json:"imdbRating"`
 		Videos      []struct {
@@ -48,7 +47,6 @@ type contentMetadata struct {
 	Rating        string
 	LogoURL       string
 	BackgroundURL string
-	Duration      float64
 }
 
 func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string, languages ...string) (contentMetadata, error) {
@@ -129,16 +127,7 @@ func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType
 		Rating:        rating,
 		LogoURL:       normalizePosterURL(meta.Meta.Logo),
 		BackgroundURL: normalizePosterURL(meta.Meta.Background),
-		Duration:      parseCinemetaRuntime(meta.Meta.Runtime),
 	}, nil
-}
-
-func parseCinemetaRuntime(raw string) float64 {
-	var minutes int
-	if _, err := fmt.Sscanf(strings.TrimSpace(raw), "%d min", &minutes); err == nil && minutes > 0 {
-		return float64(minutes * 60)
-	}
-	return 0
 }
 
 func cinemetaAcceptLanguage(language string) string {
