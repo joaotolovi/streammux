@@ -25,11 +25,6 @@ var ErrBeyondEnd = errors.New("segment beyond end of film")
 // cache directory. It is downloaded from Cinemeta while sources are collected.
 const posterFileName = "poster.jpg"
 
-// imagePlaceholderWait is how long runPlaceholder waits for a poster download
-// before falling back to the plain placeholder. It is short enough to keep
-// playback instant but gives fast Cinemeta responses time to land.
-const imagePlaceholderWait = 500 * time.Millisecond
-
 // playbackState is the per-job VOD timeline. The public HLS timeline is
 // static once the film is ready: segment n always maps to file seg_%05d.ts of
 // whichever generation produced it, and the media playlists expose the full
@@ -44,6 +39,9 @@ type playbackState struct {
 
 	cacheDir   string
 	posterPath string // absolute path to poster.jpg, set by stateFor from Process's poster dir
+	posterDir  string // original poster cache, separate from the playback cache
+	cardPath   string
+	metadata   contentMetadata
 
 	// active is the ffmpeg session currently encoding the film (or the
 	// terminal error video). Segments produced by earlier generations remain
@@ -57,6 +55,9 @@ type playbackState struct {
 	retiredPlaceholder *generation
 	placeholderStarted bool
 	placeholderWait    chan struct{}
+	placeholderDiscAt  int
+	placeholderHasDisc bool
+	placeholderSwap    bool
 
 	// filmBase is the public segment index where film content 0:00 lives
 	// (nonzero when a placeholder played first). While >= 0 the placeholder
@@ -75,6 +76,14 @@ type playbackState struct {
 	startErr  error
 	directURL string
 	lastStart time.Time
+
+	// preparationWait gates source planning only. It is intentionally distinct
+	// from startWait: the placeholder can be ready while addons are still
+	// being fetched, and source resolution must not begin before plans exist.
+	preparationWait chan struct{}
+	preparationErr  error
+	prepared        bool
+	tierMetas       []model.TierMeta
 
 	recovering   bool
 	recoveryWait chan struct{}
@@ -162,21 +171,30 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	// poster dir at that point) before we overwrite it with the playback
 	// cache dir.
 	posterPath := ""
+	posterDir := ""
 	if job.CacheDir != "" {
+		posterDir = job.CacheDir
 		posterPath = filepath.Join(job.CacheDir, posterFileName)
+	}
+	tierMetas := append([]model.TierMeta(nil), job.TierMetas...)
+	if len(tierMetas) == 0 {
+		tierMetas = placeholderTierMetas()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &playbackState{
-		ctx:             ctx,
-		cancel:          cancel,
-		cacheDir:        dir,
-		posterPath:      posterPath,
-		lastRequested:   -1,
-		maxRequested:    -1,
-		lastAccess:      time.Now(),
-		tierPending:     -1,
-		audioRenditions: make(map[string]*audioRendition),
+		ctx:               ctx,
+		cancel:            cancel,
+		cacheDir:          dir,
+		posterPath:        posterPath,
+		posterDir:         posterDir,
+		placeholderDiscAt: -1,
+		tierMetas:         tierMetas,
+		lastRequested:     -1,
+		maxRequested:      -1,
+		lastAccess:        time.Now(),
+		tierPending:       -1,
+		audioRenditions:   make(map[string]*audioRendition),
 	}
 	m.states[job.ID] = state
 	job.CacheDir = dir
@@ -340,33 +358,21 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 
 	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
 
-	// Prefer a composed placeholder with the film poster, but only when the
-	// poster is already available or arrives within a very short window. We
-	// never delay playback for the poster: Cinemeta is best-effort.
+	// Prefer the composed placeholder only when the poster is already present.
+	// A missing poster must never delay the first playable segment; watchPoster
+	// will start a replacement later when the download lands.
 	posterPath := state.posterPath
 	usePoster := posterPath != "" && fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
-	if !usePoster && posterPath != "" && job.ContentType != "" && job.ContentID != "" {
-		deadline := time.After(imagePlaceholderWait)
-	waitLoop:
-		for !fileExists(posterPath) {
-			select {
-			case <-state.ctx.Done():
-				break waitLoop
-			case <-deadline:
-				break waitLoop
-			default:
-				time.Sleep(50 * time.Millisecond)
-			}
-		}
-		usePoster = fileExists(posterPath)
-	}
 
 	var session *ffmpeg.Session
 	var err error
 
 	if usePoster {
 		log.Printf("mux: starting image placeholder with poster %s", posterPath)
-		session, err = m.ffmpeg.StartImagePlaceholderSession(state.ctx, m.placeholderPath, posterPath, dir, true)
+		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
+			VideoPath: m.placeholderPath, ImagePath: posterPath, CardPath: state.cardPath,
+			OutputDir: dir, Realtime: true,
+		})
 		if err != nil {
 			log.Printf("mux: image placeholder failed, falling back to plain placeholder: %v", err)
 			_ = os.RemoveAll(dir)
@@ -377,7 +383,10 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 
 	if !usePoster {
 		log.Printf("mux: starting plain placeholder")
-		session, err = m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.placeholderPath, dir, true)
+		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
+			VideoPath: m.placeholderPath, CardPath: state.cardPath,
+			OutputDir: dir, Realtime: true,
+		})
 	}
 
 	fail := func(format string, args ...any) {
@@ -450,6 +459,137 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		close(wait)
 	}
 	log.Printf("mux: placeholder playing")
+
+	if !usePoster && posterPath != "" {
+		if _, ok := m.ffmpeg.(dynamicPlaceholderEngine); ok {
+			go m.watchPoster(job, state, gen)
+		}
+	}
+}
+
+func (m *Muxer) startPlaceholderSession(ctx context.Context, spec ffmpeg.PlaceholderSpec) (*ffmpeg.Session, error) {
+	if engine, ok := m.ffmpeg.(dynamicPlaceholderEngine); ok {
+		return engine.StartPlaceholderSession(ctx, spec)
+	}
+	if spec.StartSegment != 0 || spec.CardPath != "" {
+		// The legacy methods do not expose a card or a non-zero start. They are
+		// still valid for old test engines and initial playback, but cannot
+		// safely perform the late replacement.
+		if spec.StartSegment != 0 {
+			return nil, fmt.Errorf("placeholder engine does not support non-zero segment starts")
+		}
+	}
+	if spec.ImagePath != "" {
+		return m.ffmpeg.StartImagePlaceholderSession(ctx, spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime)
+	}
+	return m.ffmpeg.StartSinglePlaceholderSession(ctx, spec.VideoPath, spec.OutputDir, spec.Realtime)
+}
+
+func (m *Muxer) watchPoster(job *model.MuxJob, state *playbackState, old *generation) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if fileExists(state.posterPath) {
+			m.swapPlaceholder(job, state, old)
+			return
+		}
+		select {
+		case <-state.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *Muxer) swapPlaceholder(job *model.MuxJob, state *playbackState, old *generation) {
+	engine, ok := m.ffmpeg.(dynamicPlaceholderEngine)
+	if !ok {
+		return
+	}
+
+	state.mu.Lock()
+	if state.closed || state.active != nil || state.placeholder != old || state.placeholderSwap {
+		state.mu.Unlock()
+		return
+	}
+	base := lastCommonSegment(old) + 1
+	if base <= old.startSegment {
+		state.mu.Unlock()
+		return
+	}
+	state.placeholderSwap = true
+	state.nextGeneration++
+	generationID := state.nextGeneration
+	state.mu.Unlock()
+
+	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
+	session, err := engine.StartPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
+		VideoPath: m.placeholderPath, ImagePath: state.posterPath, CardPath: state.cardPath,
+		OutputDir: dir, Realtime: true, StartSegment: base,
+	})
+	if err != nil {
+		state.mu.Lock()
+		state.placeholderSwap = false
+		state.mu.Unlock()
+		log.Printf("mux: late poster placeholder failed: %v", err)
+		return
+	}
+
+	gen := &generation{id: generationID, dir: dir, session: session, startSegment: base, startedAt: time.Now(), isLocal: true}
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4
+	}
+	needed := int(math.Ceil(m.policy.TierSwitchBuffer.Seconds() / segDur))
+	if needed < 1 {
+		needed = 1
+	}
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(75 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		common := lastCommonSegment(gen)
+		if common >= base+needed && fileExists(generationVideoPlaylistPath(gen)) && fileExists(generationAudioPlaylistPath(gen)) {
+			break
+		}
+		select {
+		case <-state.ctx.Done():
+			session.Cancel()
+			return
+		case <-session.Done():
+			state.mu.Lock()
+			state.placeholderSwap = false
+			state.mu.Unlock()
+			return
+		case <-deadline.C:
+			session.Cancel()
+			state.mu.Lock()
+			state.placeholderSwap = false
+			state.mu.Unlock()
+			log.Printf("mux: late poster placeholder timed out before buffer")
+			return
+		case <-ticker.C:
+		}
+	}
+
+	state.mu.Lock()
+	if state.closed || state.active != nil || state.placeholder != old {
+		state.placeholderSwap = false
+		state.mu.Unlock()
+		session.Cancel()
+		return
+	}
+	state.placeholder = gen
+	state.retiredPlaceholder = old
+	state.placeholderHasDisc = true
+	state.placeholderDiscAt = base
+	state.placeholderSwap = false
+	state.all = append(state.all, gen)
+	state.mu.Unlock()
+	old.session.Cancel()
+	log.Printf("mux: placeholder poster switched at segment %d", base)
+	_ = job
 }
 
 // runStartup walks the composer's source compositions until one launches.
@@ -457,8 +597,6 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 // last common segment so the handoff is a single DISCONTINUITY on an
 // otherwise static timeline.
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
-	deadline := time.Now().Add(m.policy.StartupTimeout)
-
 	// If a placeholder is configured, wait for it to be playing before
 	// preparing film sources — otherwise the film can be ready before the
 	// placeholder even starts, and the user never sees the intro.
@@ -473,6 +611,36 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 			}
 		}
 	}
+
+	// Process may have returned before addon collection finished. Do not build
+	// a composer over an empty job; wait for the worker that owns preparation.
+	state.mu.Lock()
+	prepWait := state.preparationWait
+	prepared := state.prepared
+	prepErr := state.preparationErr
+	state.mu.Unlock()
+	if prepWait != nil && !prepared {
+		select {
+		case <-prepWait:
+		case <-state.ctx.Done():
+			return
+		}
+		state.mu.Lock()
+		prepared = state.prepared
+		prepErr = state.preparationErr
+		state.mu.Unlock()
+	}
+	if !prepared {
+		if prepErr == nil {
+			prepErr = errors.New("addon preparation did not produce a playback plan")
+		}
+		m.startupFailed(job, state, prepErr)
+		return
+	}
+
+	// StartupTimeout measures actual source resolution/probing, not the time
+	// spent waiting for addons while the placeholder is already visible.
+	deadline := time.Now().Add(m.policy.StartupTimeout)
 
 	comp := m.composerFor(job, state)
 
@@ -1041,7 +1209,14 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	active := state.active
 	placeholder := state.placeholder
 	duration := state.duration
-	tiers := len(job.TierMetas)
+	metas := append([]model.TierMeta(nil), state.tierMetas...)
+	if len(metas) == 0 {
+		metas = append(metas, job.TierMetas...)
+	}
+	if len(metas) == 0 {
+		metas = placeholderTierMetas()
+	}
+	tiers := len(metas)
 	state.mu.Unlock()
 
 	if active != nil && !active.isError && active.prepared != nil && duration > 0 {
@@ -1049,8 +1224,7 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 			// Override tier 0 with the REAL probed bitrate/dimensions of
 			// the active generation — the estimate from Process time is
 			// only a placeholder until ffprobe measures the source.
-			metas := make([]model.TierMeta, len(job.TierMetas))
-			copy(metas, job.TierMetas)
+			metas := append([]model.TierMeta(nil), metas...)
 			bitrate := active.prepared.videoBitrate
 			if bitrate <= 0 {
 				bitrate = float64(active.plan.EstimatedBandwidth())
@@ -1081,7 +1255,7 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		// The lower tiers remain lazy and do not consume debrid slots until the
 		// player requests one of their namespaced segments.
 		if placeholder != nil && tiers > 1 {
-			return m.renderMasterABR(job, job.TierMetas, job.TargetLanguage), true
+			return m.renderMasterABR(job, metas, job.TargetLanguage), true
 		}
 		// Small terminal error rendition.
 		return m.renderMaster(job, 3_000_000, 0, 0, job.TargetLanguage), true
@@ -1504,6 +1678,10 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	active := state.active
 	retired := state.retiredPlaceholder
 	base := state.filmBase
+	placeholderDiscAt := -1
+	if state.placeholderHasDisc {
+		placeholderDiscAt = state.placeholderDiscAt
+	}
 	duration := state.duration
 	disc := append([]int(nil), state.discontinuities...)
 	if tier > 0 && tier < tierCount {
@@ -1526,7 +1704,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// Live placeholder phase: synchronized sliding window of both renditions,
 	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
-		return synchronizedLiveWindow(placeholder, base-1)
+		return synchronizedLiveWindowWithDiscontinuity(placeholder, base-1, placeholderDiscAt)
 	}
 
 	segDur := ffmpeg.SegDuration()
@@ -1608,6 +1786,10 @@ func tierSegmentURI(tier, segment int) string {
 // so both renditions advertise exactly the same segments. cap limits the last
 // advertised segment (>=0) to freeze the window at a handoff point.
 func synchronizedLiveWindow(gen *generation, cap int) ([]byte, bool) {
+	return synchronizedLiveWindowWithDiscontinuity(gen, cap, -1)
+}
+
+func synchronizedLiveWindowWithDiscontinuity(gen *generation, cap, discontinuityAt int) ([]byte, bool) {
 	videoPlaylist, err := readLivePlaylist(generationVideoPlaylistPath(gen))
 	if err != nil {
 		return nil, false
@@ -1630,7 +1812,7 @@ func synchronizedLiveWindow(gen *generation, cap int) ([]byte, bool) {
 	if first < 0 || last < first {
 		return nil, false
 	}
-	return videoPlaylist.render(first, last), true
+	return videoPlaylist.renderWithDiscontinuity(first, last, discontinuityAt), true
 }
 
 type livePlaylist struct {
@@ -1679,6 +1861,10 @@ func readLivePlaylist(path string) (livePlaylist, error) {
 }
 
 func (p livePlaylist) render(first, last int) []byte {
+	return p.renderWithDiscontinuity(first, last, -1)
+}
+
+func (p livePlaylist) renderWithDiscontinuity(first, last, discontinuityAt int) []byte {
 	var out []string
 	insertedSequence := false
 	for _, line := range p.header {
@@ -1692,6 +1878,9 @@ func (p livePlaylist) render(first, last int) []byte {
 		out = append(out, fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d", first))
 	}
 	for segment := first; segment <= last; segment++ {
+		if segment == discontinuityAt {
+			out = append(out, "#EXT-X-DISCONTINUITY")
+		}
 		out = append(out, p.segments[segment]...)
 	}
 	return []byte(strings.Join(out, "\n") + "\n")
@@ -2474,9 +2663,13 @@ func (m *Muxer) CleanupJob(job *model.MuxJob) {
 	state.closed = true
 	state.cancel()
 	generations := append([]*generation(nil), state.all...)
+	posterDir := state.posterDir
 	state.mu.Unlock()
 	for _, generation := range generations {
 		generation.session.Cancel()
 	}
 	_ = os.RemoveAll(state.cacheDir)
+	if posterDir != "" && posterDir != state.cacheDir {
+		_ = os.RemoveAll(posterDir)
+	}
 }

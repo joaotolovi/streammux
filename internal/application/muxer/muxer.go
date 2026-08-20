@@ -2,6 +2,7 @@ package muxer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -37,6 +38,14 @@ type mediaEngine interface {
 	StartSinglePlaceholderSession(context.Context, string, string, bool) (*ffmpeg.Session, error)        // bool: realtime pacing
 	StartImagePlaceholderSession(context.Context, string, string, string, bool) (*ffmpeg.Session, error) // (video, posterImage, outputDir, realtime)
 	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
+}
+
+// dynamicPlaceholderEngine is optional so existing lightweight media fakes and
+// alternate engines can keep using the original placeholder methods. The
+// FFmpeg implementation supports cards and non-zero segment starts, which are
+// required for an atomic late-poster replacement.
+type dynamicPlaceholderEngine interface {
+	StartPlaceholderSession(context.Context, ffmpeg.PlaceholderSpec) (*ffmpeg.Session, error)
 }
 
 // Policy groups the small number of operational deadlines used during startup
@@ -362,105 +371,143 @@ func pruneGenerationBytes(dir string, maxBytes int64) {
 	}
 }
 
-// Process performs only addon collection and inexpensive metadata planning.
-// Network resolution, probing and FFmpeg work remain lazy until the user plays.
+// Process returns the public stream entry after a short Cinemeta lookup.
+// Addon collection/planning continues in the job lifecycle, while source
+// resolution, probing and FFmpeg work remain lazy until the user plays.
 func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, contentID string) (*Result, error) {
+	if cfg == nil {
+		return &Result{}, fmt.Errorf("missing config")
+	}
 	addons := uniqueAddons(cfg.ValidAddons())
 	if len(addons) == 0 {
 		return &Result{}, nil
 	}
 
-	streams := m.collector.CollectStreams(ctx, addons, contentType, contentID)
-	plans := m.planner.Build(streams, cfg.Language)
-	if len(plans) == 0 {
-		return &Result{}, nil
-	}
-
-	result := &Result{}
-	var subtitleStream *model.StremioStream
-	if subtitle, ok := firstPlan(plans, func(plan model.PlaybackPlan) bool {
-		return plan.Kind == model.PlanSubtitledFallback
-	}); ok {
-		language := subtitle.Video.Language
-		if language == "" {
-			language = "English"
-		}
-		subtitleStream = directStream(
-			fmt.Sprintf("🎞️ Legendado — %s %s", subtitle.Video.Parsed.Resolution, subtitle.Video.Parsed.Quality),
-			fmt.Sprintf("Fonte: %s | %s", subtitle.Video.AddonName, language),
-			subtitle.Video.Stream,
-		)
-	}
-
-	primary, hasDubbed := firstPlan(plans, func(plan model.PlaybackPlan) bool {
-		return plan.HasTargetAudio
-	})
-	if !hasDubbed {
-		// Expose one catalog entry only. When no target-language audio exists,
-		// the same entry is the subtitle fallback and is named accordingly.
-		result.Dubbed = subtitleStream
-		return result, nil
-	}
-
 	job := &model.MuxJob{
-		TargetLanguage:  cfg.Language,
-		Title:           primary.Video.AddonName + " + " + primary.Audio.AddonName,
-		Plans:           plans,
-		VideoCandidates: m.planner.VideoCandidates(streams, cfg.Language),
-		Config:          *cfg,
-		ContentType:     contentType,
-		ContentID:       contentID,
+		TargetLanguage: cfg.Language,
+		Config:         *cfg,
+		ContentType:    contentType,
+		ContentID:      contentID,
+		TierMetas:      placeholderTierMetas(),
 	}
-
 	jobID := m.store.Save(job)
+	if jobID == "" {
+		return &Result{}, fmt.Errorf("store returned empty job id")
+	}
 
-	// Compute the ABR downgrade ladder metadata for the master playlist from
-	// the plan list (no probing): tier 0 is the primary plan, tiers 1-2 pick
-	// the best lighter source when one exists within the tier's bitrate
-	// budget, else fall back to a transcode of the primary source. The
-	// strategies themselves are resolved lazily when the player requests a
-	// tier.
-	job.TierMetas = tierMetasFromPlans(plans)
-
-	// Start a best-effort poster prefetch in a per-job temp directory. If the
-	// user clicks play immediately, runPlaceholder will wait up to 500ms for this
-	// to finish before falling back to the plain placeholder.
 	posterDir, err := os.MkdirTemp("", "streammux-poster-"+jobID+"-*")
-	if err != nil {
-		log.Printf("mux: cannot create poster cache: %v", err)
-	} else {
-		// Ensure job.CacheDir is the poster directory so runPlaceholder can find
-		// the downloaded poster without needing a separate lookup.
+	if err == nil {
 		job.CacheDir = posterDir
-		posterPath := filepath.Join(posterDir, posterFileName)
-		_ = m.prefetchPoster(ctx, contentType, contentID, posterPath)
+	} else {
+		log.Printf("mux: cannot create poster cache: %v", err)
 	}
 
-	mode := "Remux"
-	if primary.SingleSource() {
-		mode = "Fonte única"
+	state, err := m.stateFor(job)
+	if err != nil {
+		if posterDir != "" {
+			_ = os.RemoveAll(posterDir)
+		}
+		return &Result{}, err
 	}
-	result.Dubbed = &model.StremioStream{
-		Name: fmt.Sprintf(
-			"🎬 Dublado — %s %s + Áudio %s",
-			primary.Video.Parsed.Resolution,
-			primary.Video.Parsed.Quality,
-			cfg.Language,
-		),
-		Description: fmt.Sprintf(
-			"Vídeo: %s (%s) | Áudio: %s | %s com fallback automático",
-			primary.Video.AddonName,
-			primary.Video.Parsed.Resolution,
-			primary.Audio.AddonName,
-			mode,
-		),
-		URL: m.muxURL(jobID),
+
+	metadata := contentMetadata{}
+	// Keep the identity lookup bounded more tightly than addon collection: a
+	// slow Cinemeta response must not make autoplay feel like it is waiting for
+	// the old synchronous pipeline.
+	metadataCtx, metadataCancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	if fetched, fetchErr := fetchCinemetaMetadata(metadataCtx, m.httpClient, contentType, contentID); fetchErr == nil {
+		metadata = fetched
+	} else {
+		log.Printf("mux: Cinemeta metadata unavailable: %v", fetchErr)
+	}
+	metadataCancel()
+
+	state.mu.Lock()
+	state.metadata = metadata
+	state.cardPath = filepath.Join(state.cacheDir, "placeholder-card.txt")
+	state.preparationWait = make(chan struct{})
+	state.tierMetas = append([]model.TierMeta(nil), job.TierMetas...)
+	state.mu.Unlock()
+	job.Title = metadata.Title
+	if err := writePlaceholderCard(state.cardPath, renderPlaceholderCard(metadata, nil, cfg.Language)); err != nil {
+		log.Printf("mux: cannot initialize placeholder card: %v", err)
+	}
+
+	if metadata.PosterURL != "" && state.posterPath != "" {
+		m.prefetchPosterURL(state.ctx, metadata.PosterURL, state.posterPath)
+	} else if state.posterPath != "" && contentType != "" && contentID != "" {
+		// If the short synchronous metadata budget expired, make one best-effort
+		// background attempt so the poster can still arrive during playback.
+		m.prefetchPosterForContent(state.ctx, contentType, contentID, state.posterPath)
+	}
+	go m.prepareJob(job, state, addons, cfg.Language)
+
+	name, description := streamPresentation(metadata)
+	return &Result{Dubbed: &model.StremioStream{
+		Name:        name,
+		Description: description,
+		URL:         m.muxURL(jobID),
 		BehaviorHints: map[string]any{
 			"notWebReady": true,
 		},
+	}}, nil
+}
+
+func streamPresentation(metadata contentMetadata) (string, string) {
+	name := "🎬 StreamMux MultiAudio"
+	if metadata.Title != "" {
+		name = fmt.Sprintf("🎬 %s • StreamMux MultiAudio", metadata.Title)
 	}
 
-	return result, nil
+	var facts []string
+	if metadata.Year != "" {
+		facts = append(facts, metadata.Year)
+	}
+	if metadata.Rating != "" {
+		facts = append(facts, "⭐ "+metadata.Rating)
+	}
+	lines := make([]string, 0, 2)
+	if len(facts) > 0 {
+		lines = append(lines, strings.Join(facts, " • "))
+	}
+	lines = append(lines, "Áudio no seu idioma • qualidade máxima • remux automático")
+	return name, strings.Join(lines, "\n")
+}
+
+// prepareJob is deliberately tied to state.ctx. The HTTP request is allowed
+// to finish immediately, but addon calls remain alive until playback is
+// canceled or the store expires the job.
+func (m *Muxer) prepareJob(job *model.MuxJob, state *playbackState, addons []model.Addon, language string) {
+	streams := m.collector.CollectStreams(state.ctx, addons, job.ContentType, job.ContentID)
+	plans := m.planner.Build(streams, language)
+	candidates := m.planner.VideoCandidates(streams, language)
+
+	state.mu.Lock()
+	if state.closed {
+		state.mu.Unlock()
+		return
+	}
+	job.Plans = plans
+	job.VideoCandidates = candidates
+	metas := tierMetasFromPlans(plans)
+	if len(metas) == 0 {
+		metas = placeholderTierMetas()
+	}
+	job.TierMetas = metas
+	state.tierMetas = append([]model.TierMeta(nil), metas...)
+	state.prepared = len(plans) > 0
+	if !state.prepared {
+		state.preparationErr = errors.New("addons returned no playable streams")
+	}
+	wait := state.preparationWait
+	state.mu.Unlock()
+
+	if len(plans) > 0 {
+		_ = writePlaceholderCard(state.cardPath, renderPlaceholderCard(state.metadata, plans, language))
+	}
+	if wait != nil {
+		close(wait)
+	}
 }
 
 func uniqueAddons(addons []model.Addon) []model.Addon {

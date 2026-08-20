@@ -15,11 +15,123 @@ import (
 
 var cinemetaBaseURL = "https://v3-cinemeta.strem.io"
 
-// cinemetaMeta is the subset of the Cinemeta meta response we need.
+const cinemetaMetadataTimeout = 2 * time.Second
+
+// cinemetaMeta is the subset of the Cinemeta meta response we need. Keep the
+// fields deliberately small: the stream card needs identity and rating data,
+// while source quality/language details still come from the addons.
 type cinemetaMeta struct {
 	Meta struct {
-		Poster string `json:"poster"`
+		Name        string          `json:"name"`
+		Poster      string          `json:"poster"`
+		ReleaseInfo string          `json:"releaseInfo"`
+		IMDBRating  json.RawMessage `json:"imdbRating"`
+		Videos      []struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Season  int    `json:"season"`
+			Episode int    `json:"episode"`
+		} `json:"videos"`
 	} `json:"meta"`
+}
+
+type contentMetadata struct {
+	Title     string
+	Year      string
+	Rating    string
+	PosterURL string
+}
+
+func fetchCinemetaMetadata(ctx context.Context, client *http.Client, contentType, contentID string) (contentMetadata, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
+	if contentType == "" || contentID == "" {
+		return contentMetadata{}, fmt.Errorf("missing content type or id")
+	}
+
+	cinemetaID := contentID
+	season, episode := 0, 0
+	if contentType == "series" {
+		parts := strings.Split(contentID, ":")
+		if len(parts) > 0 {
+			cinemetaID = parts[0]
+		}
+		if len(parts) > 2 {
+			_, _ = fmt.Sscanf(parts[1], "%d", &season)
+			_, _ = fmt.Sscanf(parts[2], "%d", &episode)
+		}
+	}
+
+	url := fmt.Sprintf("%s/meta/%s/%s.json", strings.TrimSuffix(cinemetaBaseURL, "/"), contentType, cinemetaID)
+	reqCtx, cancel := context.WithTimeout(ctx, cinemetaMetadataTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return contentMetadata{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return contentMetadata{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return contentMetadata{}, fmt.Errorf("cinemeta returned status %d", resp.StatusCode)
+	}
+
+	var meta cinemetaMeta
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return contentMetadata{}, err
+	}
+
+	title := strings.TrimSpace(meta.Meta.Name)
+	if season > 0 && episode > 0 {
+		for _, video := range meta.Meta.Videos {
+			if video.Season == season && video.Episode == episode {
+				if name := strings.TrimSpace(video.Name); name != "" {
+					title = name
+				}
+				break
+			}
+		}
+	}
+
+	rating := strings.TrimSpace(string(meta.Meta.IMDBRating))
+	rating = strings.Trim(rating, `"`)
+	if rating == "null" {
+		rating = ""
+	}
+	return contentMetadata{
+		Title:     title,
+		Year:      firstReleaseYear(meta.Meta.ReleaseInfo),
+		Rating:    rating,
+		PosterURL: normalizePosterURL(meta.Meta.Poster),
+	}, nil
+}
+
+func firstReleaseYear(releaseInfo string) string {
+	for i := 0; i+4 <= len(releaseInfo); i++ {
+		part := releaseInfo[i : i+4]
+		valid := true
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return part
+		}
+	}
+	return ""
+}
+
+func normalizePosterURL(posterURL string) string {
+	posterURL = strings.TrimSpace(posterURL)
+	posterURL = strings.Replace(posterURL, "/small/", "/large/", 1)
+	posterURL = strings.Replace(posterURL, "/medium/", "/large/", 1)
+	return posterURL
 }
 
 // fetchPoster downloads the film poster for the given Stremio content type and
@@ -27,59 +139,21 @@ type cinemetaMeta struct {
 // never blocks the caller for long. Errors are swallowed; the caller should
 // simply check whether the file was created.
 func fetchPoster(ctx context.Context, client *http.Client, contentType, contentID, destPath string) error {
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
-
-	if contentType == "" || contentID == "" {
-		return fmt.Errorf("missing content type or id")
-	}
-
-	// For series episodes the Stremio content ID includes :season:episode
-	// (e.g. tt14681924:1:1), but the Cinemeta meta API only knows the show
-	// level. Strip the episode suffix so we query the series poster.
-	cinemetaID := contentID
-	if contentType == "series" {
-		if idx := strings.Index(cinemetaID, ":"); idx > 0 {
-			cinemetaID = cinemetaID[:idx]
-		}
-	}
-
-	url := fmt.Sprintf("%s/meta/%s/%s.json", cinemetaBaseURL, contentType, cinemetaID)
-
-	reqCtx, cancel := context.WithTimeout(ctx, 7*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	metadata, err := fetchCinemetaMetadata(ctx, client, contentType, contentID)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("cinemeta returned status %d", resp.StatusCode)
-	}
-
-	var meta cinemetaMeta
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		return err
-	}
-
-	posterURL := meta.Meta.Poster
+	posterURL := metadata.PosterURL
 	if posterURL == "" {
 		return fmt.Errorf("cinemeta response has no poster")
 	}
+	return downloadPoster(ctx, client, posterURL, destPath)
+}
 
-	// Prefer the highest quality available.
-	posterURL = strings.Replace(posterURL, "/small/", "/large/", 1)
-	posterURL = strings.Replace(posterURL, "/medium/", "/large/", 1)
-
+func downloadPoster(ctx context.Context, client *http.Client, posterURL, destPath string) error {
+	if client == nil {
+		client = &http.Client{Timeout: 10 * time.Second}
+	}
 	imgCtx, imgCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer imgCancel()
 
@@ -142,6 +216,44 @@ func (m *Muxer) prefetchPoster(_ context.Context, contentType, contentID, destPa
 		} else {
 			log.Printf("mux: poster prefetch ok -> %s", destPath)
 		}
+	}()
+	return done
+}
+
+func (m *Muxer) prefetchPosterURL(ctx context.Context, posterURL, destPath string) chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		prefetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		if err := downloadPoster(prefetchCtx, m.httpClient, posterURL, destPath); err != nil {
+			log.Printf("mux: poster prefetch failed: %v", err)
+			return
+		}
+		log.Printf("mux: poster prefetch ok -> %s", destPath)
+	}()
+	return done
+}
+
+func (m *Muxer) prefetchPosterForContent(ctx context.Context, contentType, contentID, destPath string) chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		prefetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		metadata, err := fetchCinemetaMetadata(prefetchCtx, m.httpClient, contentType, contentID)
+		if err != nil {
+			log.Printf("mux: background Cinemeta metadata failed: %v", err)
+			return
+		}
+		if metadata.PosterURL == "" {
+			return
+		}
+		if err := downloadPoster(prefetchCtx, m.httpClient, metadata.PosterURL, destPath); err != nil {
+			log.Printf("mux: poster prefetch failed: %v", err)
+			return
+		}
+		log.Printf("mux: poster prefetch ok -> %s", destPath)
 	}()
 	return done
 }

@@ -558,6 +558,18 @@ func tierMetasFromPlans(plans []model.PlaybackPlan) []model.TierMeta {
 	return metas
 }
 
+// placeholderTierMetas gives the player a stable virtual ladder on the very
+// first master request. The values are replaced with addon-derived estimates
+// as soon as preparation completes, and tier 0 is replaced again by probed
+// dimensions/bitrate when the selected source starts.
+func placeholderTierMetas() []model.TierMeta {
+	return []model.TierMeta{
+		{Bandwidth: 12_000_000, Width: 1920, Height: 1080},
+		{Bandwidth: 6_000_000, Width: 1280, Height: 720},
+		{Bandwidth: 2_500_000, Width: 854, Height: 480},
+	}
+}
+
 func min64(a, b int64) int64 {
 	if a < b {
 		return a

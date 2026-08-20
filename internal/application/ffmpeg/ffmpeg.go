@@ -91,6 +91,19 @@ type AudioSessionSpec struct {
 	AudioOffset     time.Duration
 }
 
+// PlaceholderSpec describes a local placeholder HLS session. StartSegment is
+// useful when a replacement joins an already-public timeline; CardPath is
+// watched by drawtext with reload=1 so metadata can change without restarting
+// the session.
+type PlaceholderSpec struct {
+	VideoPath    string
+	ImagePath    string
+	CardPath     string
+	OutputDir    string
+	Realtime     bool
+	StartSegment int
+}
+
 // Session is a single continuous FFmpeg run that produces HLS segments.
 type Session struct {
 	cancel     context.CancelFunc
@@ -540,6 +553,10 @@ func tail(s string, n int) string {
 // has rounded corners and a subtle gray border. The output is an HLS live
 // window identical to buildPlaceholderArgs, so the film handoff is unchanged.
 func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool) []string {
+	return buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir, realtime, 0, "")
+}
+
+func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath string) []string {
 	const (
 		startT       = 2.5
 		duration     = 0.8
@@ -573,6 +590,11 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
 		posterY, startT,
 	)
+	outputLabel := "v"
+	if cardPath != "" {
+		filter += ";[v]" + placeholderDrawtextFilter(cardPath) + "[card]"
+		outputLabel = "card"
+	}
 
 	preset := "veryfast"
 	if !realtime {
@@ -598,7 +620,7 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 	args = append(args,
 		"-filter_complex", filter,
 		"-shortest",
-		"-map", "[v]",
+		"-map", "["+outputLabel+"]",
 		"-c:v", "libx264", "-preset", preset, "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
@@ -608,7 +630,7 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 		"-hls_allow_cache", "0",
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
-		"-start_number", "0",
+		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "0:a:0",
 		"-c:a", "aac", "-b:a", "128k",
@@ -618,7 +640,7 @@ func buildImagePlaceholderArgs(path, imagePath, outputDir string, realtime bool)
 		"-hls_allow_cache", "0",
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
-		"-start_number", "0",
+		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
 	)
 	return args
@@ -659,6 +681,10 @@ func shiftExpr(startT, duration float64, distance, speed float64, reverse bool, 
 // terminal error video as fast as possible — it is short VOD content and must
 // have all its segments ready in seconds, so no pacing and a natural ENDLIST.
 func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
+	return buildPlaceholderArgsWithOptions(path, outputDir, realtime, 0, "")
+}
+
+func buildPlaceholderArgsWithOptions(path, outputDir string, realtime bool, startSegment int, cardPath string) []string {
 	preset := "veryfast"
 	if !realtime {
 		preset = "ultrafast"
@@ -674,6 +700,9 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 		args = append(args, "-readrate", "1", "-readrate_initial_burst", fmtDuration(segDuration))
 	}
 	args = append(args, "-i", path)
+	if cardPath != "" {
+		args = append(args, "-vf", placeholderDrawtextFilter(cardPath))
+	}
 	args = append(args,
 		"-map", "0:v:0",
 		"-c:v", "libx264", "-preset", preset, "-crf", "23",
@@ -685,7 +714,7 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 		"-hls_allow_cache", "0",
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "video", "seg_%05d.ts"),
-		"-start_number", "0",
+		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "0:a:0",
 		"-c:a", "aac", "-b:a", "128k",
@@ -695,10 +724,20 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 		"-hls_allow_cache", "0",
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(outputDir, "audio", "seg_%05d.ts"),
-		"-start_number", "0",
+		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
 	)
 	return args
+}
+
+func placeholderDrawtextFilter(cardPath string) string {
+	return fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=34:box=1:boxcolor=black@0.55:boxborderw=18:x=48:y=h-150", escapeFilterPath(cardPath))
+}
+
+func escapeFilterPath(path string) string {
+	path = strings.ReplaceAll(path, `\`, `\\`)
+	path = strings.ReplaceAll(path, `'`, `\'`)
+	return strings.ReplaceAll(path, ":", `\:`)
 }
 
 // StartSinglePlaceholderSession launches a local video as a live-window HLS
@@ -706,7 +745,7 @@ func buildPlaceholderArgs(path, outputDir string, realtime bool) []string {
 // open (film handoff); false encodes the terminal error video as fast as
 // possible with a natural ENDLIST.
 func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, realtime bool) (*Session, error) {
-	return m.startPlaceholderSession(ctx, path, "", outputDir, realtime)
+	return m.StartPlaceholderSession(ctx, PlaceholderSpec{VideoPath: path, OutputDir: outputDir, Realtime: realtime})
 }
 
 // StartImagePlaceholderSession launches the local placeholder video composed
@@ -715,28 +754,33 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputD
 // output is identical to a regular placeholder session, so the film handoff
 // works unchanged.
 func (m *Muxer) StartImagePlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {
-	return m.startPlaceholderSession(ctx, path, imagePath, outputDir, realtime)
+	return m.StartPlaceholderSession(ctx, PlaceholderSpec{VideoPath: path, ImagePath: imagePath, OutputDir: outputDir, Realtime: realtime})
 }
 
-func (m *Muxer) startPlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {
-	if strings.TrimSpace(path) == "" {
+// StartPlaceholderSession launches a placeholder with optional poster/card
+// composition and an explicit public segment start.
+func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpec) (*Session, error) {
+	if strings.TrimSpace(spec.VideoPath) == "" {
 		return nil, fmt.Errorf("placeholder session: no video provided")
 	}
-	if strings.TrimSpace(outputDir) == "" {
+	if strings.TrimSpace(spec.OutputDir) == "" {
 		return nil, fmt.Errorf("placeholder session: output directory is required")
 	}
-	if err := os.MkdirAll(filepath.Join(outputDir, "video"), 0755); err != nil {
+	if spec.StartSegment < 0 {
+		return nil, fmt.Errorf("placeholder session: invalid start segment")
+	}
+	if err := os.MkdirAll(filepath.Join(spec.OutputDir, "video"), 0755); err != nil {
 		return nil, fmt.Errorf("placeholder session: video dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(outputDir, "audio"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(spec.OutputDir, "audio"), 0755); err != nil {
 		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
 	}
 
 	var args []string
-	if imagePath != "" {
-		args = buildImagePlaceholderArgs(path, imagePath, outputDir, realtime)
+	if spec.ImagePath != "" {
+		args = buildImagePlaceholderArgsWithOptions(spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath)
 	} else {
-		args = buildPlaceholderArgs(path, outputDir, realtime)
+		args = buildPlaceholderArgsWithOptions(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath)
 	}
 
 	sessCtx, cancel := context.WithCancel(ctx)
@@ -754,7 +798,7 @@ func (m *Muxer) startPlaceholderSession(ctx context.Context, path, imagePath, ou
 		cancel:     cancel,
 		done:       make(chan struct{}),
 		progress:   make(chan ProgressSample, 1),
-		startN:     0,
+		startN:     spec.StartSegment,
 		stderrTail: stderr,
 	}
 

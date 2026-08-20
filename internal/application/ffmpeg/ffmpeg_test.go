@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -128,6 +129,17 @@ func TestBuildSessionArgsRejectsInvalidAudioMode(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("buildSessionArgs() error = nil, want invalid audio mode error")
+	}
+}
+
+func TestBuildPlaceholderArgsSupportsCardAndNonZeroStart(t *testing.T) {
+	args := buildPlaceholderArgsWithOptions("placeholder.mp4", "/tmp/out", true, 7, "/tmp/card:with-colon.txt")
+	if !containsArguments(args, []string{"-start_number", "7"}) {
+		t.Fatalf("placeholder start number missing: %#v", args)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "drawtext=textfile='/tmp/card\\:with-colon.txt'") || !strings.Contains(joined, "reload=1") {
+		t.Fatalf("placeholder card filter missing or not escaped: %s", joined)
 	}
 }
 

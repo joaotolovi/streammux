@@ -99,3 +99,31 @@ func TestFetchPosterStripsEpisodeSuffixForSeries(t *testing.T) {
 		t.Fatalf("poster data mismatch")
 	}
 }
+
+func TestFetchCinemetaMetadataExtractsPresentationFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"meta":{"name":"Oppenheimer","releaseInfo":"2023-2024","imdbRating":8.6,"videos":[{"season":1,"episode":1,"name":"Pilot"}]}}`))
+	}))
+	defer server.Close()
+
+	oldBase := cinemetaBaseURL
+	cinemetaBaseURL = server.URL
+	defer func() { cinemetaBaseURL = oldBase }()
+
+	metadata, err := fetchCinemetaMetadata(context.Background(), server.Client(), "movie", "tt123")
+	if err != nil {
+		t.Fatalf("fetchCinemetaMetadata() error = %v", err)
+	}
+	if metadata.Title != "Oppenheimer" || metadata.Year != "2023" || metadata.Rating != "8.6" {
+		t.Fatalf("unexpected metadata: %#v", metadata)
+	}
+
+	metadata, err = fetchCinemetaMetadata(context.Background(), server.Client(), "series", "tt123:1:1")
+	if err != nil {
+		t.Fatalf("series metadata error = %v", err)
+	}
+	if metadata.Title != "Pilot" {
+		t.Fatalf("episode title = %q, want Pilot", metadata.Title)
+	}
+}
