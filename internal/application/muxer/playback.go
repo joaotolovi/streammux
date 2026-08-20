@@ -360,31 +360,28 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 
 	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
 
-	// Prefer the composed placeholder only when the poster is already present.
-	// A missing poster must never delay the first playable segment; watchPoster
-	// will start a replacement later when the download lands.
+	// Prefer the composed placeholder when the poster is already present. A
+	// missing poster must never delay the first playable segment.
 	posterPath := state.posterPath
 	usePoster := posterPath != "" && fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
 
 	var session *ffmpeg.Session
 	var err error
-
 	if usePoster {
-		log.Printf("mux: starting image placeholder with poster %s", posterPath)
+		log.Printf("mux: starting opening video with poster %s", posterPath)
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
 			VideoPath: m.placeholderPath, ImagePath: posterPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
 			OutputDir: dir, Realtime: true,
 		})
 		if err != nil {
-			log.Printf("mux: image placeholder failed, falling back to plain placeholder: %v", err)
+			log.Printf("mux: composed opening failed, falling back to plain opening: %v", err)
 			_ = os.RemoveAll(dir)
 			dir = filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
 			usePoster = false
 		}
 	}
-
 	if !usePoster {
-		log.Printf("mux: starting plain placeholder")
+		log.Printf("mux: starting opening video without poster")
 		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
 			VideoPath: m.placeholderPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
 			OutputDir: dir, Realtime: true,
@@ -461,12 +458,12 @@ func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
 		close(wait)
 	}
 	log.Printf("mux: placeholder playing")
-
 	if !usePoster && posterPath != "" {
 		if _, ok := m.ffmpeg.(dynamicPlaceholderEngine); ok {
 			go m.watchPoster(job, state, gen)
 		}
 	}
+
 }
 
 func (m *Muxer) startPlaceholderSession(ctx context.Context, spec ffmpeg.PlaceholderSpec) (*ffmpeg.Session, error) {

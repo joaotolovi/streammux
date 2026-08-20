@@ -569,38 +569,48 @@ func buildImagePlaceholderArgsWithOptions(path, imagePath, outputDir string, rea
 
 func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realtime bool, startSegment int, cardPath, metadataPath, detailsPath, overlayEndpoint string) []string {
 	const (
-		startT       = 2.5
+		startT       = 5.0
 		duration     = 0.8
 		posterW      = 256 // 320 * 0.8
 		posterH      = 384 // 480 * 0.8
 		posterX      = 1280 - posterW - 77
 		posterY      = (720 - posterH) / 2
-		shiftLeft    = 140
-		videoSpeed   = float64(shiftLeft) / duration
 		posterSpeedX = 1280 - posterX
 		posterSpeed  = float64(posterSpeedX) / duration
 	)
 
+	spinnerPath := findAsset(path, "loading_spinner.gif")
+	useSpinner := realtime && assetExists(spinnerPath)
+	baseVideo := "[0:v]"
+	filterPrefix := "color=c=black:s=1280x720[base];"
+	if realtime {
+		filterPrefix += "[0:v]tpad=stop_mode=clone:stop_duration=114[basevideo];"
+		baseVideo = "[basevideo]"
+	}
 	filter := fmt.Sprintf(
-		"color=c=black:s=1280x720[base];"+
+		filterPrefix+
 			"[1:v]scale=%d:%d,format=yuva420p[poster_raw];"+
 			"[2:v]scale=%d:%d[mask_scaled];"+
 			"[3:v]scale=%d:%d[border_scaled];"+
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
 			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
-			"[base][0:v]overlay=x='%s':y=0[shifted];"+
+			"[base]%soverlay=x=0:y=0[shifted];"+
 			"[shifted][poster]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[withposter];"+
-			"[withposter][border_scaled]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[v]",
+			"[withposter][border_scaled]overlay=x='%s':y=%d:enable='gt(t,%.2f)'[withborder];"+
+			"[withborder][spinner]overlay=x=1184:y=624:eof_action=repeat[v]",
 		posterW, posterH,
 		posterW, posterH,
 		posterW, posterH,
 		startT, duration,
-		shiftExpr(startT, duration, -shiftLeft, videoSpeed, false, -shiftLeft),
+		baseVideo,
 		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
 		posterY, startT,
 		shiftExpr(startT, duration, 1280-posterX, posterSpeed, true, posterX),
 		posterY, startT,
 	)
+	if !useSpinner {
+		filter = strings.Replace(filter, "[withborder][spinner]overlay=x=1184:y=624:eof_action=repeat[v]", "[withborder]null[v]", 1)
+	}
 	outputLabel := "v"
 	if cardPath != "" {
 		filter += ";[v]" + placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint) + "[card]"
@@ -628,9 +638,11 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		"-loop", "1", "-i", findAsset(path, "poster_round_mask.png"),
 		"-loop", "1", "-i", findAsset(path, "poster_round_border.png"),
 	)
+	if useSpinner {
+		args = append(args, "-stream_loop", "-1", "-i", spinnerPath)
+	}
 	args = append(args,
 		"-filter_complex", filter,
-		"-shortest",
 		"-map", "["+outputLabel+"]",
 		"-c:v", "libx264", "-preset", preset, "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
@@ -644,6 +656,12 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "0:a:0",
+		"-af", func() string {
+			if realtime {
+				return "apad=pad_dur=114"
+			}
+			return "anull"
+		}(),
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
@@ -654,6 +672,9 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
 	)
+	if realtime {
+		args = append(args[:len(args)-1], "-t", "120", args[len(args)-1])
+	}
 	return args
 }
 
@@ -666,6 +687,11 @@ func findAsset(placeholderPath, name string) string {
 		return candidate
 	}
 	return name
+}
+
+func assetExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // shiftExpr builds an expression that moves from startX to endX over the
@@ -715,11 +741,31 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		args = append(args, "-readrate", "1", "-readrate_initial_burst", fmtDuration(segDuration))
 	}
 	args = append(args, "-i", path)
-	if cardPath != "" {
-		args = append(args, "-vf", placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint))
+	spinnerPath := findAsset(path, "loading_spinner.gif")
+	useSpinner := realtime && assetExists(spinnerPath)
+	videoMap := "0:v:0"
+	if useSpinner {
+		args = append(args, "-stream_loop", "-1", "-i", spinnerPath)
+	}
+	if cardPath != "" || useSpinner {
+		textFilter := placeholderDrawtextFilter(cardPath, metadataPath, detailsPath, overlayEndpoint)
+		if !realtime {
+			args = append(args, "-vf", textFilter)
+		} else if useSpinner {
+			filter := "[0:v]tpad=stop_mode=clone:stop_duration=114[intro];" +
+				"[1:v]format=rgba,scale=72:72[spinner];" +
+				"[intro][spinner]overlay=x=1184:y=624:eof_action=repeat[withspinner];" +
+				"[withspinner]" + textFilter + "[v]"
+			args = append(args, "-filter_complex", filter)
+			videoMap = "[v]"
+		} else {
+			args = append(args, "-vf", "tpad=stop_mode=clone:stop_duration=114,"+textFilter)
+		}
+	} else if realtime {
+		args = append(args, "-vf", "tpad=stop_mode=clone:stop_duration=114")
 	}
 	args = append(args,
-		"-map", "0:v:0",
+		"-map", videoMap,
 		"-c:v", "libx264", "-preset", preset, "-crf", "23",
 		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
 		"-force_key_frames", "expr:gte(t,n_forced*4)",
@@ -732,6 +778,12 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "video", "video.m3u8"),
 		"-map", "0:a:0",
+		"-af", func() string {
+			if realtime {
+				return "apad=pad_dur=114"
+			}
+			return "anull"
+		}(),
 		"-c:a", "aac", "-b:a", "128k",
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
@@ -742,6 +794,10 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 		"-start_number", strconv.Itoa(startSegment),
 		filepath.Join(outputDir, "audio", "audio.m3u8"),
 	)
+	if realtime {
+		// Keep both HLS outputs aligned with the 120-second frozen intro.
+		args = append(args[:len(args)-1], "-t", "120", args[len(args)-1])
+	}
 	return args
 }
 

@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 )
 
-//go:embed placeholder.mp4 error.mp4 poster_round_mask.png poster_round_border.png
+//go:embed placeholder.mp4 error.mp4 loading_spinner.gif poster_round_mask.png poster_round_border.png
 var files embed.FS
 
 // PlaceholderPath extracts the default placeholder and its overlay mask assets
@@ -27,7 +27,7 @@ func PlaceholderPath() (path, dir string, err error) {
 		_ = os.RemoveAll(dir)
 		return "", "", err
 	}
-	if err := extractAll(dir, []string{"poster_round_mask.png", "poster_round_border.png"}); err != nil {
+	if err := extractAll(dir, []string{"loading_spinner.gif", "poster_round_mask.png", "poster_round_border.png"}); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", "", err
 	}
