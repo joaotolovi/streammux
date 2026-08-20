@@ -743,13 +743,13 @@ func buildPlaceholderArgsWithCards(path, outputDir string, realtime bool, startS
 func placeholderDrawtextFilter(cardPath string, metadataPath ...string) string {
 	filters := []string{"fade=t=in:st=0:d=0.7"}
 	if len(metadataPath) > 0 && metadataPath[0] != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.48:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0])))
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.82:fontsize=22:line_spacing=5:box=1:boxcolor=black@0.38:boxborderw=10:x=947:y=570", escapeFilterPath(metadataPath[0])))
 	}
 	if cardPath != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=24:box=1:boxcolor=black@0.42:boxborderw=10:x=48:y=48:alpha='if(lt(t,0.8),t/0.8,1)'", escapeFilterPath(cardPath)))
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=24:alpha='if(lt(t,0.8),t/0.8,1)'", escapeFilterPath(cardPath)))
 	}
 	if len(metadataPath) > 1 && metadataPath[1] != "" {
-		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white:fontsize=24:box=1:boxcolor=black@0.42:boxborderw=10:x=48:y=86:alpha='if(lt(t,1.1),0,if(lt(t,1.8),(t-1.1)/0.7,1))'", escapeFilterPath(metadataPath[1])))
+		filters = append(filters, fmt.Sprintf("drawtext=textfile='%s':reload=1:fontcolor=white@0.78:fontsize=22:box=1:boxcolor=black@0.32:boxborderw=8:x=24:y=58:alpha='if(lt(t,1.1),0,if(lt(t,1.8),(t-1.1)/0.7,1))'", escapeFilterPath(metadataPath[1])))
 	}
 	return strings.Join(filters, ",")
 }
