@@ -592,8 +592,8 @@ func buildImagePlaceholderArgsWithCards(path, imagePath, outputDir string, realt
 			"[poster_raw][mask_scaled]alphamerge[rounded];"+
 			"[rounded]fade=t=in:st=%.2f:d=%.2f:alpha=1,setpts=PTS-STARTPTS[poster];"+
 			"[base]%soverlay=x=0:y=0[shifted];"+
-			"[shifted][poster]overlay@poster=x=1280:y=%d[withposter];"+
-			"[withposter][border_scaled]overlay@poster_border=x=1280:y=%d[withborder];"+
+			"[shifted][poster]overlay@poster=x='if(lt(t,5),1280,max(947,1280-(t-5)*416.25))':y=%d[withposter];"+
+			"[withposter][border_scaled]overlay@poster_border=x='if(lt(t,5),1280,max(947,1280-(t-5)*416.25))':y=%d[withborder];"+
 			spinnerInput,
 		posterW, posterH,
 		posterW, posterH,
