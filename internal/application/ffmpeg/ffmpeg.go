@@ -17,9 +17,10 @@ const (
 	// segDuration is the length of each HLS segment in seconds.
 	segDuration = 4.0
 
-	// hlsWindowSegments preserves the short, continuously updated HLS window
-	// expected by clients through an intro-to-film discontinuity.
-	hlsWindowSegments = 12
+	// StreamMux renders its own playback window and removes files according to
+	// the client cursor. FFmpeg must retain produced segments meanwhile: a VOD
+	// source can run several times faster than the player consumes it.
+	hlsManifestSegments = 0
 )
 
 const stderrTailSize = 32 * 1024
@@ -289,7 +290,7 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
 	}
-	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_list_size", strconv.Itoa(hlsWindowSegments), "-hls_flags", "independent_segments+temp_file+split_by_time+delete_segments", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
+	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_list_size", strconv.Itoa(hlsManifestSegments), "-hls_flags", "independent_segments+temp_file+split_by_time", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
 	return args, nil
 }
 
@@ -362,9 +363,9 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	// hls_time, permanently misaligning the two renditions. split_by_time
 	// keeps both renditions on the same 4s grid; the first post-seek segment
 	// may start mid-GOP (players decode from its first keyframe).
-	videoFlags := "independent_segments+temp_file+delete_segments"
+	videoFlags := "independent_segments+temp_file"
 	if spec.StartTime > 0 {
-		videoFlags = "temp_file+split_by_time+discont_start+delete_segments"
+		videoFlags = "temp_file+split_by_time+discont_start"
 	} else if spec.StartSegment > 0 {
 		videoFlags += "+discont_start"
 	}
@@ -397,7 +398,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", strconv.Itoa(hlsWindowSegments),
+		"-hls_list_size", strconv.Itoa(hlsManifestSegments),
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "video", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),
@@ -406,7 +407,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 
 	// Audio-only rendition: split_by_time keeps it on the exact 4s grid
 	// (audio frames are dense, cutting anywhere is safe).
-	audioFlags := "independent_segments+temp_file+split_by_time+delete_segments"
+	audioFlags := "independent_segments+temp_file+split_by_time"
 	if spec.StartSegment > 0 {
 		audioFlags += "+discont_start"
 	}
@@ -426,7 +427,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", strconv.Itoa(hlsWindowSegments),
+		"-hls_list_size", strconv.Itoa(hlsManifestSegments),
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),

@@ -38,9 +38,9 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		{"-metadata:s:a:0", "language=por"},
 		{"-disposition:a:0", "default"},
 		{"-metadata:s:a:0", "title=Português"},
-		{"-hls_flags", "temp_file+split_by_time+discont_start+delete_segments"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start"},
 		{"-hls_segment_filename", "/tmp/session/video/seg_%05d.ts"},
-		{"-hls_list_size", "12"},
+		{"-hls_list_size", "0"},
 		{"-hls_segment_filename", "/tmp/session/audio/seg_%05d.ts"},
 		{"/tmp/session/video/video.m3u8"},
 		{"/tmp/session/audio/audio.m3u8"},
@@ -72,7 +72,7 @@ func TestBuildAudioSessionArgs(t *testing.T) {
 		{"-c:a", "aac"},
 		{"-metadata:s:a:0", "language=eng"},
 		{"-hls_segment_filename", "/tmp/audio-alt/audio/seg_%05d.ts"},
-		{"-hls_list_size", "12"},
+		{"-hls_list_size", "0"},
 		{"-start_number", "7"},
 		{"/tmp/audio-alt/audio/audio.m3u8"},
 	} {
@@ -109,7 +109,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
 		{"-c:a", "aac"},
-		{"-hls_flags", "temp_file+split_by_time+discont_start+delete_segments"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start"},
 		{"/tmp/dual/video/video.m3u8"},
 		{"/tmp/dual/audio/audio.m3u8"},
 	} {
@@ -202,11 +202,11 @@ func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
 	}
 	videoFlags := flagsFor(got, "/tmp/fresh/video/video.m3u8")
 	audioFlags := flagsFor(got, "/tmp/fresh/audio/audio.m3u8")
-	if videoFlags != "independent_segments+temp_file+delete_segments" {
-		t.Fatalf("fresh video flags = %q, want bounded segment window", videoFlags)
+	if videoFlags != "independent_segments+temp_file" {
+		t.Fatalf("fresh video flags = %q, want muxer-managed segment retention", videoFlags)
 	}
-	if audioFlags != "independent_segments+temp_file+split_by_time+delete_segments" {
-		t.Fatalf("audio flags = %q, want bounded split-by-time window", audioFlags)
+	if audioFlags != "independent_segments+temp_file+split_by_time" {
+		t.Fatalf("audio flags = %q, want muxer-managed split-by-time retention", audioFlags)
 	}
 }
 
