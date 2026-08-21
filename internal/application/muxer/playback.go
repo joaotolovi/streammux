@@ -1593,9 +1593,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	state.lastAccess = time.Now()
 	placeholder := state.placeholder
 	active := state.active
-	base := state.filmBase
 	duration := state.duration
-	filmStartTime := state.filmStartTime
 	metadataDuration := state.metadata.Duration
 	disc := append([]int(nil), state.discontinuities...)
 	if tier > 0 && tier < tierCount {
@@ -1636,14 +1634,12 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(segDur))))
 
 	if duration > 0 {
-		// The playlist starts at filmBase, so segment durations are relative to
-		// the source time represented by that public segment.
-		remaining := duration - filmStartTime
-		if remaining < 0 {
-			remaining = 0
-		}
-		segs := computeEqualLengthSegments(segDur, remaining)
-		first := base
+		// Keep the complete public movie timeline after the intro handoff. The
+		// player already applied its saved position while the virtual intro
+		// playlist was active; starting this VOD at filmBase would reset its media
+		// time to zero and make it apply the saved position a second time.
+		segs := computeEqualLengthSegments(segDur, duration)
+		first := 0
 		last := first + len(segs) - 1
 		if first > last {
 			first = last + 1
@@ -1871,8 +1867,6 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 		introPhysical, introMapped = mapIntroSegment(state, segment)
 	}
 	duration := state.duration
-	filmBase := state.filmBase
-	filmStartTime := state.filmStartTime
 	errGen := state.errorGeneration
 	errStart := state.errorStart
 	active := state.active
@@ -1898,7 +1892,7 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 		if segment >= errStart+m.errorSegmentCount() {
 			return ""
 		}
-	} else if segment < filmBase || segment >= filmBase+vodSegmentCount(duration-filmStartTime) {
+	} else if segment >= vodSegmentCount(duration) {
 		return ""
 	}
 	// Once a tier switch completes, the active generation is authoritative.
@@ -2255,7 +2249,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	state.mu.Lock()
 	count := 0
 	if state.duration > 0 {
-		count = state.filmBase + vodSegmentCount(state.duration-state.filmStartTime)
+		count = vodSegmentCount(state.duration)
 	}
 	hasError := state.errorGeneration != nil
 	state.mu.Unlock()
