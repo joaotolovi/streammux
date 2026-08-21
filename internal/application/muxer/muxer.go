@@ -64,6 +64,15 @@ type Policy struct {
 	// MinHandoffBuffer is how much content the film must have ready before the
 	// intro hands off, so playback doesn't stall on the first bandwidth dip.
 	MinHandoffBuffer time.Duration
+	// GenerationDuration bounds each on-demand VOD batch. The muxer starts the
+	// next batch before the current batch's remaining buffer is exhausted.
+	GenerationDuration time.Duration
+	// GenerationRefillLead is the minimum buffered media remaining when the next
+	// batch starts warming up.
+	GenerationRefillLead time.Duration
+	// SegmentRetention is the rewind window retained behind the client's last
+	// requested segment.
+	SegmentRetention time.Duration
 	// TierSwitchBuffer is the cushion required when spinning up a lazy ABR
 	// tier switch: smaller than the startup cushion so the switch is fast,
 	// but nonzero so the first segment is already out before the player
@@ -91,29 +100,26 @@ func defaultPolicy() Policy {
 		// The Stremio client tolerates roughly 60s before it gives up on
 		// starting playback, so startup can use a generous window. Lenient uses
 		// half of StartupTimeout and re-runs cached probes, so it stays fast.
-		StartupTimeout:   50 * time.Second,
-		AttemptTimeout:   25 * time.Second,
-		SegmentTimeout:   30 * time.Second,
-		IdleTimeout:      90 * time.Second,
-		HealthWindow:     4 * time.Second,
-		RecoveryCooldown: 10 * time.Second,
-		RetryCooldown:    30 * time.Second,
-		// Remote film inputs are intentionally paced at 1x. Allow normal FFmpeg
-		// scheduling jitter around that limit; genuinely slow sources still fall
-		// below this threshold across consecutive health windows.
-		MinRealtime:        0.90,
-		MinPublishedAhead:  12 * time.Second,
-		// Film inputs are paced after their initial burst. Keep the intro frozen
-		// for at most two HLS segments while the first film generation warms up;
-		// a longer freeze makes clients abandon the live-to-VOD handoff.
-		MinHandoffBuffer:   8 * time.Second,
-		TierSwitchBuffer:   8 * time.Second,
-		TierSwitchCooldown: 30 * time.Second,
-		DurationTolerance:  0.002,
-		PlaceholderMinTime: 8 * time.Second,
-		CacheMaxBytes:      8 * 1024 * 1024 * 1024,
-		CacheMinFreeBytes:  3 * 1024 * 1024 * 1024,
-		SessionMaxBytes:    512 * 1024 * 1024,
+		StartupTimeout:       50 * time.Second,
+		AttemptTimeout:       25 * time.Second,
+		SegmentTimeout:       30 * time.Second,
+		IdleTimeout:          90 * time.Second,
+		HealthWindow:         4 * time.Second,
+		RecoveryCooldown:     10 * time.Second,
+		RetryCooldown:        30 * time.Second,
+		MinRealtime:          1.0,
+		MinPublishedAhead:    12 * time.Second,
+		MinHandoffBuffer:     20 * time.Second,
+		GenerationDuration:   96 * time.Second,
+		GenerationRefillLead: 24 * time.Second,
+		SegmentRetention:     60 * time.Second,
+		TierSwitchBuffer:     8 * time.Second,
+		TierSwitchCooldown:   30 * time.Second,
+		DurationTolerance:    0.002,
+		PlaceholderMinTime:   8 * time.Second,
+		CacheMaxBytes:        8 * 1024 * 1024 * 1024,
+		CacheMinFreeBytes:    3 * 1024 * 1024 * 1024,
+		SessionMaxBytes:      2 * 1024 * 1024 * 1024,
 	}
 }
 
@@ -281,9 +287,12 @@ func (m *Muxer) enforceCacheBudget() {
 		state.mu.Lock()
 		active := state.active
 		all := append([]*generation(nil), state.all...)
+		requested := state.lastRequested
 		state.mu.Unlock()
+		retainBefore := requested - durationSegments(m.policy.SegmentRetention)
 		if active != nil {
-			pruneGenerationBytes(active.dir, sessionLimit)
+			pruneGenerationSegments(active.dir, retainBefore)
+			pruneGenerationBytes(active.dir, sessionLimit, retainBefore)
 		}
 		for _, generation := range all {
 			if generation == nil || generation == active || generation.session == nil {
@@ -291,7 +300,11 @@ func (m *Muxer) enforceCacheBudget() {
 			}
 			select {
 			case <-generation.session.Done():
-				_ = os.RemoveAll(generation.dir)
+				// A completed batch can still contain the next segment requested
+				// by the client while its replacement is warming up.
+				if requested > highestCompleteSegment(generation.dir) {
+					_ = os.RemoveAll(generation.dir)
+				}
 			default:
 			}
 		}
@@ -328,7 +341,39 @@ type cacheSegment struct {
 	size  int64
 }
 
-func pruneGenerationBytes(dir string, maxBytes int64) {
+func durationSegments(duration time.Duration) int {
+	if duration <= 0 {
+		return 0
+	}
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4
+	}
+	return int(math.Ceil(duration.Seconds() / segDur))
+}
+
+func pruneGenerationSegments(dir string, before int) {
+	if dir == "" || before <= 0 {
+		return
+	}
+	for _, media := range []string{"video", "audio"} {
+		entries, err := os.ReadDir(filepath.Join(dir, media))
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			var index int
+			if _, err := fmt.Sscanf(entry.Name(), "seg_%05d.ts", &index); err == nil && index < before {
+				_ = os.Remove(filepath.Join(dir, media, entry.Name()))
+			}
+		}
+	}
+}
+
+func pruneGenerationBytes(dir string, maxBytes int64, before int) {
 	if dir == "" || maxBytes <= 0 {
 		return
 	}
@@ -369,6 +414,9 @@ func pruneGenerationBytes(dir string, maxBytes int64) {
 	for _, segment := range ordered {
 		if total <= maxBytes {
 			break
+		}
+		if segment.index >= before {
+			continue
 		}
 		for _, path := range segment.paths {
 			_ = os.Remove(path)

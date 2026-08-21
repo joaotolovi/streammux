@@ -59,12 +59,41 @@ func TestPruneGenerationBytesRemovesOldestCompleteSegments(t *testing.T) {
 		}
 	}
 
-	pruneGenerationBytes(dir, 400)
+	pruneGenerationBytes(dir, 400, 2)
 	if fileExists(filepath.Join(dir, "video", "seg_00000.ts")) || fileExists(filepath.Join(dir, "audio", "seg_00000.ts")) {
 		t.Fatal("oldest segment pair was not removed")
 	}
 	if !fileExists(filepath.Join(dir, "video", "seg_00002.ts")) || !fileExists(filepath.Join(dir, "audio", "seg_00002.ts")) {
 		t.Fatal("newest segment pair was removed")
+	}
+}
+
+func TestPruneGenerationSegmentsKeepsRewindWindow(t *testing.T) {
+	dir := t.TempDir()
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := 0; index < 4; index++ {
+		for _, media := range []string{"video", "audio"} {
+			path := filepath.Join(dir, media, fmt.Sprintf("seg_%05d.ts", index))
+			if err := os.WriteFile(path, []byte("segment"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	pruneGenerationSegments(dir, 2)
+	for _, index := range []int{0, 1} {
+		if fileExists(filepath.Join(dir, "video", fmt.Sprintf("seg_%05d.ts", index))) {
+			t.Fatalf("expired video segment %d was retained", index)
+		}
+	}
+	for _, index := range []int{2, 3} {
+		if !fileExists(filepath.Join(dir, "video", fmt.Sprintf("seg_%05d.ts", index))) || !fileExists(filepath.Join(dir, "audio", fmt.Sprintf("seg_%05d.ts", index))) {
+			t.Fatalf("rewind-window segment %d was removed", index)
+		}
 	}
 }
 

@@ -894,6 +894,7 @@ func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState,
 		UserAgent:       browserUA,
 		AudioOffset:     audioOffset,
 		Transcode:       prepared.transcode,
+		Duration:        m.policy.GenerationDuration,
 	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
@@ -2065,6 +2066,7 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 			StartSegment: segment, StartTime: float64(segment-state.filmBase) * ffmpeg.SegDuration(),
 			OutputDir: dir, AudioMode: prepared.audioMode, AudioLanguage: id,
 			AudioTitle: id, UserAgent: browserUA, AudioOffset: audioOffsetForPrepared(m, prepared),
+			Duration: m.policy.GenerationDuration,
 		})
 		state.mu.Lock()
 		r.starting = false
@@ -2129,6 +2131,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			at = lastRequested + 1
 		}
 		m.requestTier(job, state, tier, at)
+		m.ensureGenerationRefill(job, state, segment)
 	}
 
 	if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
@@ -2211,12 +2214,16 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			select {
 			case <-active.session.Done():
 				if !recovering {
-					m.ensureRecovery(job, state, segment, "session ended")
+					reason := "session ended"
+					if active.session.Err() == nil {
+						reason = "buffer refill"
+					}
+					m.ensureRecovery(job, state, segment, reason)
 				}
 			default:
-				// A bounded HLS cache removes old segments. A request behind the
-				// producer is therefore a backward seek and must relaunch at that
-				// position instead of retaining the entire film on disk.
+				// The muxer retains a short rewind window behind the player. A
+				// request before that window is a real backward seek and must
+				// relaunch at the requested position.
 				if (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
 					m.fastSeek(job, state, active, segment)
 				}
@@ -2244,6 +2251,41 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			}
 		}
 	}
+}
+
+// ensureGenerationRefill starts the next finite VOD batch while the player
+// still has enough of the completed batch to continue without waiting. The
+// previous batch remains in state.all until its last segment is consumed.
+func (m *Muxer) ensureGenerationRefill(job *model.MuxJob, state *playbackState, segment int) {
+	state.mu.Lock()
+	if state.closed || state.recovering || state.active == nil || state.active.isError {
+		state.mu.Unlock()
+		return
+	}
+	active := state.active
+	lead := m.policy.GenerationRefillLead
+	state.mu.Unlock()
+
+	select {
+	case <-active.session.Done():
+	default:
+		return
+	}
+	if active.session.Err() != nil {
+		return
+	}
+
+	segDur := ffmpeg.SegDuration()
+	if segDur <= 0 {
+		segDur = 4
+	}
+	leadSegments := int(math.Ceil(lead.Seconds() / segDur))
+	highest := highestCompleteSegment(active.dir)
+	if highest < segment || highest-segment > leadSegments {
+		return
+	}
+	log.Printf("mux: refilling completed batch at segment %d with %d segments ahead", highest+1, highest-segment)
+	m.ensureRecovery(job, state, highest+1, "buffer refill")
 }
 
 func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio bool) string {
@@ -2389,7 +2431,7 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 		prefer = nil
 	}
 	state.mu.Unlock()
-	if prefer != nil && reason != "seek" {
+	if prefer != nil && reason != "seek" && reason != "buffer refill" {
 		m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
 	}
 	if reason == "player throughput" {
@@ -2464,7 +2506,9 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	}
 	if old != nil && old != winner {
 		old.session.Cancel()
-		m.removeGenerationWhenStopped(old)
+		if reason != "buffer refill" {
+			m.removeGenerationWhenStopped(old)
+		}
 	}
 	log.Printf("mux: switched at segment %d to video#%d audio#%d (%s) after %s", startSegment, winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, reason)
 	go m.monitorGeneration(job, state, winner)

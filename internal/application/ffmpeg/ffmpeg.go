@@ -17,16 +17,9 @@ const (
 	// segDuration is the length of each HLS segment in seconds.
 	segDuration = 4.0
 
-	// hlsWindowSegments bounds every on-disk rendition to roughly 48 seconds.
-	// Sessions read at playback speed, so this window stays ahead of the player
-	// without allowing a full film to accumulate in the server's temporary disk.
-	hlsWindowSegments = 12
-
-	// Film inputs get six unpaced segments before settling at playback speed.
-	// This keeps startup and seeks prompt while preventing a fast stream-copy
-	// session from deleting segments before an HLS client requests them.
-	filmReadRate         = "1"
-	filmInitialReadBurst = 6 * segDuration
+	// hlsManifestSegments is internal FFmpeg bookkeeping only. StreamMux serves
+	// its own playlist and retains segment files according to the client cursor.
+	hlsManifestSegments = 0
 )
 
 const stderrTailSize = 32 * 1024
@@ -83,6 +76,9 @@ type SessionSpec struct {
 	// Transcode, when non-nil, re-encodes the video (see TranscodeSpec)
 	// instead of stream-copying it.
 	Transcode *TranscodeSpec
+	// Duration bounds one on-demand VOD production batch. A zero duration keeps
+	// the FFmpeg session open until its input ends.
+	Duration time.Duration
 }
 
 // AudioSessionSpec describes a lazy audio-only HLS session aligned to the
@@ -98,6 +94,7 @@ type AudioSessionSpec struct {
 	AudioTitle      string
 	UserAgent       string
 	AudioOffset     time.Duration
+	Duration        time.Duration
 }
 
 // PlaceholderSpec describes a local placeholder HLS session. StartSegment is
@@ -285,7 +282,6 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if ua := strings.TrimSpace(spec.UserAgent); ua != "" {
 		args = append(args, "-user_agent", ua)
 	}
-	args = appendPacedInputArgs(args)
 	args = append(args, "-icy", "0", "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args, "-metadata:s:a:0", "language="+language, "-disposition:a:0", "default")
@@ -293,7 +289,10 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
 	}
-	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_list_size", strconv.Itoa(hlsWindowSegments), "-hls_flags", "independent_segments+temp_file+split_by_time+delete_segments", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
+	if spec.Duration > 0 {
+		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
+	}
+	args = append(args, "-f", "hls", "-hls_time", fmtDuration(segDuration), "-hls_list_size", strconv.Itoa(hlsManifestSegments), "-hls_flags", "independent_segments+temp_file+split_by_time", "-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"), "-start_number", strconv.Itoa(spec.StartSegment), filepath.Join(spec.OutputDir, "audio", "audio.m3u8"))
 	return args, nil
 }
 
@@ -338,7 +337,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 		args = append(args, "-user_agent", userAgent)
 	}
-	args = appendPacedInputArgs(args)
 	args = append(args, "-icy", "0", "-i", spec.VideoURL)
 
 	dualSource := strings.TrimSpace(spec.AudioURL) != "" && spec.AudioURL != spec.VideoURL
@@ -353,7 +351,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)
 		}
-		args = appendPacedInputArgs(args)
 		args = append(args, "-icy", "0", "-i", spec.AudioURL)
 	}
 
@@ -368,9 +365,9 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	// hls_time, permanently misaligning the two renditions. split_by_time
 	// keeps both renditions on the same 4s grid; the first post-seek segment
 	// may start mid-GOP (players decode from its first keyframe).
-	videoFlags := "independent_segments+temp_file+delete_segments"
+	videoFlags := "independent_segments+temp_file"
 	if spec.StartTime > 0 {
-		videoFlags = "temp_file+split_by_time+discont_start+delete_segments"
+		videoFlags = "temp_file+split_by_time+discont_start"
 	} else if spec.StartSegment > 0 {
 		videoFlags += "+discont_start"
 	}
@@ -400,10 +397,13 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	} else {
 		args = append(args, "-c:v", "copy")
 	}
+	if spec.Duration > 0 {
+		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
+	}
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", strconv.Itoa(hlsWindowSegments),
+		"-hls_list_size", strconv.Itoa(hlsManifestSegments),
 		"-hls_flags", videoFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "video", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),
@@ -412,7 +412,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 
 	// Audio-only rendition: split_by_time keeps it on the exact 4s grid
 	// (audio frames are dense, cutting anywhere is safe).
-	audioFlags := "independent_segments+temp_file+split_by_time+delete_segments"
+	audioFlags := "independent_segments+temp_file+split_by_time"
 	if spec.StartSegment > 0 {
 		audioFlags += "+discont_start"
 	}
@@ -429,23 +429,19 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
 	}
+	if spec.Duration > 0 {
+		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
+	}
 	args = append(args,
 		"-f", "hls",
 		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", strconv.Itoa(hlsWindowSegments),
+		"-hls_list_size", strconv.Itoa(hlsManifestSegments),
 		"-hls_flags", audioFlags,
 		"-hls_segment_filename", filepath.Join(spec.OutputDir, "audio", "seg_%05d.ts"),
 		"-start_number", strconv.Itoa(spec.StartSegment),
 		filepath.Join(spec.OutputDir, "audio", "audio.m3u8"),
 	)
 	return args, nil
-}
-
-func appendPacedInputArgs(args []string) []string {
-	return append(args,
-		"-readrate", filmReadRate,
-		"-readrate_initial_burst", fmtDuration(filmInitialReadBurst),
-	)
 }
 
 // StartN returns the segment number this session starts generating at.
