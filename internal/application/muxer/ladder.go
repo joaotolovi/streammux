@@ -313,7 +313,7 @@ func (m *Muxer) requestTier(job *model.MuxJob, state *playbackState, tier, atSeg
 		return
 	}
 	if state.tierBusy {
-		if state.tierPending != tier {
+		if state.tierPending != tier || atSegment >= state.tierSwitchSegment {
 			cancel = cancelTierSwitchLocked(state)
 		}
 		state.mu.Unlock()
@@ -330,11 +330,21 @@ func (m *Muxer) requestTier(job *model.MuxJob, state *playbackState, tier, atSeg
 		state.mu.Unlock()
 		return
 	}
+	lead := durationSegments(m.policy.MinHandoffBuffer)
+	if lead < 1 {
+		lead = 1
+	}
+	// Variant URIs are immutable once served. Leave a full handoff buffer of
+	// active-tier URLs between the player's request and the first target URL.
+	// This also gives the lazy generation time to warm without interrupting the
+	// initial intro-to-film transition.
+	atSegment += lead
 
 	switchCtx, switchCancel := context.WithCancel(state.ctx)
 	expected := state.active
 	state.tierBusy = true
 	state.tierPending = tier
+	state.tierSwitchSegment = atSegment
 	state.tierSwitchCancel = switchCancel
 	state.tierWait = make(chan struct{})
 	state.tierErr = nil
@@ -387,6 +397,7 @@ func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, expected 
 	}
 	state.tierBusy = false
 	state.tierPending = -1
+	state.tierSwitchSegment = -1
 	state.tierSwitchCancel = nil
 	state.tierWait = nil
 	state.mu.Unlock()
@@ -405,11 +416,10 @@ func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, expected 
 		return
 	}
 	if old != nil && old != winner {
-		// The target has a buffered segment at the cutover. Stop the old
-		// generation immediately so a tier switch never leaves three sessions
-		// alive and the normal state returns to one generation.
+		// Stop producing the old tier, but retain its already-served bridge URLs
+		// until the player advances past them. Removing it here turns a retry of
+		// vN/seg_* before the cutover into an unintended seek.
 		old.session.Cancel()
-		m.removeGenerationWhenStopped(old)
 	}
 	log.Printf("mux: tier %d -> %s (ladder tier %d) at segment %d in %s",
 		tier, strategyDesc(winner.prepared), fromTier, atSegment, time.Since(start).Round(time.Millisecond))

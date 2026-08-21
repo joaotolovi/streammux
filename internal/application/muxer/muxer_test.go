@@ -829,6 +829,38 @@ func TestSegmentPathTierIgnoresRetiredTierAfterCutover(t *testing.T) {
 	}
 }
 
+func TestMediaSegmentPathKeepsBridgedTierURIsStableAfterCutover(t *testing.T) {
+	oldDir := t.TempDir()
+	newDir := t.TempDir()
+	for _, dir := range []string{oldDir, newDir} {
+		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bridged := filepath.Join(oldDir, "video", "seg_00012.ts")
+	if err := os.WriteFile(bridged, []byte("primary"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "video", "seg_00017.ts"), []byte("tier"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	job := &model.MuxJob{ID: "job"}
+	mux := &Muxer{states: map[string]*playbackState{
+		"job": {
+			active:     &generation{dir: newDir, tier: 2, startSegment: 17},
+			activeTier: 2,
+			all: []*generation{
+				{dir: oldDir, tier: 0, startSegment: 12},
+				{dir: newDir, tier: 2, startSegment: 17},
+			},
+		},
+	}}
+
+	if path := mux.mediaSegmentPath(job, 12, 2, false); path != bridged {
+		t.Fatalf("bridged tier URI = %q, want %q", path, bridged)
+	}
+}
+
 func TestRequestTierHonorsCooldown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

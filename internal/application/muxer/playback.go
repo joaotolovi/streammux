@@ -103,16 +103,20 @@ type playbackState struct {
 	// tierDisc marks per-tier video discontinuities (strategy switches). A
 	// switch has only one pending generation; requests for it are bridged by
 	// the active generation until the cutover.
-	activeTier       int
-	tierBusy         bool
-	tierPending      int
-	tierSwitchCancel context.CancelFunc
-	tierWait         chan struct{}
-	tierErr          error
-	lastTierSwitch   time.Time
-	tier0Prepared    *preparedPlan
-	tierBudgets      [tierCount]int64
-	tierDisc         [tierCount][]int
+	activeTier  int
+	tierBusy    bool
+	tierPending int
+	// tierSwitchSegment is the first segment whose tier URL has not been
+	// bridged to the active generation. It prevents replacing a URL the player
+	// may already have cached while a lazy tier warms up.
+	tierSwitchSegment int
+	tierSwitchCancel  context.CancelFunc
+	tierWait          chan struct{}
+	tierErr           error
+	lastTierSwitch    time.Time
+	tier0Prepared     *preparedPlan
+	tierBudgets       [tierCount]int64
+	tierDisc          [tierCount][]int
 
 	duration      float64 // film duration in seconds (from probe)
 	lastRequested int
@@ -198,6 +202,7 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 		maxRequested:      -1,
 		lastAccess:        time.Now(),
 		tierPending:       -1,
+		tierSwitchSegment: -1,
 		audioRenditions:   make(map[string]*audioRendition),
 	}
 	m.states[job.ID] = state
@@ -2125,6 +2130,13 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	if !audio {
 		state.mu.Lock()
 		lastRequested := state.lastRequested
+		active := state.active
+		if active != nil {
+			// The cache cursor must advance even when the segment was already
+			// present. Previously it only changed on cache misses, which made
+			// both retention and ABR cutover decisions stale.
+			state.lastRequested = segment
+		}
 		state.mu.Unlock()
 		at := segment
 		if lastRequested >= 0 && lastRequested+1 > at {
@@ -2307,13 +2319,29 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 	state.mu.Lock()
 	active := state.active
 	activeTier := state.activeTier
+	all := append([]*generation(nil), state.all...)
 	state.mu.Unlock()
-	if active == nil || activeTier == tier {
+	if active == nil {
 		return ""
 	}
-	path := generationSegmentPath(active, segment)
-	if fileExists(path) {
-		return path
+	if activeTier != tier {
+		path := generationSegmentPath(active, segment)
+		if fileExists(path) {
+			return path
+		}
+	}
+	// A player may retry a URI it received through the bridge before the tier
+	// cutover. Keep that URI stable even after the new tier becomes active.
+	if tier > 0 && activeTier == tier && segment < active.startSegment {
+		for i := len(all) - 1; i >= 0; i-- {
+			if all[i] == active {
+				continue
+			}
+			path := generationSegmentPath(all[i], segment)
+			if fileExists(path) {
+				return path
+			}
+		}
 	}
 	return ""
 }
