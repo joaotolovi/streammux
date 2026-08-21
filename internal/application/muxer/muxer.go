@@ -280,8 +280,13 @@ func (m *Muxer) enforceCacheBudget() {
 		state.mu.Unlock()
 		retainBefore := requested - durationSegments(m.policy.SegmentRetention)
 		if active != nil {
-			pruneGenerationSegments(active.dir, retainBefore)
-			pruneGenerationBytes(active.dir, sessionLimit, retainBefore)
+			highest := highestCompleteSegment(active.dir)
+			activeRetainBefore := retainBefore
+			if highest >= 0 && requested > highest {
+				activeRetainBefore = highest - durationSegments(m.policy.SegmentRetention)
+			}
+			pruneGenerationSegments(active.dir, activeRetainBefore)
+			pruneGenerationBytes(active.dir, sessionLimit, activeRetainBefore)
 		}
 		for _, generation := range all {
 			if generation == nil || generation == active || generation.session == nil {
