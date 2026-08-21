@@ -277,7 +277,7 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if ua := strings.TrimSpace(spec.UserAgent); ua != "" {
 		args = append(args, "-user_agent", ua)
 	}
-	args = append(args, "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
+	args = append(args, "-icy", "0", "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args, "-metadata:s:a:0", "language="+language, "-disposition:a:0", "default")
 	}
@@ -329,7 +329,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 		args = append(args, "-user_agent", userAgent)
 	}
-	args = append(args, "-i", spec.VideoURL)
+	args = append(args, "-icy", "0", "-i", spec.VideoURL)
 
 	dualSource := strings.TrimSpace(spec.AudioURL) != "" && spec.AudioURL != spec.VideoURL
 	if dualSource {
@@ -343,7 +343,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)
 		}
-		args = append(args, "-i", spec.AudioURL)
+		args = append(args, "-icy", "0", "-i", spec.AudioURL)
 	}
 
 	audioInput := 0
