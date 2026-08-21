@@ -13,13 +13,21 @@ import (
 	"time"
 )
 
-// segDuration is the length of each HLS segment in seconds.
-const segDuration = 4.0
+const (
+	// segDuration is the length of each HLS segment in seconds.
+	segDuration = 4.0
 
-// hlsWindowSegments bounds every on-disk rendition to roughly 48 seconds.
-// Sessions read at playback speed, so this window stays ahead of the player
-// without allowing a full film to accumulate in the server's temporary disk.
-const hlsWindowSegments = 12
+	// hlsWindowSegments bounds every on-disk rendition to roughly 48 seconds.
+	// Sessions read at playback speed, so this window stays ahead of the player
+	// without allowing a full film to accumulate in the server's temporary disk.
+	hlsWindowSegments = 12
+
+	// Film inputs get six unpaced segments before settling at playback speed.
+	// This keeps startup and seeks prompt while preventing a fast stream-copy
+	// session from deleting segments before an HLS client requests them.
+	filmReadRate         = "1"
+	filmInitialReadBurst = 6 * segDuration
+)
 
 const stderrTailSize = 32 * 1024
 
@@ -277,6 +285,7 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if ua := strings.TrimSpace(spec.UserAgent); ua != "" {
 		args = append(args, "-user_agent", ua)
 	}
+	args = appendPacedInputArgs(args)
 	args = append(args, "-icy", "0", "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args, "-metadata:s:a:0", "language="+language, "-disposition:a:0", "default")
@@ -329,6 +338,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 		args = append(args, "-user_agent", userAgent)
 	}
+	args = appendPacedInputArgs(args)
 	args = append(args, "-icy", "0", "-i", spec.VideoURL)
 
 	dualSource := strings.TrimSpace(spec.AudioURL) != "" && spec.AudioURL != spec.VideoURL
@@ -343,6 +353,7 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)
 		}
+		args = appendPacedInputArgs(args)
 		args = append(args, "-icy", "0", "-i", spec.AudioURL)
 	}
 
@@ -428,6 +439,13 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		filepath.Join(spec.OutputDir, "audio", "audio.m3u8"),
 	)
 	return args, nil
+}
+
+func appendPacedInputArgs(args []string) []string {
+	return append(args,
+		"-readrate", filmReadRate,
+		"-readrate_initial_burst", fmtDuration(filmInitialReadBurst),
+	)
 }
 
 // StartN returns the segment number this session starts generating at.
