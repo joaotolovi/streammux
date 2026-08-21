@@ -12,14 +12,9 @@ import (
 	"github.com/streammux/streammux/internal/domain/model"
 )
 
-// The ABR downgrade ladder. The master playlist advertises tier 0/1/2 as
-// progressively lighter variants. Tiers are severity signals, never bindings:
-// when the player requests a tier, the server walks that tier's ladder of
-// strategies — a lighter existing source or an on-the-fly transcode of the
-// primary source — and serves whichever launches, falling through to the next
-// strategy on failure and, if a whole tier is exhausted, to the next tier's
-// ladder under the requested playlist. The public segment timeline is shared,
-// so every switch resumes exactly where the player is.
+// The ABR downgrade ladder. Tier 0 is the selected source and lower tiers are
+// on-the-fly transcodes of that same source. Arbitrary releases cannot safely
+// share HLS boundaries, timestamps, or audio with the primary.
 
 const (
 	tierCount        = 3
@@ -89,29 +84,14 @@ func transcodeSpecFor(tier, t0Height int) *ffmpeg.TranscodeSpec {
 	}
 }
 
-// buildTierLadder computes the strategy ladder for one tier from the composer
-// ledger (metadata only — no probing). All lighter sources are kept — none is
-// discarded — but ordered by distance to the tier's target bitrate so
-// degradation is gradual. Example with t0=100 and target=80: available 95,
-// 89, 79, 67 orders as 79, 89, 67, 95 — the closest to the 20% lighter ideal
-// first, falling back through the next closest if it fails. This avoids a
-// single large jump to a very low quality when a gentle step would suffice.
-// The transcode candidate is interleaved by the same distance metric, with
-// score as tie-break so a professional encode at similar bitrate wins over a
-// realtime transcode.
+// buildTierLadder returns only a transcode of the selected primary source.
+// Stream-copy variants from other releases have unrelated keyframe boundaries
+// and cannot be switched safely on this fixed public segment timeline.
 func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
-	if tier <= 0 || tier >= tierCount || state.tier0Prepared == nil || state.composer == nil {
+	if tier <= 0 || tier >= tierCount || state.tier0Prepared == nil {
 		return nil
 	}
 	t0 := state.tier0Prepared
-	t0Key := t0.plan.Video.SourceKey()
-	audioKey := t0.plan.Audio.SourceKey()
-	if state.active != nil && state.active.prepared != nil {
-		audioKey = state.active.prepared.plan.Audio.SourceKey()
-	}
-	if audioKey == "" || audioKey == t0Key {
-		audioKey = ""
-	}
 	target := state.tierBudgets[tier]
 	if target <= 0 {
 		target = state.tierBudgets[0] * 8 / 10
@@ -119,15 +99,6 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 			target = 8_000_000
 		}
 	}
-	t0Bits := streamBandwidth(t0.plan.Video)
-
-	type ranked struct {
-		s    *tierStrategy
-		dist int64
-	}
-	var ranked_list []ranked
-
-	// Transcode candidate for this tier.
 	tc := transcodeSpecFor(tier, t0.videoHeight)
 	tcBits := int64(tc.MaxRateKbps) * 1000
 	tcScore := int(float64(analyzer.VideoScore(t0.plan.Video)) * transcodeQuality)
@@ -135,99 +106,16 @@ func buildTierLadder(state *playbackState, tier int) []*tierStrategy {
 	if tcDist < 0 {
 		tcDist = -tcDist
 	}
-	ranked_list = append(ranked_list, ranked{
-		s: &tierStrategy{
-			kind:      stratTranscode,
-			transcode: tc,
-			score:     tcScore,
-			estBits:   tcBits,
-			height:    tc.Height,
-			desc:      fmt.Sprintf("transcode primary -> %dp@%dk", tc.Height, tc.MaxRateKbps),
-		},
-		dist: tcDist,
-	})
-
-	// All lighter existing sources (strictly below t0), paired with the
-	// current dub whenever possible. None discarded — ordered by proximity
-	// to target. Sources already marked failed are skipped (ledger is live).
-	for _, v := range state.composer.videos {
-		if v.failed || v.stream.SourceKey() == t0Key {
-			continue
-		}
-		est := streamBandwidth(v.stream)
-		if est >= t0Bits {
-			continue
-		}
-		if est <= 0 {
-			continue
-		}
-		score := analyzer.VideoScore(v.stream)
-		if score <= 0 {
-			continue
-		}
-		pair := (*sourceState)(nil)
-		if audioKey != "" {
-			pair = state.composer.sourceByKey(audioKey)
-		}
-		if pair == nil || pair.failed {
-			for _, a := range state.composer.audios {
-				if !a.failed {
-					pair = a
-					break
-				}
-			}
-		}
-		if pair == nil {
-			continue
-		}
-		dist := est - target
-		if dist < 0 {
-			dist = -dist
-		}
-		ranked_list = append(ranked_list, ranked{
-			s: &tierStrategy{
-				kind:    stratSource,
-				video:   v,
-				audio:   pair,
-				score:   score,
-				estBits: est,
-				height:  resolutionHeight(v.stream.Parsed.Resolution),
-				desc:    fmt.Sprintf("source video#%d (%s %s)", v.videoPos, v.stream.Parsed.Resolution, v.stream.Parsed.Quality),
-			},
-			dist: dist,
-		})
+	strategy := &tierStrategy{
+		kind:      stratTranscode,
+		transcode: tc,
+		score:     tcScore,
+		estBits:   tcBits,
+		height:    tc.Height,
+		desc:      fmt.Sprintf("transcode primary -> %dp@%dk", tc.Height, tc.MaxRateKbps),
 	}
-
-	// Sort by distance to target (closest first), tie-break by quality
-	// so among equally distant bitrates the better encode wins.
-	for i := 1; i < len(ranked_list); i++ {
-		for j := i; j > 0; j-- {
-			a, b := ranked_list[j-1], ranked_list[j]
-			swap := false
-			if strategyUnderBudget(b.s, target) != strategyUnderBudget(a.s, target) {
-				swap = strategyUnderBudget(b.s, target)
-			} else if b.dist < a.dist {
-				swap = true
-			} else if b.dist == a.dist && b.s.score > a.s.score {
-				swap = true
-			}
-			if !swap {
-				break
-			}
-			ranked_list[j-1], ranked_list[j] = ranked_list[j], ranked_list[j-1]
-		}
-	}
-	ladder := make([]*tierStrategy, 0, len(ranked_list))
-	log.Printf("mux: tier %d ladder target=%dk primary=%dk candidates=%d", tier, target/1000, t0Bits/1000, len(ranked_list))
-	for i, r := range ranked_list {
-		kind := "source"
-		if r.s.kind == stratTranscode {
-			kind = "transcode"
-		}
-		log.Printf("mux: tier %d rank#%d kind=%s %s bitrate=%dk height=%dp score=%d distance=%dk", tier, i+1, kind, r.s.desc, r.s.estBits/1000, r.s.height, r.s.score, r.dist/1000)
-		ladder = append(ladder, r.s)
-	}
-	return ladder
+	log.Printf("mux: tier %d transcode target=%dk bitrate=%dk height=%dp score=%d distance=%dk", tier, target/1000, strategy.estBits/1000, strategy.height, strategy.score, tcDist/1000)
+	return []*tierStrategy{strategy}
 }
 
 // strategyUnderBudget prefers a real source that already satisfies the tier's

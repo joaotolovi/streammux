@@ -2382,6 +2382,12 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 	if active == nil || activeTier == tier {
 		return ""
 	}
+	// Lower tiers are H.264 transcodes. Never satisfy their first request with
+	// a tier-0 stream-copy segment (often HEVC): changing codec between adjacent
+	// chunks leaves ExoPlayer repeatedly resetting at the intro handoff.
+	if tier > 0 && active.prepared != nil && active.prepared.transcode == nil {
+		return ""
+	}
 	path := generationSegmentPath(active, segment)
 	if fileExists(path) {
 		return path
