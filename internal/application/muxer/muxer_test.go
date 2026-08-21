@@ -1117,6 +1117,35 @@ func TestComposerExhaustsAndLenientPass(t *testing.T) {
 	}
 }
 
+func TestComposerFallsBackToBestSingleSourceWithoutTargetLanguage(t *testing.T) {
+	comp := newComposer(composerJobFixture())
+	// Skip the regular and lenient target-language passes.
+	comp.cursor = len(comp.ranked)
+	comp.lenient = true
+
+	candidate := comp.acquire()
+	if candidate == nil {
+		t.Fatal("acquire() returned nil instead of a language fallback")
+	}
+	if !candidate.fallback || !candidate.single || candidate.video != candidate.audio {
+		t.Fatalf("fallback must use a single video/audio source: %#v", candidate)
+	}
+	if !strings.Contains(candidate.video.stream.Stream.URL, "v-2160") {
+		t.Fatalf("fallback video = %s, want highest-quality source", candidate.video.stream.Stream.URL)
+	}
+}
+
+func TestFallbackTrackPrefersDefaultThenQuality(t *testing.T) {
+	s := &sourceState{probe: &ffmpeg.ProbeResult{AudioTracks: []ffmpeg.AudioTrack{
+		{Index: 0, Channels: 8, BitRate: 4_000_000},
+		{Index: 1, Default: true, Channels: 6, BitRate: 1_500_000},
+		{Index: 2, Default: true, Forced: true, Channels: 8, BitRate: 4_000_000},
+	}}}
+	if got := s.selectFallbackTrack(); got != 1 {
+		t.Fatalf("fallback track = %d, want default non-forced track 1", got)
+	}
+}
+
 func TestComposerMarkFailedSkipsSourceInBothQueues(t *testing.T) {
 	comp := newComposer(composerJobFixture())
 	first := comp.acquire()
