@@ -861,54 +861,6 @@ func TestMediaSegmentPathKeepsBridgedTierURIsStableAfterCutover(t *testing.T) {
 	}
 }
 
-func TestMediaSegmentPathBridgesPlaceholderForEveryTier(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	segment := filepath.Join(dir, "video", "seg_00002.ts")
-	if err := os.WriteFile(segment, []byte("placeholder"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	job := &model.MuxJob{ID: "job"}
-	mux := &Muxer{states: map[string]*playbackState{
-		"job": {all: []*generation{{dir: dir, tier: 0, isLocal: true}}},
-	}}
-
-	if path := mux.mediaSegmentPath(job, 2, 2, false); path != segment {
-		t.Fatalf("tier-2 placeholder segment = %q, want %q", path, segment)
-	}
-}
-
-func TestMediaSegmentPathKeepsPlaceholderTierURIsAfterFilmHandoff(t *testing.T) {
-	placeholderDir := t.TempDir()
-	filmDir := t.TempDir()
-	for _, dir := range []string{placeholderDir, filmDir} {
-		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	placeholder := filepath.Join(placeholderDir, "video", "seg_00002.ts")
-	if err := os.WriteFile(placeholder, []byte("placeholder"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	job := &model.MuxJob{ID: "job"}
-	mux := &Muxer{states: map[string]*playbackState{
-		"job": {
-			active:     &generation{dir: filmDir, tier: 0, startSegment: 7},
-			activeTier: 0,
-			all: []*generation{
-				{dir: placeholderDir, tier: 0, isLocal: true},
-				{dir: filmDir, tier: 0, startSegment: 7},
-			},
-		},
-	}}
-
-	if path := mux.mediaSegmentPath(job, 2, 1, false); path != placeholder {
-		t.Fatalf("stale tier-1 placeholder segment = %q, want %q", path, placeholder)
-	}
-}
-
 func TestRequestTierHonorsCooldown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

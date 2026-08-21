@@ -2307,7 +2307,7 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 	}
 	// A requested ABR namespace is only a URL contract. While its generation
 	// is being prepared, or while the switch cooldown is active, keep serving
-	// the exact segment from the active generation. This makes the handoff
+	// the exact segment from the active generation. This makes the tier switch
 	// invisible to the player and ensures a missing target segment never
 	// blocks the current stream.
 	state := m.lookupState(job.ID)
@@ -2320,11 +2320,7 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 	all := append([]*generation(nil), state.all...)
 	state.mu.Unlock()
 	if active == nil {
-		// Players are allowed to select a lower ABR URI while the opening
-		// placeholder is still live. The placeholder has only one rendition,
-		// so every tier must resolve to those exact segments until film media is
-		// promoted; otherwise a stale vN/seg_* request becomes a false seek.
-		return m.segmentPath(job, segment, false)
+		return ""
 	}
 	if activeTier != tier {
 		path := generationSegmentPath(active, segment)
@@ -2332,11 +2328,8 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 			return path
 		}
 	}
-	// A player may select an ABR URL while the placeholder is live, then retry
-	// that old URL after the film becomes active on another tier. Keep every
-	// URI before the film boundary stable; otherwise vN/seg_* is misclassified
-	// as a backward seek and replaces the freshly started film generation.
-	if tier > 0 && segment < active.startSegment {
+	// Keep a URI served by a tier bridge stable after that tier becomes active.
+	if tier > 0 && activeTier == tier && segment < active.startSegment {
 		for i := len(all) - 1; i >= 0; i-- {
 			if all[i] == active {
 				continue
