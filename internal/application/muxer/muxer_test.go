@@ -80,6 +80,18 @@ func TestRecordVideoRequestIgnoresRetryAndResetsOnSeek(t *testing.T) {
 	}
 }
 
+func TestCachedRequestsAdvanceMaximumBeforeSeekClassification(t *testing.T) {
+	state := &playbackState{lastRequested: 10, maxRequested: 10}
+	mux := &Muxer{}
+	previousMax := mux.recordVideoRequestLocked(state, 11, time.Unix(100, 0))
+	if previousMax != 10 || state.maxRequested != 11 {
+		t.Fatalf("request max moved from %d to %d, want 10 to 11", previousMax, state.maxRequested)
+	}
+	if isForwardSeek(previousMax, 11, 10, 0) {
+		t.Fatal("next sequential cached request must not be classified as a seek")
+	}
+}
+
 func TestForwardSeekStartsOneSegmentBeforeRequested(t *testing.T) {
 	if !isForwardSeek(100, 130, 105, 0) {
 		t.Fatal("fixture must be a forward seek")

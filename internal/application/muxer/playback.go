@@ -2104,12 +2104,13 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	// because mediaSegmentPath intentionally bridges a not-yet-ready tier to
 	// the active generation; looking first would otherwise make the first
 	// bridged request skip starting the background switch.
+	requestMaxBefore := -1
 	if !audio {
 		state.mu.Lock()
 		lastRequested := state.lastRequested
 		active := state.active
 		if active != nil {
-			m.recordVideoRequestLocked(state, segment, time.Now())
+			requestMaxBefore = m.recordVideoRequestLocked(state, segment, time.Now())
 		}
 		state.mu.Unlock()
 		at := segment
@@ -2149,10 +2150,10 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		recovering := state.recovering
 		recoveryWait := state.recoveryWait
 		recoveryErr := state.recoveryErr
-		// Capture the max BEFORE including this request: a real seek jumps
-		// far beyond it, and comparing against a max that already contains
-		// the request itself never detects anything.
-		prevMax := state.maxRequested
+		// requestMaxBefore was captured before this request was registered. A
+		// real seek jumps beyond it, while cached sequential requests still
+		// advance state.maxRequested for future classifications.
+		prevMax := requestMaxBefore
 		if !placeholderActive {
 			state.lastRequested = segment
 			if segment > state.maxRequested {
@@ -2205,14 +2206,16 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				// The muxer retains a short rewind window behind the player. A
 				// request before that window is a real backward seek and must
 				// relaunch at the requested position.
-				if (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
+				if !audio && (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
 					target := segment
-					if isForwardSeek(prevMax, segment, highest, active.startSegment) && target > 0 {
+					forward := isForwardSeek(prevMax, segment, highest, active.startSegment)
+					if forward && target > 0 {
 						// HLS fetches can arrive out of order around a seek. Include one
 						// segment before the first forward request so its predecessor is
 						// ready instead of triggering an immediate second seek.
 						target--
 					}
+					log.Printf("mux: segment %d outside active window [%d,%d] (previous max %d, forward=%t); seeking from %d", segment, lowest, highest, prevMax, forward, target)
 					m.fastSeek(job, state, active, target)
 				}
 			}
@@ -2244,9 +2247,13 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 // recordVideoRequestLocked tracks only consecutive media requests. Retries do
 // not consume another segment; jumps reset health tracking so a user seek is
 // never mistaken for a source slowdown.
-func (m *Muxer) recordVideoRequestLocked(state *playbackState, segment int, at time.Time) {
+func (m *Muxer) recordVideoRequestLocked(state *playbackState, segment int, at time.Time) int {
 	previous := state.lastRequested
+	previousMax := state.maxRequested
 	state.lastRequested = segment
+	if segment > state.maxRequested {
+		state.maxRequested = segment
+	}
 	switch {
 	case previous < 0:
 		state.lastSequentialAt = time.Time{}
@@ -2256,6 +2263,7 @@ func (m *Muxer) recordVideoRequestLocked(state *playbackState, segment int, at t
 		state.lastSequentialAt = time.Time{}
 		state.playbackEpoch++
 	}
+	return previousMax
 }
 
 func resetPlaybackTrackingLocked(state *playbackState) {
