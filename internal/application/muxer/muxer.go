@@ -52,24 +52,17 @@ type dynamicPlaceholderEngine interface {
 // and recovery. They are intentionally internal defaults rather than user-facing
 // knobs until measurements from real Stremio clients justify configuration.
 type Policy struct {
-	StartupTimeout    time.Duration
-	AttemptTimeout    time.Duration
-	SegmentTimeout    time.Duration
-	IdleTimeout       time.Duration
-	HealthWindow      time.Duration
-	RecoveryCooldown  time.Duration
-	RetryCooldown     time.Duration
-	MinRealtime       float64
-	MinPublishedAhead time.Duration
+	StartupTimeout   time.Duration
+	AttemptTimeout   time.Duration
+	SegmentTimeout   time.Duration
+	IdleTimeout      time.Duration
+	HealthWindow     time.Duration
+	RecoveryCooldown time.Duration
+	RetryCooldown    time.Duration
 	// MinHandoffBuffer is how much content the film must have ready before the
-	// intro hands off, so playback doesn't stall on the first bandwidth dip.
+	// intro hands off. During a source recovery, it is the maximum safe time
+	// for the replacement to produce its first segment.
 	MinHandoffBuffer time.Duration
-	// GenerationDuration bounds each on-demand VOD batch. The muxer starts the
-	// next batch before the current batch's remaining buffer is exhausted.
-	GenerationDuration time.Duration
-	// GenerationRefillLead is the minimum buffered media remaining when the next
-	// batch starts warming up.
-	GenerationRefillLead time.Duration
 	// SegmentRetention is the rewind window retained behind the client's last
 	// requested segment.
 	SegmentRetention time.Duration
@@ -100,26 +93,22 @@ func defaultPolicy() Policy {
 		// The Stremio client tolerates roughly 60s before it gives up on
 		// starting playback, so startup can use a generous window. Lenient uses
 		// half of StartupTimeout and re-runs cached probes, so it stays fast.
-		StartupTimeout:       50 * time.Second,
-		AttemptTimeout:       25 * time.Second,
-		SegmentTimeout:       30 * time.Second,
-		IdleTimeout:          90 * time.Second,
-		HealthWindow:         4 * time.Second,
-		RecoveryCooldown:     10 * time.Second,
-		RetryCooldown:        30 * time.Second,
-		MinRealtime:          1.0,
-		MinPublishedAhead:    12 * time.Second,
-		MinHandoffBuffer:     20 * time.Second,
-		GenerationDuration:   96 * time.Second,
-		GenerationRefillLead: 24 * time.Second,
-		SegmentRetention:     60 * time.Second,
-		TierSwitchBuffer:     8 * time.Second,
-		TierSwitchCooldown:   30 * time.Second,
-		DurationTolerance:    0.002,
-		PlaceholderMinTime:   8 * time.Second,
-		CacheMaxBytes:        8 * 1024 * 1024 * 1024,
-		CacheMinFreeBytes:    3 * 1024 * 1024 * 1024,
-		SessionMaxBytes:      2 * 1024 * 1024 * 1024,
+		StartupTimeout:     50 * time.Second,
+		AttemptTimeout:     25 * time.Second,
+		SegmentTimeout:     30 * time.Second,
+		IdleTimeout:        90 * time.Second,
+		HealthWindow:       4 * time.Second,
+		RecoveryCooldown:   10 * time.Second,
+		RetryCooldown:      30 * time.Second,
+		MinHandoffBuffer:   20 * time.Second,
+		SegmentRetention:   60 * time.Second,
+		TierSwitchBuffer:   8 * time.Second,
+		TierSwitchCooldown: 30 * time.Second,
+		DurationTolerance:  0.002,
+		PlaceholderMinTime: 8 * time.Second,
+		CacheMaxBytes:      8 * 1024 * 1024 * 1024,
+		CacheMinFreeBytes:  3 * 1024 * 1024 * 1024,
+		SessionMaxBytes:    2 * 1024 * 1024 * 1024,
 	}
 }
 

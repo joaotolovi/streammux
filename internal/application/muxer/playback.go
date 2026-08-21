@@ -121,9 +121,13 @@ type playbackState struct {
 	duration      float64 // film duration in seconds (from probe)
 	lastRequested int
 	maxRequested  int
-	lastAccess    time.Time
-	lastRecovery  time.Time
-	closed        bool
+	// lastSequentialAt is updated only by consecutive video requests. It keeps
+	// source health dormant while the player is paused or changing position.
+	lastSequentialAt time.Time
+	playbackEpoch    uint64
+	lastAccess       time.Time
+	lastRecovery     time.Time
+	closed           bool
 
 	deliveries []deliverySample
 
@@ -676,6 +680,8 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.lastRecovery = time.Now()
 	state.lastRequested = -1
 	state.maxRequested = -1
+	state.lastSequentialAt = time.Time{}
+	state.playbackEpoch++
 	if state.filmBase > 0 {
 		state.discontinuities = append(state.discontinuities, state.filmBase)
 	}
@@ -929,13 +935,13 @@ func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState,
 		select {
 		case <-attemptCtx.Done():
 			session.Cancel()
-			go cleanupFailedGeneration(generation)
+			cleanupFailedGeneration(generation)
 			return nil, fmt.Errorf("first segment deadline: %w", attemptCtx.Err())
 		case <-session.Done():
 			if fileExists(segmentPath) && fileExists(audioSegmentPath) {
 				break
 			}
-			go cleanupFailedGeneration(generation)
+			cleanupFailedGeneration(generation)
 			if session.Err() != nil {
 				m.invalidatePlanSources(prepared.plan)
 				return nil, session.Err()
@@ -978,7 +984,9 @@ func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState,
 // coordinateRecovery walks the composer until one composition launches.
 // prefer (when set) reuses the previous generation's prepared sources first —
 // a seek keeps the same sources, only the offset changes.
-func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, prefer *generation, startSegment int, timeout time.Duration) (*generation, error) {
+func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, prefer *generation, startSegment int, timeout, minBuffer time.Duration) (*generation, error) {
+	recoveryCtx, cancel := context.WithTimeout(state.ctx, timeout)
+	defer cancel()
 	deadline := time.Now().Add(timeout)
 
 	state.mu.Lock()
@@ -997,7 +1005,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		if startTime < 0 {
 			startTime = 0
 		}
-		if gen, err := m.launchGeneration(job, state, prefer.planIndex, prefer.prepared, prefer.tier, startSegment, startTime, m.policy.MinHandoffBuffer); err == nil {
+		if gen, err := m.launchGenerationContext(job, state, recoveryCtx, prefer.planIndex, prefer.prepared, prefer.tier, startSegment, startTime, minBuffer); err == nil {
 			return gen, nil
 		} else {
 			log.Printf("mux: preferred sources failed to relaunch: %v", err)
@@ -1043,7 +1051,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 				if startTime < 0 {
 					startTime = 0
 				}
-				gen, launchErr := m.launchGeneration(job, state, candidate.ordinal, prepared, tier, startSegment, startTime, m.policy.MinHandoffBuffer)
+				gen, launchErr := m.launchGenerationContext(job, state, recoveryCtx, candidate.ordinal, prepared, tier, startSegment, startTime, minBuffer)
 				if launchErr == nil {
 					log.Printf("mux: recovery preserved audio source %s while switching video", retainedAudioKey)
 					return gen, nil
@@ -1073,7 +1081,7 @@ func (m *Muxer) coordinateRecovery(job *model.MuxJob, state *playbackState, pref
 		if startTime < 0 {
 			startTime = 0
 		}
-		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, tier, startSegment, startTime, m.policy.MinHandoffBuffer)
+		gen, err := m.launchGenerationContext(job, state, recoveryCtx, candidate.ordinal, prepared, tier, startSegment, startTime, minBuffer)
 		if err == nil {
 			return gen, nil
 		}
@@ -1102,9 +1110,14 @@ func (m *Muxer) markComposerFailed(state *playbackState, sourceKey string) {
 }
 
 func cleanupFailedGeneration(generation *generation) {
-	select {
-	case <-generation.session.Done():
-	case <-time.After(2 * time.Second):
+	if generation == nil {
+		return
+	}
+	if generation.session != nil {
+		generation.session.Cancel()
+		if done := generation.session.Done(); done != nil {
+			<-done
+		}
 	}
 	_ = os.RemoveAll(generation.dir)
 }
@@ -2096,10 +2109,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		lastRequested := state.lastRequested
 		active := state.active
 		if active != nil {
-			// The cache cursor must advance even when the segment was already
-			// present. Previously it only changed on cache misses, which made
-			// both retention and ABR cutover decisions stale.
-			state.lastRequested = segment
+			m.recordVideoRequestLocked(state, segment, time.Now())
 		}
 		state.mu.Unlock()
 		at := segment
@@ -2107,7 +2117,6 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			at = lastRequested + 1
 		}
 		m.requestTier(job, state, tier, at)
-		m.ensureGenerationRefill(job, state, segment)
 	}
 
 	if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
@@ -2190,11 +2199,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			select {
 			case <-active.session.Done():
 				if !recovering {
-					reason := "session ended"
-					if active.session.Err() == nil {
-						reason = "buffer refill"
-					}
-					m.ensureRecovery(job, state, segment, reason)
+					m.ensureRecovery(job, state, segment, "session ended")
 				}
 			default:
 				// The muxer retains a short rewind window behind the player. A
@@ -2229,39 +2234,26 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 	}
 }
 
-// ensureGenerationRefill starts the next finite VOD batch while the player
-// still has enough of the completed batch to continue without waiting. The
-// previous batch remains in state.all until its last segment is consumed.
-func (m *Muxer) ensureGenerationRefill(job *model.MuxJob, state *playbackState, segment int) {
-	state.mu.Lock()
-	if state.closed || state.recovering || state.active == nil || state.active.isError {
-		state.mu.Unlock()
-		return
+// recordVideoRequestLocked tracks only consecutive media requests. Retries do
+// not consume another segment; jumps reset health tracking so a user seek is
+// never mistaken for a source slowdown.
+func (m *Muxer) recordVideoRequestLocked(state *playbackState, segment int, at time.Time) {
+	previous := state.lastRequested
+	state.lastRequested = segment
+	switch {
+	case previous < 0:
+		state.lastSequentialAt = time.Time{}
+	case segment == previous+1:
+		state.lastSequentialAt = at
+	case segment != previous:
+		state.lastSequentialAt = time.Time{}
+		state.playbackEpoch++
 	}
-	active := state.active
-	lead := m.policy.GenerationRefillLead
-	state.mu.Unlock()
+}
 
-	select {
-	case <-active.session.Done():
-	default:
-		return
-	}
-	if active.session.Err() != nil {
-		return
-	}
-
-	segDur := ffmpeg.SegDuration()
-	if segDur <= 0 {
-		segDur = 4
-	}
-	leadSegments := int(math.Ceil(lead.Seconds() / segDur))
-	highest := highestCompleteSegment(active.dir)
-	if highest < segment || highest-segment > leadSegments {
-		return
-	}
-	log.Printf("mux: refilling completed batch at segment %d with %d segments ahead", highest+1, highest-segment)
-	m.ensureRecovery(job, state, highest+1, "buffer refill")
+func resetPlaybackTrackingLocked(state *playbackState) {
+	state.lastSequentialAt = time.Time{}
+	state.playbackEpoch++
 }
 
 func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio bool) string {
@@ -2327,6 +2319,7 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 	state.recoveryErr = nil
 	// Hold requests at the target; the seeker session is coming.
 	state.lastRequested = targetSegment
+	resetPlaybackTrackingLocked(state)
 	if targetSegment > state.maxRequested {
 		state.maxRequested = targetSegment
 	}
@@ -2346,6 +2339,17 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		}
 
 		log.Printf("mux: fast seek to segment %d (%.0fs) with the active sources", targetSegment, startTime)
+		// A seek has no old playback position to preserve. Stop the current
+		// reader before reopening the same debrid source at the new offset.
+		if old.session != nil {
+			old.session.Cancel()
+			if done := old.session.Done(); done != nil {
+				select {
+				case <-done:
+				case <-state.ctx.Done():
+				}
+			}
+		}
 		gen, err := m.launchGeneration(job, state, old.planIndex, old.prepared, old.tier, targetSegment, startTime, 0)
 
 		state.mu.Lock()
@@ -2412,6 +2416,11 @@ func (m *Muxer) ensureRecovery(job *model.MuxJob, state *playbackState, startSeg
 	go m.runRecovery(job, state, startSegment, reason)
 }
 
+const (
+	recoveryPlayerThroughput  = "player throughput"
+	recoveryProductionDeficit = "production deficit"
+)
+
 func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegment int, reason string) {
 	// A seek keeps the same sources (only the offset changes); a dead or
 	// unsustainable session must reconsider its sources.
@@ -2422,14 +2431,14 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 		prefer = nil
 	}
 	state.mu.Unlock()
-	if prefer != nil && reason != "seek" && reason != "buffer refill" {
+	if prefer != nil && reason != "seek" {
 		m.markComposerFailed(state, prefer.prepared.plan.Video.SourceKey())
 	}
-	if reason == "player throughput" {
-		// The bottleneck is the player's link, not the server: relaunching
-		// the same heavy source would always succeed (server-side
-		// production is healthy) and the downgrade would be a no-op. Drop
-		// the preference so the composer picks the next lighter video.
+	handoff := reason == recoveryPlayerThroughput || reason == recoveryProductionDeficit
+	if handoff {
+		// Both a player bandwidth deficit and a slow source need a different
+		// video. Drop the preference so the composer advances to the next
+		// candidate instead of relaunching the same rendition.
 		prefer = nil
 	}
 	if reason == "no active session" {
@@ -2440,7 +2449,27 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 		state.mu.Unlock()
 	}
 
-	winner, err := m.coordinateRecovery(job, state, prefer, startSegment, m.policy.StartupTimeout)
+	timeout := m.policy.StartupTimeout
+	minBuffer := m.policy.MinHandoffBuffer
+	if handoff {
+		// Do not ask a debrid provider to stream two video sources at once.
+		// Already-written segments remain in state.all and bridge playback while
+		// the replacement produces its first segment.
+		if expected != nil && expected.session != nil {
+			expected.session.Cancel()
+			if done := expected.session.Done(); done != nil {
+				select {
+				case <-done:
+				case <-state.ctx.Done():
+				}
+			}
+		}
+		timeout = m.policy.MinHandoffBuffer
+		minBuffer = 0
+	}
+
+	started := time.Now()
+	winner, err := m.coordinateRecovery(job, state, prefer, startSegment, timeout, minBuffer)
 
 	state.mu.Lock()
 	wait := state.recoveryWait
@@ -2497,11 +2526,11 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	}
 	if old != nil && old != winner {
 		old.session.Cancel()
-		if reason != "buffer refill" {
+		if !handoff {
 			m.removeGenerationWhenStopped(old)
 		}
 	}
-	log.Printf("mux: switched at segment %d to video#%d audio#%d (%s) after %s", startSegment, winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, reason)
+	log.Printf("mux: switched at segment %d to video#%d audio#%d (%s) after %s in %s", startSegment, winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, reason, time.Since(started).Round(time.Millisecond))
 	go m.monitorGeneration(job, state, winner)
 }
 

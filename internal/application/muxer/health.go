@@ -9,25 +9,26 @@ import (
 )
 
 type healthDecision struct {
-	realtime  float64
-	downgrade bool
+	realtime float64
+	valid    bool
 }
 
 type healthTracker struct {
-	window     time.Duration
-	minimum    float64
-	samples    []ffmpeg.ProgressSample
-	lastEval   time.Time
-	lowWindows int
+	window  time.Duration
+	samples []ffmpeg.ProgressSample
 }
 
 func newHealthTracker(policy Policy) *healthTracker {
-	return &healthTracker{window: policy.HealthWindow, minimum: policy.MinRealtime}
+	return &healthTracker{window: policy.HealthWindow}
 }
 
-// observe derives a moving production rate from FFmpeg's real session:
-// media seconds produced / monotonic wall-clock seconds. Two non-overlapping
-// slow windows are required before a downgrade is recommended.
+func (h *healthTracker) reset() {
+	h.samples = nil
+}
+
+// observe derives a smoothed production rate from FFmpeg's real session:
+// media seconds produced / monotonic wall-clock seconds. The caller combines
+// it with the on-disk media reserve to decide whether a handoff is needed.
 func (h *healthTracker) observe(sample ffmpeg.ProgressSample) healthDecision {
 	if sample.OutTime <= 0 || sample.At.IsZero() {
 		return healthDecision{}
@@ -48,33 +49,37 @@ func (h *healthTracker) observe(sample ffmpeg.ProgressSample) healthDecision {
 	oldest := h.samples[0]
 	wall := sample.At.Sub(oldest.At)
 	media := sample.OutTime - oldest.OutTime
-	if wall < h.window*3/4 || media <= 0 {
+	if wall < h.window*3/4 || media < 0 {
 		return healthDecision{}
 	}
 	realtime := float64(media) / float64(wall)
-	decision := healthDecision{realtime: realtime}
+	return healthDecision{realtime: realtime, valid: true}
+}
 
-	if !h.lastEval.IsZero() && sample.At.Sub(h.lastEval) < h.window {
-		return decision
-	}
-	h.lastEval = sample.At
-	if realtime < h.minimum {
-		h.lowWindows++
-	} else {
-		h.lowWindows = 0
-	}
-	decision.downgrade = h.lowWindows >= 2
-	return decision
+// needsSourceHandoff reports whether an active viewer has reached the media
+// reserve required to replace a source. The old source is stopped before the
+// replacement starts, so ahead (not ahead divided by the current deficit) is
+// the actual time available for the handoff.
+func needsSourceHandoff(ahead time.Duration, production float64, reserve time.Duration) bool {
+	return production >= 0 && production < 1 && ahead <= reserve
 }
 
 func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, generation *generation) {
 	tracker := newHealthTracker(m.policy)
+	var playbackEpoch uint64
 	for sample := range generation.session.Progress() {
 		if !m.isActiveGeneration(state, generation) {
 			return
 		}
+
+		state.mu.Lock()
+		if playbackEpoch != state.playbackEpoch {
+			playbackEpoch = state.playbackEpoch
+			tracker.reset()
+		}
+		state.mu.Unlock()
 		decision := tracker.observe(sample)
-		if decision.realtime > 0 {
+		if decision.valid {
 			log.Printf(
 				"mux: plan %d session production %.2fx (ffmpeg cumulative %.2fx)",
 				generation.planIndex,
@@ -82,7 +87,7 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 				sample.Speed,
 			)
 		}
-		if !decision.downgrade {
+		if !decision.valid {
 			continue
 		}
 
@@ -90,32 +95,15 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 		highest := highestCompleteSegment(generation.dir)
 		requested := state.lastRequested
 		ahead := time.Duration(highest-requested) * time.Duration(ffmpeg.SegDuration()*float64(time.Second))
+		playing := !state.lastSequentialAt.IsZero() && sample.At.Sub(state.lastSequentialAt) <= m.policy.HealthWindow*3
 		cooldownElapsed := time.Since(state.lastRecovery) >= m.policy.RecoveryCooldown
 		alreadyRecovering := state.recovering
 		state.mu.Unlock()
 
-		if requested < 0 || ahead >= m.policy.MinPublishedAhead || !cooldownElapsed || alreadyRecovering {
+		if requested < 0 || !playing || !cooldownElapsed || alreadyRecovering {
 			continue
 		}
-
-		// Bursty CDNs defeat the two-consecutive-slow-windows rule: a
-		// short full stall is followed by a fast burst that resets the
-		// count, yet the player — running close to the production
-		// frontier with a thin buffer — stalls during every gap. A single
-		// near-stalled window (below half of realtime) with the player
-		// this close to the frontier means a stall within seconds:
-		// switch before the buffer drains instead of after.
-		if decision.realtime > 0 && decision.realtime < m.policy.MinRealtime/2 {
-			startSegment := highest + 1
-			if startSegment <= requested {
-				startSegment = requested + 1
-			}
-			log.Printf(
-				"mux: plan stalled at %.2fx with %s buffered (bursty source gap); trying other sources",
-				decision.realtime,
-				ahead.Round(time.Second),
-			)
-			m.ensureRecovery(job, state, startSegment, "production gap")
+		if !needsSourceHandoff(ahead, decision.realtime, m.policy.MinHandoffBuffer) {
 			continue
 		}
 
@@ -124,11 +112,11 @@ func (m *Muxer) monitorGeneration(job *model.MuxJob, state *playbackState, gener
 			startSegment = requested + 1
 		}
 		log.Printf(
-			"mux: plan is unsustainable at %.2fx with %s buffered; trying lighter sources",
+			"mux: production %.2fx reached handoff reserve (%s buffered); switching sources",
 			decision.realtime,
 			ahead.Round(time.Second),
 		)
-		m.ensureRecovery(job, state, startSegment, "measured FFmpeg throughput")
+		m.ensureRecovery(job, state, startSegment, recoveryProductionDeficit)
 	}
 
 	<-generation.session.Done()

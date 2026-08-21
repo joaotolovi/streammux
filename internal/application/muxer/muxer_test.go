@@ -21,25 +21,62 @@ import (
 	"github.com/streammux/streammux/internal/domain/model"
 )
 
-func TestHealthTrackerRequiresTwoSlowNonOverlappingWindows(t *testing.T) {
+func TestHealthTrackerReportsSmoothedProductionRate(t *testing.T) {
 	policy := defaultPolicy()
 	tracker := newHealthTracker(policy)
 	start := time.Unix(100, 0)
 
-	if decision := tracker.observe(ffmpeg.ProgressSample{At: start, OutTime: time.Second}); decision.downgrade {
-		t.Fatal("first sample must not request downgrade")
+	if decision := tracker.observe(ffmpeg.ProgressSample{At: start, OutTime: time.Second}); decision.valid {
+		t.Fatal("first sample must not produce a rate")
 	}
-	first := tracker.observe(ffmpeg.ProgressSample{At: start.Add(4 * time.Second), OutTime: 2 * time.Second})
-	if first.downgrade {
-		t.Fatal("one slow window must not request downgrade")
+	slow := tracker.observe(ffmpeg.ProgressSample{At: start.Add(4 * time.Second), OutTime: 2 * time.Second})
+	if !slow.valid {
+		t.Fatal("complete health window must produce a rate")
 	}
-	if first.realtime >= policy.MinRealtime {
-		t.Fatalf("first realtime = %.2f, want below %.2f", first.realtime, policy.MinRealtime)
+	if slow.realtime >= 1 {
+		t.Fatalf("slow realtime = %.2f, want below realtime", slow.realtime)
 	}
 
-	second := tracker.observe(ffmpeg.ProgressSample{At: start.Add(8 * time.Second), OutTime: 3 * time.Second})
-	if !second.downgrade {
-		t.Fatalf("two slow windows should request downgrade; realtime %.2f", second.realtime)
+	fast := tracker.observe(ffmpeg.ProgressSample{At: start.Add(8 * time.Second), OutTime: 10 * time.Second})
+	if !fast.valid || fast.realtime < 1 {
+		t.Fatalf("fast realtime = %.2f, want above realtime", fast.realtime)
+	}
+}
+
+func TestNeedsSourceHandoffUsesPhysicalReserve(t *testing.T) {
+	reserve := 20 * time.Second
+	if !needsSourceHandoff(reserve, 0.5, reserve) {
+		t.Fatal("slow source at the handoff reserve must switch")
+	}
+	if needsSourceHandoff(24*time.Second, 0.5, reserve) {
+		t.Fatal("source above the physical handoff reserve must continue")
+	}
+	if needsSourceHandoff(0, 1, reserve) {
+		t.Fatal("realtime production must not switch solely because the reserve is low")
+	}
+}
+
+func TestRecordVideoRequestIgnoresRetryAndResetsOnSeek(t *testing.T) {
+	state := &playbackState{lastRequested: -1}
+	now := time.Unix(100, 0)
+	mux := &Muxer{}
+
+	mux.recordVideoRequestLocked(state, 10, now)
+	if !state.lastSequentialAt.IsZero() {
+		t.Fatal("first request must not start consumption tracking")
+	}
+	mux.recordVideoRequestLocked(state, 11, now.Add(4*time.Second))
+	if state.lastSequentialAt.IsZero() {
+		t.Fatal("consecutive request must start consumption tracking")
+	}
+	trackedAt := state.lastSequentialAt
+	mux.recordVideoRequestLocked(state, 11, now.Add(8*time.Second))
+	if state.lastSequentialAt != trackedAt {
+		t.Fatal("retry must not look like another consumed segment")
+	}
+	mux.recordVideoRequestLocked(state, 30, now.Add(9*time.Second))
+	if !state.lastSequentialAt.IsZero() || state.playbackEpoch != 1 {
+		t.Fatal("seek must reset production health tracking")
 	}
 }
 
@@ -114,16 +151,15 @@ func TestComposerWithAudioPreservesRequestedAudioSource(t *testing.T) {
 	}
 }
 
-func TestHealthTrackerHealthyWindowResetsSlowState(t *testing.T) {
+func TestHealthTrackerReportsAStoppedSource(t *testing.T) {
 	policy := defaultPolicy()
 	tracker := newHealthTracker(policy)
 	start := time.Unix(200, 0)
 
 	tracker.observe(ffmpeg.ProgressSample{At: start, OutTime: time.Second})
-	tracker.observe(ffmpeg.ProgressSample{At: start.Add(4 * time.Second), OutTime: 2 * time.Second})
-	healthy := tracker.observe(ffmpeg.ProgressSample{At: start.Add(8 * time.Second), OutTime: 10 * time.Second})
-	if healthy.downgrade || healthy.realtime < 1 {
-		t.Fatalf("healthy window = %+v", healthy)
+	stopped := tracker.observe(ffmpeg.ProgressSample{At: start.Add(4 * time.Second), OutTime: time.Second})
+	if !stopped.valid || stopped.realtime != 0 {
+		t.Fatalf("stopped window = %+v, want valid 0x production", stopped)
 	}
 }
 
@@ -625,7 +661,7 @@ func TestMasterPlaylistSeparatesSameLanguageAlternativeForExoPlayer(t *testing.T
 	}
 }
 
-func TestPlaceholderMasterAdvertisesVirtualABRTiers(t *testing.T) {
+func TestPlaceholderMasterAdvertisesSingleRendition(t *testing.T) {
 	state := &playbackState{placeholder: &generation{}}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{
@@ -643,9 +679,12 @@ func TestPlaceholderMasterAdvertisesVirtualABRTiers(t *testing.T) {
 		t.Fatal("MasterPlaylist() returned false")
 	}
 	playlist := string(data)
-	for _, uri := range []string{"video/video.m3u8", "video/v1.m3u8", "video/v2.m3u8"} {
-		if !strings.Contains(playlist, uri) {
-			t.Fatalf("placeholder master missing %s: %s", uri, playlist)
+	if !strings.Contains(playlist, "video/video.m3u8") {
+		t.Fatalf("placeholder master missing primary rendition: %s", playlist)
+	}
+	for _, uri := range []string{"video/v1.m3u8", "video/v2.m3u8"} {
+		if strings.Contains(playlist, uri) {
+			t.Fatalf("placeholder master unexpectedly exposes ABR rendition %s: %s", uri, playlist)
 		}
 	}
 }

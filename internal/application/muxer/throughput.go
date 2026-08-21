@@ -82,7 +82,7 @@ func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Dura
 				next = highest + 1
 			}
 			log.Printf("mux: player throughput %.1f Mbps below required %.1f Mbps, switching to lighter source at segment %d", sustained/1e6, required/1e6, next)
-			m.ensureRecovery(job, state, next, "player throughput")
+			m.ensureRecovery(job, state, next, recoveryPlayerThroughput)
 		}
 	}
 }
