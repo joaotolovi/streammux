@@ -338,7 +338,7 @@ func (c *composer) acquireWithin(maxBits int64) *composition {
 					continue
 				}
 				c.lastDelivered = key
-				log.Printf("mux: acquire language fallback -> video#%d single-source title=%q", video.videoPos, streamTitleLabel(video.stream))
+				log.Printf("mux: acquire language fallback -> video#%d single-source", video.videoPos)
 				return comp
 			}
 			c.done = true
