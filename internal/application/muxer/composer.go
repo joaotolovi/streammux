@@ -38,6 +38,8 @@ type sourceState struct {
 	trackLeni int  // lenient track (-1 = none)
 	leniDone  bool // lenient selection attempted (distinguishes "rejected in
 	// lenient" from "not yet evaluated" — the latter must still be tried last)
+	fallbackTrack     int
+	fallbackTrackDone bool
 }
 
 type failClass int
@@ -58,6 +60,8 @@ type composition struct {
 	// lenient marks compositions from the second pass (und/untagged tracks
 	// accepted).
 	lenient bool
+	// fallback ignores language and takes audio from this video's own file.
+	fallback bool
 	// ordinal identifies this composition in logs / generations.
 	ordinal int
 }
@@ -68,6 +72,8 @@ type composer struct {
 	ranked  []*composition
 	cursor  int
 	lenient bool
+	fallback bool
+	fallbackCursor int
 	done    bool
 	nextOrd int
 	// incompatible marks dual pairs that failed compatibility (duration /
@@ -91,7 +97,7 @@ func newComposer(job *model.MuxJob) *composer {
 		if s, ok := ledger[key]; ok {
 			return s
 		}
-		s := &sourceState{stream: stream, track: -1, trackLeni: -1}
+		s := &sourceState{stream: stream, track: -1, trackLeni: -1, fallbackTrack: -1}
 		ledger[key] = s
 		return s
 	}
@@ -314,6 +320,27 @@ func (c *composer) acquireWithin(maxBits int64) *composition {
 				c.cursor = 0
 				continue
 			}
+			if !c.fallback {
+				// Language is a preference, not a reason to leave the player
+				// without a movie. This pass never pairs different releases.
+				c.fallback = true
+			}
+			for c.fallbackCursor < len(c.videos) {
+				video := c.videos[c.fallbackCursor]
+				if video.failed || (maxBits > 0 && streamBandwidth(video.stream) > maxBits) {
+					c.fallbackCursor++
+					continue
+				}
+				comp := &composition{video: video, audio: video, single: true, fallback: true, ordinal: len(c.ranked) + c.fallbackCursor + 1}
+				key := c.compositionKey(comp)
+				if key == c.lastDelivered {
+					c.fallbackCursor++
+					continue
+				}
+				c.lastDelivered = key
+				log.Printf("mux: acquire language fallback -> video#%d single-source title=%q", video.videoPos, streamTitleLabel(video.stream))
+				return comp
+			}
 			c.done = true
 			return nil
 		}
@@ -379,6 +406,14 @@ func (c *composer) hasLenientCandidates() bool {
 // (the sources stay valid for other pairings); resolve/probe/launch failures
 // mark the responsible source as failed for every pairing.
 func (c *composer) fail(comp *composition, class failClass, err error) {
+	if comp.fallback {
+		if class == failVideo || (class == failLaunch && !errors.Is(err, context.DeadlineExceeded)) {
+			comp.video.failed = true
+			comp.video.failErr = err
+		}
+		c.fallbackCursor++
+		return
+	}
 	switch class {
 	case failVideo:
 		comp.video.failed = true
@@ -422,6 +457,9 @@ func pairKey(comp *composition) string {
 
 func (c *composer) compositionKey(comp *composition) string {
 	if comp.single {
+		if comp.fallback {
+			return "fallback:" + comp.video.stream.SourceKey()
+		}
 		return "single:" + comp.video.stream.SourceKey()
 	}
 	return pairKey(comp)
@@ -453,6 +491,8 @@ func (c *composer) markFailed(sourceKey string) {
 func (c *composer) reset() {
 	c.cursor = 0
 	c.lenient = false
+	c.fallback = false
+	c.fallbackCursor = 0
 	c.done = false
 	c.incompatible = make(map[string]bool)
 	c.lastDelivered = ""
@@ -461,9 +501,11 @@ func (c *composer) reset() {
 			s.failed = false
 			s.failErr = nil
 			s.trackDone = false
-			s.track = 0
-			s.trackLeni = 0
+			s.track = -1
+			s.trackLeni = -1
 			s.leniDone = false
+			s.fallbackTrack = -1
+			s.fallbackTrackDone = false
 		}
 	}
 }
@@ -526,13 +568,16 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 			return nil, failAudio, fmt.Errorf("audio source: %w", err)
 		}
 		audio = comp.audio
-	} else {
+	} else if !comp.fallback {
 		if err := m.ensureAudioSource(ctx, job, comp.video, comp.isLenient()); err != nil {
 			return nil, failAudio, fmt.Errorf("audio source: %w", err)
 		}
 	}
 
 	track := audio.selectedTrack(comp.isLenient())
+	if comp.fallback {
+		track = audio.selectFallbackTrack()
+	}
 	if track < 0 {
 		// "No target track" is a property of the source+pass, not a dead
 		// source: failNoTrack lets the composer skip it as audio while other
@@ -540,8 +585,8 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 		return nil, failNoTrack, fmt.Errorf("source has no confirmed %s audio track", job.TargetLanguage)
 	}
 	lang, title := trackMeta(audio.probe.AudioTracks, track)
-	log.Printf("mux: composition %d selected audio track a:%d (of %d, lang=%s title=%s) from %s lenient=%v",
-		comp.ordinal, track, len(audio.probe.AudioTracks), lang, title, audio.stream.SourceKey(), comp.isLenient())
+	log.Printf("mux: composition %d selected audio track a:%d (of %d, lang=%s title=%s) from %s lenient=%v fallback=%v",
+		comp.ordinal, track, len(audio.probe.AudioTracks), lang, title, audio.stream.SourceKey(), comp.isLenient(), comp.fallback)
 
 	if comp.video.probe.Duration <= 0 {
 		return nil, failVideo, fmt.Errorf("video source has no probeable duration")
@@ -689,6 +734,40 @@ func (s *sourceState) selectedTrack(lenient bool) int {
 	return s.trackLeni
 }
 
+// selectFallbackTrack returns the best normal audio track without making a
+// language claim. Prefer the file's default track, then channels and bitrate;
+// forced tracks are used only when no normal track is available.
+func (s *sourceState) selectFallbackTrack() int {
+	if s.fallbackTrackDone {
+		return s.fallbackTrack
+	}
+	s.fallbackTrackDone = true
+	s.fallbackTrack = -1
+	var best ffmpeg.AudioTrack
+	haveBest := false
+	for _, track := range s.probe.AudioTracks {
+		if !haveBest || betterFallbackTrack(track, best) {
+			s.fallbackTrack = track.Index
+			best = track
+			haveBest = true
+		}
+	}
+	return s.fallbackTrack
+}
+
+func betterFallbackTrack(candidate, current ffmpeg.AudioTrack) bool {
+	if candidate.Forced != current.Forced {
+		return !candidate.Forced
+	}
+	if candidate.Default != current.Default {
+		return candidate.Default
+	}
+	if candidate.Channels != current.Channels {
+		return candidate.Channels > current.Channels
+	}
+	return candidate.BitRate > current.BitRate
+}
+
 // trackMeta returns the language tag and title of a selected audio track for
 // logging (empty strings when the track is not found).
 func trackMeta(tracks []ffmpeg.AudioTrack, index int) (lang, title string) {
@@ -711,7 +790,7 @@ func makeCompositionPlan(comp *composition) model.PlaybackPlan {
 		Kind:           kind,
 		Video:          comp.video.stream,
 		Audio:          comp.audio.stream,
-		HasTargetAudio: true,
+		HasTargetAudio: !comp.fallback,
 	}
 }
 
