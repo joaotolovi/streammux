@@ -53,11 +53,8 @@ func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Dura
 		if required <= 0 {
 			required = float64(active.plan.EstimatedBandwidth())
 		}
-		// Headroom: the delivery must also carry audio + TS overhead.
-		// The player (ExoPlayer 0.75, hls.js 0.8) applies its own safety
-		// margin on top, so we keep this conservative (≈10% above the
-		// probed peak bitrate) to avoid a three-way stacking.
-		required *= 1.10
+		// Headroom for audio + TS overhead only (player ABR disabled).
+		required *= 1.05
 	}
 	state.mu.Unlock()
 
