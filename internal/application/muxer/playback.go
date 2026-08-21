@@ -2354,17 +2354,9 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		}
 
 		log.Printf("mux: fast seek to segment %d (%.0fs) with the active sources", targetSegment, startTime)
-		// A seek has no old playback position to preserve. Stop the current
-		// reader before reopening the same debrid source at the new offset.
-		if old.session != nil {
-			old.session.Cancel()
-			if done := old.session.Done(); done != nil {
-				select {
-				case <-done:
-				case <-state.ctx.Done():
-				}
-			}
-		}
+		// Keep the old generation producing and serving its already-written
+		// segments while the seek warms up. The cutover happens only after the
+		// new generation's first segment is ready.
 		gen, err := m.launchGeneration(job, state, old.planIndex, old.prepared, old.tier, targetSegment, startTime, 0)
 
 		state.mu.Lock()
@@ -2467,18 +2459,9 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	timeout := m.policy.StartupTimeout
 	minBuffer := m.policy.MinHandoffBuffer
 	if handoff {
-		// Do not ask a debrid provider to stream two video sources at once.
-		// Already-written segments remain in state.all and bridge playback while
-		// the replacement produces its first segment.
-		if expected != nil && expected.session != nil {
-			expected.session.Cancel()
-			if done := expected.session.Done(); done != nil {
-				select {
-				case <-done:
-				case <-state.ctx.Done():
-				}
-			}
-		}
+		// Keep the current generation serving while the replacement warms up.
+		// Both sessions may read concurrently; the old one is retired only after
+		// the handoff commits.
 		timeout = m.policy.MinHandoffBuffer
 		minBuffer = 0
 	}
