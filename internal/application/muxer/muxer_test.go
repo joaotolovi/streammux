@@ -488,8 +488,8 @@ func TestRenderMediaPlaylistErrorTailTruncatesFilm(t *testing.T) {
 }
 
 func TestRenderMediaPlaylistErrorOnlyAfterPlaceholder(t *testing.T) {
-	// Startup failed while the placeholder played: [0..3) placeholder +
-	// DISCONTINUITY + error video.
+	// Startup failed while the placeholder played: the error video takes over
+	// at the current public segment without advertising retired intro files.
 	state := &playbackState{
 		errorGeneration: &generation{dir: t.TempDir(), isError: true},
 		errorStart:      3,
@@ -502,11 +502,14 @@ func TestRenderMediaPlaylistErrorOnlyAfterPlaceholder(t *testing.T) {
 		t.Fatal("VideoPlaylist() returned false")
 	}
 	playlist := string(data)
-	if !strings.Contains(playlist, "seg_00000.ts") || !strings.Contains(playlist, "seg_00002.ts") {
-		t.Fatalf("placeholder prefix missing: %s", playlist)
+	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:3\n") {
+		t.Fatalf("error playlist must start at the handoff: %s", playlist)
 	}
-	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n#EXTINF:4.000000,\nseg_00003.ts") {
-		t.Fatalf("error cutover missing: %s", playlist)
+	if strings.Contains(playlist, "seg_00000.ts") || strings.Contains(playlist, "seg_00002.ts") {
+		t.Fatalf("error playlist must not advertise retired placeholders: %s", playlist)
+	}
+	if !strings.Contains(playlist, "#EXTINF:4.000000,\nseg_00003.ts") {
+		t.Fatalf("error video missing: %s", playlist)
 	}
 	if !strings.Contains(playlist, "#EXT-X-ENDLIST") {
 		t.Fatalf("playlist must end with ENDLIST: %s", playlist)

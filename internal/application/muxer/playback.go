@@ -737,10 +737,10 @@ func (m *Muxer) startupFailed(job *model.MuxJob, state *playbackState, cause err
 	log.Printf("mux: startup failed (retry after cooldown resumes from remaining sources): %v", cause)
 }
 
-// startErrorGeneration launches the local error video. The error video is
-// short VOD content, so it always numbers from segment 0 — start_number > its
-// content length would produce no segments at all. The placeholder (if any)
-// is retired and the public timeline resets with a DISCONTINUITY.
+// startErrorGeneration launches the local error video at its public handoff
+// segment. Continuing the existing numbering lets a client that is still
+// requesting the next intro segment receive the error video without a retry
+// or a seek.
 func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generation {
 	if m.errorPath == "" {
 		return nil
@@ -750,14 +750,18 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 	state.nextGeneration++
 	generationID := state.nextGeneration
 	ph := state.placeholder
+	if atSeg < 0 {
+		atSeg = state.introLastPublic
+	}
 	state.mu.Unlock()
-	start := 0
-	_ = atSeg // accepted for API symmetry; the error video resets the timeline
+	start := max(atSeg, 0)
 
 	var gen *generation
 	for attempt := 0; attempt < 2; attempt++ {
 		dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-		session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.errorPath, dir, false)
+		session, err := m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
+			VideoPath: m.errorPath, OutputDir: dir, StartSegment: start,
+		})
 		if err != nil {
 			log.Printf("mux: error video start (attempt %d): %v", attempt+1, err)
 			_ = os.RemoveAll(dir)
@@ -1676,17 +1680,12 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	}
 
 	if errGen != nil {
-		// Error-only timeline: placeholder prefix (if any) + error video.
-		b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
+		// The placeholder is retired once the error video is ready. Start at the
+		// first error segment instead of advertising virtual intro segments that
+		// no longer have backing files.
+		b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", errStart))
 		b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
 		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
-		for i := 0; i < errStart; i++ {
-			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
-			b.WriteString(tierSegmentURI(tier, i))
-		}
-		if errStart > 0 {
-			b.WriteString("#EXT-X-DISCONTINUITY\n")
-		}
 		for i := errStart; i < errStart+m.errorSegmentCount(); i++ {
 			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
 			b.WriteString(tierSegmentURI(tier, i))
