@@ -210,10 +210,10 @@ func newComposer(job *model.MuxJob) *composer {
 
 	log.Printf("mux: composer videos=%d audios=%d compositions=%d", len(c.videos), len(c.audios), len(c.ranked))
 	for i, s := range c.videos {
-		log.Printf("mux:   video#%d score=%d size=%s key=%s", i, analyzer.VideoScore(s.stream), streamSizeLabel(s.stream), s.stream.SourceKey())
+		log.Printf("mux:   video#%d score=%d size=%s key=%s title=%q", i, analyzer.VideoScore(s.stream), streamSizeLabel(s.stream), s.stream.SourceKey(), streamTitleLabel(s.stream))
 	}
 	for i, s := range c.audios {
-		log.Printf("mux:   audio#%d conf=%d score=%d size=%s key=%s", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), streamSizeLabel(s.stream), s.stream.SourceKey())
+		log.Printf("mux:   audio#%d conf=%d score=%d size=%s key=%s title=%q", i, audioConfidence(s.stream, job.TargetLanguage), analyzer.AudioScore(s.stream), streamSizeLabel(s.stream), s.stream.SourceKey(), streamTitleLabel(s.stream))
 	}
 	for i, comp := range c.ranked {
 		if i >= 8 {
@@ -349,8 +349,8 @@ func (c *composer) acquireWithin(maxBits int64) *composition {
 			continue
 		}
 		c.lastDelivered = key
-		log.Printf("mux: acquire rank=%d/%d -> video#%d audio#%d single=%v lenient=%v",
-			c.cursor+1, len(c.ranked), comp.video.videoPos, comp.audio.audioPos, comp.single, c.lenient)
+		log.Printf("mux: acquire rank=%d/%d -> video#%d audio#%d single=%v lenient=%v title=%q / %q",
+			c.cursor+1, len(c.ranked), comp.video.videoPos, comp.audio.audioPos, comp.single, c.lenient, streamTitleLabel(comp.video.stream), streamTitleLabel(comp.audio.stream))
 		return comp
 	}
 }
@@ -713,6 +713,33 @@ func makeCompositionPlan(comp *composition) model.PlaybackPlan {
 		Audio:          comp.audio.stream,
 		HasTargetAudio: true,
 	}
+}
+
+func streamTitleLabel(s model.CollectedStream) string {
+	t := strings.TrimSpace(s.Stream.Title)
+	if t == "" {
+		t = strings.TrimSpace(s.Stream.Name)
+	}
+	// Single line, truncated for logs.
+	t = strings.ReplaceAll(t, "\n", " ")
+	t = strings.TrimSpace(t)
+	if len(t) > 160 {
+		t = t[:160] + "…"
+	}
+	if d := strings.TrimSpace(strings.ReplaceAll(s.Stream.Description, "\n", " ")); d != "" {
+		if len(d) > 160 {
+			d = d[:160] + "…"
+		}
+		if t != "" {
+			t += " | " + d
+		} else {
+			t = d
+		}
+	}
+	if t == "" {
+		t = s.AddonName + " " + s.SourceKey()
+	}
+	return t
 }
 
 func min(a, b int) int {

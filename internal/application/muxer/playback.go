@@ -576,7 +576,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		prepCancel()
 		if err != nil {
 			lastErr = err
-			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v", candidate.ordinal, candidate.video.videoPos, candidate.audio.audioPos, err)
+			log.Printf("mux: composition %d (video#%d audio#%d) failed: %v title=%q / %q", candidate.ordinal, candidate.video.videoPos, candidate.audio.audioPos, err, streamTitleLabel(candidate.video.stream), streamTitleLabel(candidate.audio.stream))
 			state.mu.Lock()
 			comp.fail(candidate, cls, err)
 			state.mu.Unlock()
@@ -628,7 +628,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 			break
 		}
 		lastErr = err
-		log.Printf("mux: composition %d launch failed: %v", candidate.ordinal, err)
+		log.Printf("mux: composition %d launch failed: %v title=%q / %q", candidate.ordinal, err, streamTitleLabel(candidate.video.stream), streamTitleLabel(candidate.audio.stream))
 		state.mu.Lock()
 		comp.fail(candidate, failLaunch, err)
 		state.mu.Unlock()
