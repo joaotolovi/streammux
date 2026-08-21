@@ -103,7 +103,10 @@ func defaultPolicy() Policy {
 		// below this threshold across consecutive health windows.
 		MinRealtime:        0.90,
 		MinPublishedAhead:  12 * time.Second,
-		MinHandoffBuffer:   20 * time.Second,
+		// Film inputs are paced after their initial burst. Keep the intro frozen
+		// for at most two HLS segments while the first film generation warms up;
+		// a longer freeze makes clients abandon the live-to-VOD handoff.
+		MinHandoffBuffer:   8 * time.Second,
 		TierSwitchBuffer:   8 * time.Second,
 		TierSwitchCooldown: 30 * time.Second,
 		DurationTolerance:  0.002,
