@@ -308,13 +308,13 @@ func (m *Muxer) requestTier(job *model.MuxJob, state *playbackState, tier, atSeg
 
 	var cancel context.CancelFunc
 	state.mu.Lock()
-	if state.closed || state.recovering || state.tier0Prepared == nil {
+	if state.closed || state.recovering || state.tier0Prepared == nil || state.active == nil {
 		state.mu.Unlock()
 		return
 	}
 	if state.tierBusy {
 		if state.tierPending != tier {
-			cancel = state.tierSwitchCancel
+			cancel = cancelTierSwitchLocked(state)
 		}
 		state.mu.Unlock()
 		if cancel != nil {
@@ -332,6 +332,7 @@ func (m *Muxer) requestTier(job *model.MuxJob, state *playbackState, tier, atSeg
 	}
 
 	switchCtx, switchCancel := context.WithCancel(state.ctx)
+	expected := state.active
 	state.tierBusy = true
 	state.tierPending = tier
 	state.tierSwitchCancel = switchCancel
@@ -339,14 +340,25 @@ func (m *Muxer) requestTier(job *model.MuxJob, state *playbackState, tier, atSeg
 	state.tierErr = nil
 	state.mu.Unlock()
 
-	go m.runTierSwitch(job, state, tier, atSegment, switchCtx, switchCancel)
+	go m.runTierSwitch(job, state, expected, tier, atSegment, switchCtx, switchCancel)
+}
+
+// cancelTierSwitchLocked invalidates a pending switch before cancellation is
+// delivered. The worker therefore cannot commit a generation that finished at
+// the same time as a seek, recovery, or player-driven tier reversal.
+func cancelTierSwitchLocked(state *playbackState) context.CancelFunc {
+	if !state.tierBusy {
+		return nil
+	}
+	state.tierPending = -1
+	return state.tierSwitchCancel
 }
 
 // runTierSwitch walks the tier's ladder at the player's position, falling
 // through to deeper tiers' ladders when a whole tier is exhausted. The
 // resulting generation serves the requesting tier's namespace regardless of
 // which ladder ultimately supplied it.
-func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, tier, atSegment int, switchCtx context.Context, switchCancel context.CancelFunc) {
+func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, expected *generation, tier, atSegment int, switchCtx context.Context, switchCancel context.CancelFunc) {
 	start := time.Now()
 	winner, fromTier, err := m.launchTierStrategy(job, state, tier, atSegment, switchCtx)
 	switchCancel()
@@ -355,7 +367,7 @@ func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, tier, atS
 	wait := state.tierWait
 	old := state.active
 	committed := false
-	if err == nil && !state.closed && state.tierPending == tier {
+	if err == nil && !state.closed && state.tierPending == tier && state.active == expected {
 		committed = true
 		state.active = winner
 		state.all = append(state.all, winner)

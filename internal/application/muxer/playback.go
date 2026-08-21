@@ -2288,6 +2288,7 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		state.mu.Unlock()
 		return
 	}
+	cancelTier := cancelTierSwitchLocked(state)
 	state.recovering = true
 	state.recoveryWait = make(chan struct{})
 	state.recoveryErr = nil
@@ -2297,6 +2298,9 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		state.maxRequested = targetSegment
 	}
 	state.mu.Unlock()
+	if cancelTier != nil {
+		cancelTier()
+	}
 
 	go func() {
 		base := 0
@@ -2313,14 +2317,17 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 
 		state.mu.Lock()
 		wait := state.recoveryWait
-		if err == nil && !state.closed {
-			if old != gen && old.planIndex != gen.planIndex {
-				state.discontinuities = append(state.discontinuities, targetSegment)
+		committed := err == nil && !state.closed && state.active == old
+		if committed {
+			if old != gen {
+				// Every FFmpeg process starts a new timestamp sequence, even when it
+				// uses the same source. Tell the player to reset its decoders.
+				state.discontinuities = appendUniqueInt(state.discontinuities, targetSegment)
 			}
 			state.active = gen
 			state.all = append(state.all, gen)
 			state.lastRecovery = time.Now()
-		} else {
+		} else if err != nil {
 			state.recoveryErr = err
 		}
 		state.recovering = false
@@ -2330,7 +2337,18 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 			close(wait)
 		}
 
-		if err != nil {
+		if !committed {
+			if gen != nil {
+				gen.session.Cancel()
+				m.removeGenerationWhenStopped(gen)
+			}
+			state.mu.Lock()
+			closed := state.closed
+			stillActive := state.active == old
+			state.mu.Unlock()
+			if err == nil || closed || !stillActive {
+				return
+			}
 			log.Printf("mux: fast seek failed (%v); falling back to full recovery", err)
 			m.ensureRecovery(job, state, targetSegment, "seek fallback")
 			return
@@ -2350,10 +2368,14 @@ func (m *Muxer) ensureRecovery(job *model.MuxJob, state *playbackState, startSeg
 		state.mu.Unlock()
 		return
 	}
+	cancelTier := cancelTierSwitchLocked(state)
 	state.recovering = true
 	state.recoveryWait = make(chan struct{})
 	state.recoveryErr = nil
 	state.mu.Unlock()
+	if cancelTier != nil {
+		cancelTier()
+	}
 	go m.runRecovery(job, state, startSegment, reason)
 }
 
@@ -2362,6 +2384,7 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	// unsustainable session must reconsider its sources.
 	state.mu.Lock()
 	prefer := state.active
+	expected := state.active
 	if prefer != nil && prefer.isLocal {
 		prefer = nil
 	}
@@ -2388,18 +2411,21 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 
 	state.mu.Lock()
 	wait := state.recoveryWait
-	old := state.active
-	if err == nil && !state.closed {
+	old := expected
+	abandoned := state.closed || state.active != expected
+	committed := err == nil && !abandoned
+	if committed {
 		state.active = winner
 		state.all = append(state.all, winner)
-		// Mark the cutover when the source changes so players reset their
-		// decoders (resolution/HDR can differ between plans).
-		if old != nil && old != winner && old.planIndex != winner.planIndex {
-			state.discontinuities = append(state.discontinuities, startSegment)
+		// Every replacement FFmpeg process starts a new timestamp sequence,
+		// including a relaunch of the same source. The discontinuity is required
+		// so players do not freeze when timestamps jump backwards at the cutover.
+		if old != nil && old != winner {
+			state.discontinuities = appendUniqueInt(state.discontinuities, startSegment)
 		}
 		state.lastRecovery = time.Now()
 		state.recoveryErr = nil
-	} else {
+	} else if !abandoned {
 		state.recoveryErr = err
 	}
 	state.recovering = false
@@ -2408,6 +2434,13 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 
 	if wait != nil {
 		close(wait)
+	}
+	if abandoned || (err == nil && !committed) {
+		if winner != nil {
+			winner.session.Cancel()
+			m.removeGenerationWhenStopped(winner)
+		}
+		return
 	}
 	if err != nil {
 		log.Printf("mux: recovery after %s failed: %v", reason, err)

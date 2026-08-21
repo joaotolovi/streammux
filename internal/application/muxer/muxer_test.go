@@ -804,6 +804,7 @@ func TestRequestTierHonorsCooldown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	state := &playbackState{
+		active:         &generation{},
 		ctx:            ctx,
 		activeTier:     0,
 		tierPending:    -1,
@@ -821,6 +822,35 @@ func TestRequestTierHonorsCooldown(t *testing.T) {
 	state.mu.Unlock()
 	if busy {
 		t.Fatal("tier switch started during cooldown")
+	}
+}
+
+func TestRequestTierCancelsPendingSwitchWhenPlayerReturnsToActiveTier(t *testing.T) {
+	canceled := make(chan struct{})
+	state := &playbackState{
+		active:        &generation{},
+		activeTier:    0,
+		tierBusy:      true,
+		tierPending:   1,
+		tier0Prepared: &preparedPlan{},
+		tierSwitchCancel: func() {
+			close(canceled)
+		},
+	}
+	mux := &Muxer{}
+
+	mux.requestTier(&model.MuxJob{ID: "job"}, state, 0, 2)
+
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("pending tier switch was not canceled")
+	}
+	state.mu.Lock()
+	pending := state.tierPending
+	state.mu.Unlock()
+	if pending != -1 {
+		t.Fatalf("pending tier = %d, want invalidated", pending)
 	}
 }
 

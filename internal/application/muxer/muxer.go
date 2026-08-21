@@ -91,14 +91,17 @@ func defaultPolicy() Policy {
 		// The Stremio client tolerates roughly 60s before it gives up on
 		// starting playback, so startup can use a generous window. Lenient uses
 		// half of StartupTimeout and re-runs cached probes, so it stays fast.
-		StartupTimeout:     50 * time.Second,
-		AttemptTimeout:     25 * time.Second,
-		SegmentTimeout:     30 * time.Second,
-		IdleTimeout:        90 * time.Second,
-		HealthWindow:       4 * time.Second,
-		RecoveryCooldown:   10 * time.Second,
-		RetryCooldown:      30 * time.Second,
-		MinRealtime:        1.0,
+		StartupTimeout:   50 * time.Second,
+		AttemptTimeout:   25 * time.Second,
+		SegmentTimeout:   30 * time.Second,
+		IdleTimeout:      90 * time.Second,
+		HealthWindow:     4 * time.Second,
+		RecoveryCooldown: 10 * time.Second,
+		RetryCooldown:    30 * time.Second,
+		// Remote film inputs are intentionally paced at 1x. Allow normal FFmpeg
+		// scheduling jitter around that limit; genuinely slow sources still fall
+		// below this threshold across consecutive health windows.
+		MinRealtime:        0.90,
 		MinPublishedAhead:  12 * time.Second,
 		MinHandoffBuffer:   20 * time.Second,
 		TierSwitchBuffer:   8 * time.Second,
