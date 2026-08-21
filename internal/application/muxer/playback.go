@@ -2197,9 +2197,6 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		} else if !active.isError {
 			highest := highestCompleteSegment(active.dir)
 			lowest := lowestCompleteSegment(active.dir)
-			if !audio && segment >= 140 && segment <= 150 {
-				log.Printf("mux: seek-check seg=%d prevMax=%d highest=%d lowest=%d start=%d recovering=%v audio=%v isForward=%v", segment, prevMax, highest, lowest, active.startSegment, recovering, audio, isForwardSeek(prevMax, segment, highest, active.startSegment))
-			}
 			select {
 			case <-active.session.Done():
 				if !recovering {
