@@ -2322,7 +2322,11 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 	all := append([]*generation(nil), state.all...)
 	state.mu.Unlock()
 	if active == nil {
-		return ""
+		// Players are allowed to select a lower ABR URI while the opening
+		// placeholder is still live. The placeholder has only one rendition,
+		// so every tier must resolve to those exact segments until film media is
+		// promoted; otherwise a stale vN/seg_* request becomes a false seek.
+		return m.segmentPath(job, segment, false)
 	}
 	if activeTier != tier {
 		path := generationSegmentPath(active, segment)
