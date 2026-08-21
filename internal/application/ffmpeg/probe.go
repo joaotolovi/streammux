@@ -128,6 +128,7 @@ func (m *Muxer) Probe(ctx context.Context, url string) (*ProbeResult, error) {
 func (m *Muxer) probeOnce(ctx context.Context, url string, limit probeLimits) (*ProbeResult, error) {
 	args := []string{
 		"-v", "error",
+		"-icy", "0",
 		"-analyzeduration", limit.analyzeDuration,
 		"-probesize", limit.probeSize,
 		"-print_format", "json",
