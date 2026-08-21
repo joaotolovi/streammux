@@ -301,7 +301,7 @@ func TestRenderMediaPlaylistVodWithDiscontinuity(t *testing.T) {
 }
 
 func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
-	// The film occupies [2..7) of the public timeline (28s = 7 segments).
+	// The film starts at public segment 2 and contains all seven film segments.
 	state := &playbackState{
 		duration:        28,
 		filmBase:        2,
@@ -324,16 +324,15 @@ func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
 	if strings.Contains(playlist, "seg_00000.ts") || strings.Contains(playlist, "seg_00001.ts") {
 		t.Fatalf("playlist must not list placeholder segments: %s", playlist)
 	}
-	if !strings.Contains(playlist, "seg_00006.ts") || strings.Contains(playlist, "seg_00007.ts") {
-		t.Fatalf("playlist must list exactly the film range: %s", playlist)
+	if !strings.Contains(playlist, "seg_00008.ts") {
+		t.Fatalf("playlist must list the complete film range: %s", playlist)
 	}
 }
 
 func TestRenderMediaPlaylistAfterPlaceholderResume(t *testing.T) {
 	state := &playbackState{
 		duration:        28,
-		filmBase:        2,
-		resumeStart:     5,
+		filmBase:        5,
 		discontinuities: []int{5},
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
@@ -372,26 +371,88 @@ func TestSegmentPathMapsVirtualResumeToIntro(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	videoPath := filepath.Join(dir, "video", "seg_00000.ts")
-	if err := os.WriteFile(videoPath, []byte("intro"), 0644); err != nil {
-		t.Fatal(err)
+	for segment := 0; segment < 4; segment++ {
+		for _, media := range []string{"video", "audio"} {
+			path := filepath.Join(dir, media, fmt.Sprintf("seg_%05d.ts", segment))
+			if err := os.WriteFile(path, []byte("intro"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
+	videoPath := filepath.Join(dir, "video", "seg_00000.ts")
 	placeholder := &generation{dir: dir}
 	state := &playbackState{
-		placeholder:      placeholder,
-		introPublicStart: 375,
-		filmEnd:          -1,
-		all:              []*generation{placeholder},
+		placeholder:        placeholder,
+		introPublicStart:   -1,
+		introPhysicalStart: -1,
+		introLastPhysical:  -1,
+		introSegments:      make(map[int]int),
+		all:                []*generation{placeholder},
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 375); got != videoPath {
 		t.Fatalf("mapped resume path = %q, want %q", got, videoPath)
 	}
-	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 376); got != "" {
-		t.Fatalf("unexpected second intro segment = %q", got)
+	secondPath := filepath.Join(dir, "video", "seg_00001.ts")
+	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 900); got != secondPath {
+		t.Fatalf("intro seek path = %q, want %q", got, secondPath)
 	}
-	if state.introPublicStart != 375 {
-		t.Fatalf("intro public start = %d, want 375", state.introPublicStart)
+	secondAudioPath := filepath.Join(dir, "audio", "seg_00001.ts")
+	if got := mux.AudioSegmentPath(&model.MuxJob{ID: "job"}, 900); got != secondAudioPath {
+		t.Fatalf("intro seek audio path = %q, want %q", got, secondAudioPath)
+	}
+	thirdPath := filepath.Join(dir, "video", "seg_00002.ts")
+	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 901); got != thirdPath {
+		t.Fatalf("continued intro path = %q, want %q", got, thirdPath)
+	}
+	fourthPath := filepath.Join(dir, "video", "seg_00003.ts")
+	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 120); got != fourthPath {
+		t.Fatalf("backward intro seek path = %q, want %q", got, fourthPath)
+	}
+	if state.introPublicStart != 120 || state.introPhysicalStart != 3 {
+		t.Fatalf("intro anchor = (%d, %d), want (120, 3)", state.introPublicStart, state.introPhysicalStart)
+	}
+	if got := introHandoffSegment(state, 8); got != 125 {
+		t.Fatalf("handoff segment = %d, want 125", got)
+	}
+}
+
+func TestIntroAtZeroKeepsPublicAndPhysicalSegmentsAligned(t *testing.T) {
+	state := &playbackState{
+		placeholder:        &generation{},
+		introPublicStart:   -1,
+		introPhysicalStart: -1,
+		introLastPhysical:  -1,
+		introSegments:      make(map[int]int),
+	}
+	if physical, ok := mapIntroSegment(state, 0); !ok || physical != 0 {
+		t.Fatalf("first mapping = (%d, %v), want (0, true)", physical, ok)
+	}
+	if physical, ok := mapIntroSegment(state, 1); !ok || physical != 1 {
+		t.Fatalf("second mapping = (%d, %v), want (1, true)", physical, ok)
+	}
+	if got := introHandoffSegment(state, 8); got != 8 {
+		t.Fatalf("handoff segment = %d, want 8", got)
+	}
+}
+
+func TestSegmentPathDoesNotServeRetiredIntroAfterHandoff(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "video", "seg_00000.ts"), []byte("intro"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	intro := &generation{dir: dir, isLocal: true}
+	state := &playbackState{
+		active:   &generation{startSegment: 5},
+		all:      []*generation{intro},
+		duration: 60,
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	if got := mux.SegmentPath(&model.MuxJob{ID: "job"}, 0); got != "" {
+		t.Fatalf("retired intro satisfied film seek: %q", got)
 	}
 }
 
@@ -427,9 +488,8 @@ func TestRenderMediaPlaylistErrorOnlyAfterPlaceholder(t *testing.T) {
 	// Startup failed while the placeholder played: [0..3) placeholder +
 	// DISCONTINUITY + error video.
 	state := &playbackState{
-		errorGeneration:    &generation{dir: t.TempDir(), isError: true},
-		errorStart:         3,
-		retiredPlaceholder: &generation{dir: t.TempDir()},
+		errorGeneration: &generation{dir: t.TempDir(), isError: true},
+		errorStart:      3,
 	}
 	mux := &Muxer{states: map[string]*playbackState{"job": state}}
 	job := &model.MuxJob{ID: "job"}

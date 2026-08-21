@@ -22,7 +22,7 @@ func TestFetchPosterDownloadsImage(t *testing.T) {
 
 	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"meta":{"poster":"` + posterServer.URL + `/poster.png"}}`))
+		_, _ = w.Write([]byte(`{"meta":{"logo":"` + posterServer.URL + `/poster.png"}}`))
 	}))
 	defer metaServer.Close()
 
@@ -70,7 +70,7 @@ func TestFetchPosterStripsEpisodeSuffixForSeries(t *testing.T) {
 	metaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedPath = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"meta":{"poster":"` + posterServer.URL + `/poster.jpg"}}`))
+		_, _ = w.Write([]byte(`{"meta":{"logo":"` + posterServer.URL + `/poster.jpg"}}`))
 	}))
 	defer metaServer.Close()
 
@@ -105,7 +105,7 @@ func TestFetchCinemetaMetadataExtractsPresentationFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedLanguage = r.URL.Query().Get("language")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"meta":{"name":"Oppenheimer","releaseInfo":"2023-2024","imdbRating":8.6,"videos":[{"season":1,"episode":1,"name":"Pilot"}]}}`))
+		_, _ = w.Write([]byte(`{"meta":{"name":"Oppenheimer","releaseInfo":"2023-2024","runtime":"180 min","imdbRating":8.6,"videos":[{"season":1,"episode":1,"name":"Pilot"}]}}`))
 	}))
 	defer server.Close()
 
@@ -119,6 +119,9 @@ func TestFetchCinemetaMetadataExtractsPresentationFields(t *testing.T) {
 	}
 	if metadata.Title != "Oppenheimer" || metadata.Year != "2023" || metadata.Rating != "8.6" {
 		t.Fatalf("unexpected metadata: %#v", metadata)
+	}
+	if metadata.Duration != 180*60 {
+		t.Fatalf("duration = %.0f, want 10800", metadata.Duration)
 	}
 	if receivedLanguage != "pt-BR" {
 		t.Fatalf("language query = %q, want pt-BR", receivedLanguage)
