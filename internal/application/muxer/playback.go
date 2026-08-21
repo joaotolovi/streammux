@@ -2332,9 +2332,11 @@ func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio boo
 			return path
 		}
 	}
-	// A player may retry a URI it received through the bridge before the tier
-	// cutover. Keep that URI stable even after the new tier becomes active.
-	if tier > 0 && activeTier == tier && segment < active.startSegment {
+	// A player may select an ABR URL while the placeholder is live, then retry
+	// that old URL after the film becomes active on another tier. Keep every
+	// URI before the film boundary stable; otherwise vN/seg_* is misclassified
+	// as a backward seek and replaces the freshly started film generation.
+	if tier > 0 && segment < active.startSegment {
 		for i := len(all) - 1; i >= 0; i-- {
 			if all[i] == active {
 				continue
