@@ -16,6 +16,10 @@ import (
 const (
 	// segDuration is the length of each HLS segment in seconds.
 	segDuration = 4.0
+	// initialReadBurstSeconds fills the server-side media reserve before input
+	// reads settle to playback speed. It prevents a fast CDN from downloading
+	// the whole film while still absorbing short source outages.
+	initialReadBurstSeconds = 120.0
 
 	// StreamMux renders its own playback window and removes files according to
 	// the client cursor. FFmpeg must retain produced segments meanwhile: a VOD
@@ -330,6 +334,8 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		"-stats_period", "1",
 		"-progress", "pipe:1",
 		"-y",
+		"-readrate", "1",
+		"-readrate_initial_burst", fmtDuration(initialReadBurstSeconds),
 		"-ss", fmtDuration(offset),
 	}
 	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
@@ -345,7 +351,11 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 			// audio to re-align it with the video content.
 			args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
 		}
-		args = append(args, "-ss", fmtDuration(offset))
+		args = append(args,
+			"-readrate", "1",
+			"-readrate_initial_burst", fmtDuration(initialReadBurstSeconds),
+			"-ss", fmtDuration(offset),
+		)
 		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
 			args = append(args, "-user_agent", userAgent)
 		}

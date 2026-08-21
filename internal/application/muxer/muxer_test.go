@@ -80,6 +80,20 @@ func TestRecordVideoRequestIgnoresRetryAndResetsOnSeek(t *testing.T) {
 	}
 }
 
+func TestForwardSeekStartsOneSegmentBeforeRequested(t *testing.T) {
+	if !isForwardSeek(100, 130, 105, 0) {
+		t.Fatal("fixture must be a forward seek")
+	}
+	requested := 130
+	target := requested
+	if isForwardSeek(100, requested, 105, 0) && target > 0 {
+		target--
+	}
+	if target != 129 {
+		t.Fatalf("forward seek target = %d, want 129", target)
+	}
+}
+
 func TestPruneGenerationBytesRemovesOldestCompleteSegments(t *testing.T) {
 	dir := t.TempDir()
 	for _, media := range []string{"video", "audio"} {

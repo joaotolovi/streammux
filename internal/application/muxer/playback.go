@@ -2206,7 +2206,14 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				// request before that window is a real backward seek and must
 				// relaunch at the requested position.
 				if (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
-					m.fastSeek(job, state, active, segment)
+					target := segment
+					if isForwardSeek(prevMax, segment, highest, active.startSegment) && target > 0 {
+						// HLS fetches can arrive out of order around a seek. Include one
+						// segment before the first forward request so its predecessor is
+						// ready instead of triggering an immediate second seek.
+						target--
+					}
+					m.fastSeek(job, state, active, target)
 				}
 			}
 		} else {

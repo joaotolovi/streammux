@@ -30,7 +30,7 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		t.Fatalf("input count = %d, want 1; args: %#v", countArgument(got, "-i"), got)
 	}
 	for _, want := range [][]string{
-		{"-ss", "12", "-icy", "0", "-i", "https://example.test/media.mkv"},
+		{"-readrate", "1", "-readrate_initial_burst", "120", "-ss", "12", "-icy", "0", "-i", "https://example.test/media.mkv"},
 		{"-map", "0:v:1"},
 		{"-map", "0:a:2"},
 		{"-c:v", "copy"},
@@ -103,8 +103,8 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		t.Fatalf("input count = %d, want 2; args: %#v", countArgument(got, "-i"), got)
 	}
 	for _, want := range [][]string{
-		{"-ss", "20", "-icy", "0", "-i", spec.VideoURL},
-		{"-ss", "20", "-icy", "0", "-i", spec.AudioURL},
+		{"-readrate", "1", "-readrate_initial_burst", "120", "-ss", "20", "-icy", "0", "-i", spec.VideoURL},
+		{"-readrate", "1", "-readrate_initial_burst", "120", "-ss", "20", "-icy", "0", "-i", spec.AudioURL},
 		{"-map", "0:v:0"},
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
