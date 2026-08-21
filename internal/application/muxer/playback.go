@@ -619,6 +619,14 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 
 		startSegment := base
 		startTime := filmStartTime
+		if strings.EqualFold(prepared.videoCodec, "hevc") && prepared.videoHeight > 1080 && startTime > 0 {
+			// A resumed 4K HEVC stream-copy session starts at an arbitrary GOP
+			// position. Start with independent H.264 chunks instead of letting
+			// the player receive one undecodable HEVC segment before ABR reacts.
+			sourceHeight := prepared.videoHeight
+			prepared = transcodePrepared(prepared, transcodeSpecFor(1, sourceHeight))
+			log.Printf("mux: starting resumed %dp HEVC as 1080p H.264", sourceHeight)
+		}
 		if startSegment > 0 {
 			log.Printf("mux: starting film at public segment %d, source %.0fs", startSegment, startTime)
 		}

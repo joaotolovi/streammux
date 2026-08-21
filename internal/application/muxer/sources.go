@@ -61,6 +61,7 @@ type preparedPlan struct {
 	videoBitrate float64
 	videoWidth   int
 	videoHeight  int
+	videoCodec   string
 	// videoAudioTracks are the audio tracks of the video source, used for A/V
 	// offset estimation on dual-source plans.
 	videoAudioTracks []ffmpeg.AudioTrack
@@ -157,6 +158,7 @@ func (m *Muxer) preparePlanMode(ctx context.Context, job *model.MuxJob, plan mod
 	if len(videoProbe.VideoStreams) > 0 {
 		prepared.videoWidth = videoProbe.VideoStreams[0].Width
 		prepared.videoHeight = videoProbe.VideoStreams[0].Height
+		prepared.videoCodec = videoProbe.VideoStreams[0].Codec
 	}
 	prepared.videoAudioTracks = videoProbe.AudioTracks
 	for _, track := range audioProbe.AudioTracks {

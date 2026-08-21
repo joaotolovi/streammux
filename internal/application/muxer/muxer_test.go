@@ -1146,6 +1146,17 @@ func TestFallbackTrackPrefersDefaultThenQuality(t *testing.T) {
 	}
 }
 
+func TestTranscodePreparedCapsDimensionsAndBitrate(t *testing.T) {
+	prepared := &preparedPlan{videoWidth: 3840, videoHeight: 2160, videoBitrate: 93_000_000, videoCodec: "hevc"}
+	got := transcodePrepared(prepared, &ffmpeg.TranscodeSpec{Height: 1080, MaxRateKbps: 18_000})
+	if got.transcode == nil || got.videoWidth != 1920 || got.videoHeight != 1080 || got.videoBitrate != 18_000_000 || got.videoCodec != "h264" {
+		t.Fatalf("unexpected transcoded plan: %#v", got)
+	}
+	if prepared.transcode != nil || prepared.videoHeight != 2160 || prepared.videoCodec != "hevc" {
+		t.Fatalf("source plan was modified: %#v", prepared)
+	}
+}
+
 func TestComposerMarkFailedSkipsSourceInBothQueues(t *testing.T) {
 	comp := newComposer(composerJobFixture())
 	first := comp.acquire()

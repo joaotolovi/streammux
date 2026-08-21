@@ -84,6 +84,18 @@ func transcodeSpecFor(tier, t0Height int) *ffmpeg.TranscodeSpec {
 	}
 }
 
+func transcodePrepared(source *preparedPlan, spec *ffmpeg.TranscodeSpec) *preparedPlan {
+	clone := *source
+	clone.transcode = spec
+	clone.videoBitrate = float64(spec.MaxRateKbps) * 1000
+	clone.videoCodec = "h264"
+	if source.videoWidth > 0 && source.videoHeight > 0 {
+		clone.videoWidth = source.videoWidth * spec.Height / source.videoHeight
+		clone.videoHeight = spec.Height
+	}
+	return &clone
+}
+
 // buildTierLadder returns only a transcode of the selected primary source.
 // Stream-copy variants from other releases have unrelated keyframe boundaries
 // and cannot be switched safely on this fixed public segment timeline.
@@ -164,14 +176,7 @@ func (m *Muxer) prepareTierStrategy(ctx context.Context, job *model.MuxJob, stat
 		if t0 == nil {
 			return nil, fmt.Errorf("no primary plan to transcode")
 		}
-		clone := *t0
-		clone.transcode = s.transcode
-		clone.videoBitrate = float64(s.transcode.MaxRateKbps) * 1000
-		if t0.videoWidth > 0 && t0.videoHeight > 0 {
-			clone.videoWidth = t0.videoWidth * s.transcode.Height / t0.videoHeight
-			clone.videoHeight = s.transcode.Height
-		}
-		return &clone, nil
+		return transcodePrepared(t0, s.transcode), nil
 	case stratSource:
 		comp := &composition{
 			video:   s.video,

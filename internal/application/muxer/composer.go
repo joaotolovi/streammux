@@ -613,6 +613,7 @@ func (m *Muxer) prepareComposition(ctx context.Context, job *model.MuxJob, comp 
 	if len(comp.video.probe.VideoStreams) > 0 {
 		prepared.videoWidth = comp.video.probe.VideoStreams[0].Width
 		prepared.videoHeight = comp.video.probe.VideoStreams[0].Height
+		prepared.videoCodec = comp.video.probe.VideoStreams[0].Codec
 	}
 	prepared.videoAudioTracks = comp.video.probe.AudioTracks
 
