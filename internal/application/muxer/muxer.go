@@ -98,7 +98,10 @@ func defaultPolicy() Policy {
 		HealthWindow:       4 * time.Second,
 		RecoveryCooldown:   10 * time.Second,
 		RetryCooldown:      30 * time.Second,
-		MinRealtime:        1.0,
+		// Remote film inputs are intentionally paced at 1x. Allow normal FFmpeg
+		// scheduling jitter around that limit; genuinely slow sources still fall
+		// below this threshold across consecutive health windows.
+		MinRealtime:        0.90,
 		MinPublishedAhead:  12 * time.Second,
 		MinHandoffBuffer:   20 * time.Second,
 		TierSwitchBuffer:   8 * time.Second,

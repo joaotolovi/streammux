@@ -2416,8 +2416,10 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 		state.mu.Lock()
 		wait := state.recoveryWait
 		if err == nil && !state.closed {
-			if old != gen && old.planIndex != gen.planIndex {
-				state.discontinuities = append(state.discontinuities, targetSegment)
+			if old != gen {
+				// Every FFmpeg process starts a new timestamp sequence, even when it
+				// uses the same source. Tell the player to reset its decoders.
+				state.discontinuities = appendUniqueInt(state.discontinuities, targetSegment)
 			}
 			state.active = gen
 			state.all = append(state.all, gen)
@@ -2494,10 +2496,11 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	if err == nil && !state.closed {
 		state.active = winner
 		state.all = append(state.all, winner)
-		// Mark the cutover when the source changes so players reset their
-		// decoders (resolution/HDR can differ between plans).
-		if old != nil && old != winner && old.planIndex != winner.planIndex {
-			state.discontinuities = append(state.discontinuities, startSegment)
+		// Every replacement FFmpeg process starts a new timestamp sequence,
+		// including a relaunch of the same source. The discontinuity is required
+		// so players do not freeze when timestamps jump backwards at the cutover.
+		if old != nil && old != winner {
+			state.discontinuities = appendUniqueInt(state.discontinuities, startSegment)
 		}
 		state.lastRecovery = time.Now()
 		state.recoveryErr = nil
