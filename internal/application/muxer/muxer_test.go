@@ -304,8 +304,7 @@ func TestRenderMediaPlaylistVodWithDiscontinuity(t *testing.T) {
 }
 
 func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
-	// The film takes over at segment 2, but the public movie timeline remains
-	// complete so the player's media clock does not reset at the handoff.
+	// The film starts at public segment 2 and contains all seven film segments.
 	state := &playbackState{
 		duration:        28,
 		filmBase:        2,
@@ -319,16 +318,16 @@ func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
 		t.Fatal("VideoPlaylist() returned false")
 	}
 	playlist := string(data)
-	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:0\n") {
-		t.Fatalf("playlist must preserve the movie timeline: %s", playlist[:120])
+	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:2\n") {
+		t.Fatalf("playlist must start at the film base: %s", playlist[:120])
 	}
 	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n#EXTINF:4.000000,\nseg_00002.ts") {
 		t.Fatalf("playlist missing cutover discontinuity: %s", playlist)
 	}
-	if !strings.Contains(playlist, "seg_00000.ts") || !strings.Contains(playlist, "seg_00001.ts") {
-		t.Fatalf("playlist must retain the pre-handoff movie range: %s", playlist)
+	if strings.Contains(playlist, "seg_00000.ts") || strings.Contains(playlist, "seg_00001.ts") {
+		t.Fatalf("playlist must not list placeholder segments: %s", playlist)
 	}
-	if !strings.Contains(playlist, "seg_00006.ts") {
+	if !strings.Contains(playlist, "seg_00008.ts") {
 		t.Fatalf("playlist must list the complete film range: %s", playlist)
 	}
 }
@@ -347,11 +346,11 @@ func TestRenderMediaPlaylistAfterPlaceholderResume(t *testing.T) {
 		t.Fatal("VideoPlaylist() returned false")
 	}
 	playlist := string(data)
-	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:0\n") {
-		t.Fatalf("playlist must preserve the movie timeline after resume: %s", playlist)
+	if !strings.Contains(playlist, "#EXT-X-MEDIA-SEQUENCE:5\n") {
+		t.Fatalf("playlist must start at the resumed segment: %s", playlist)
 	}
-	if !strings.Contains(playlist, "seg_00000.ts") || !strings.Contains(playlist, "seg_00004.ts") {
-		t.Fatalf("playlist must retain segments before the handoff: %s", playlist)
+	if strings.Contains(playlist, "seg_00002.ts") || strings.Contains(playlist, "seg_00004.ts") {
+		t.Fatalf("playlist must not advertise skipped film segments: %s", playlist)
 	}
 	if !strings.Contains(playlist, "#EXT-X-DISCONTINUITY\n") || !strings.Contains(playlist, "seg_00005.ts") {
 		t.Fatalf("playlist missing resumed handoff: %s", playlist)
