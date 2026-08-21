@@ -38,7 +38,7 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		{"-metadata:s:a:0", "language=por"},
 		{"-disposition:a:0", "default"},
 		{"-metadata:s:a:0", "title=Português"},
-		{"-hls_flags", "temp_file+discont_start"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start"},
 		{"-hls_segment_filename", "/tmp/session/video/seg_%05d.ts"},
 		{"-hls_list_size", "0"},
 		{"-hls_segment_filename", "/tmp/session/audio/seg_%05d.ts"},
@@ -109,7 +109,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
 		{"-c:a", "aac"},
-		{"-hls_flags", "temp_file+discont_start"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start"},
 		{"/tmp/dual/video/video.m3u8"},
 		{"/tmp/dual/audio/audio.m3u8"},
 	} {
@@ -187,9 +187,9 @@ func containsArguments(args, sequence []string) bool {
 	return false
 }
 
-func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
-	// StartTime 0 = fresh start: the video keeps independent_segments (split
-	// on keyframes); only seeks switch to split_by_time.
+func TestBuildSessionArgsKeepsVideoAndAudioOnSameGrid(t *testing.T) {
+	// The public timeline uses one segment number for video and audio, so both
+	// outputs must split on the same fixed grid from the initial segment.
 	spec := SessionSpec{
 		VideoURL:        "https://example.test/media.mkv",
 		VideoTrackIndex: 0,
@@ -202,8 +202,8 @@ func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
 	}
 	videoFlags := flagsFor(got, "/tmp/fresh/video/video.m3u8")
 	audioFlags := flagsFor(got, "/tmp/fresh/audio/audio.m3u8")
-	if videoFlags != "independent_segments+temp_file" {
-		t.Fatalf("fresh video flags = %q, want muxer-managed segment retention", videoFlags)
+	if videoFlags != "temp_file+split_by_time" {
+		t.Fatalf("video flags = %q, want fixed-grid split", videoFlags)
 	}
 	if audioFlags != "independent_segments+temp_file+split_by_time" {
 		t.Fatalf("audio flags = %q, want muxer-managed split-by-time retention", audioFlags)

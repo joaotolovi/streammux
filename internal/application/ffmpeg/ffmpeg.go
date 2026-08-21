@@ -357,22 +357,16 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		audioInput = 1
 	}
 
-	// Video-only rendition. Stream copy must cut on keyframes to keep
-	// segments independently decodable (mid-GOP cuts produce non-existing PPS).
-	// Transcode can keep split_by_time because it forces IDRs on the 4s grid.
-	videoFlags := "independent_segments+temp_file"
+	// Both renditions must use the same 4s segment grid. Stream-copy video
+	// can begin mid-GOP between segments, so it must not advertise independent
+	// segments; each seek still begins from FFmpeg's preceding source keyframe.
+	videoFlags := "temp_file+split_by_time"
+	if spec.StartSegment > 0 {
+		videoFlags += "+discont_start"
+	}
 	if spec.Transcode != nil {
-		if spec.StartTime > 0 {
-			videoFlags = "temp_file+split_by_time+discont_start"
-		} else if spec.StartSegment > 0 {
-			videoFlags += "+discont_start"
-		}
-	} else {
-		if spec.StartTime > 0 {
-			videoFlags = "temp_file+discont_start"
-		} else if spec.StartSegment > 0 {
-			videoFlags += "+discont_start"
-		}
+		// Transcodes force IDRs at the grid, so their segments are independent.
+		videoFlags = "independent_segments+" + videoFlags
 	}
 	args = append(args,
 		"-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex),
