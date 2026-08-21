@@ -61,15 +61,32 @@ func (m *Muxer) ObserveDelivery(job *model.MuxJob, sent int64, elapsed time.Dura
 	}
 	state.mu.Unlock()
 
-	// Keep this as diagnostics only. A server-side source switch changes the
-	// media characteristics behind the player's current variant and can cause
-	// buffering; the player's HLS ABR must perform bandwidth adaptation.
 	last := samples[len(samples)-1]
 	if required > 0 && last.bytes > 0 && float64(last.bytes*8)/last.seconds < required {
 		sustained := windowThroughput(samples)
 		log.Printf("mux: delivery %.1f Mbps below required %.1f Mbps (%.1f MB in %.1fs; window %d/%d sustained %.1f Mbps)",
 			float64(last.bytes*8)/last.seconds/1e6, required/1e6,
 			float64(last.bytes)/1e6, last.seconds, len(samples), deliveryWindow, sustained/1e6)
+	}
+	if playerTooSlow(samples, required) {
+		sustained := windowThroughput(samples)
+		state.mu.Lock()
+		recovering := state.recovering
+		cooldownElapsed := time.Since(state.lastRecovery) >= m.policy.RecoveryCooldown
+		requested := state.lastRequested
+		highest := -1
+		if state.active != nil {
+			highest = highestCompleteSegment(state.active.dir)
+		}
+		state.mu.Unlock()
+		if !recovering && cooldownElapsed && requested >= 0 && highest >= 0 {
+			next := requested + 1
+			if next <= highest {
+				next = highest + 1
+			}
+			log.Printf("mux: player throughput %.1f Mbps below required %.1f Mbps, switching to lighter source at segment %d", sustained/1e6, required/1e6, next)
+			m.ensureRecovery(job, state, next, "player throughput")
+		}
 	}
 }
 
