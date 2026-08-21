@@ -1143,37 +1143,9 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 	active := state.active
 	placeholder := state.placeholder
 	duration := state.duration
-	metas := append([]model.TierMeta(nil), state.tierMetas...)
-	if len(metas) == 0 {
-		metas = append(metas, job.TierMetas...)
-	}
-	if len(metas) == 0 {
-		metas = placeholderTierMetas()
-	}
-	tiers := len(metas)
 	state.mu.Unlock()
 
 	if active != nil && !active.isError && active.prepared != nil && duration > 0 {
-		if tiers > 1 {
-			// Override tier 0 with the REAL probed bitrate/dimensions of
-			// the active generation — the estimate from Process time is
-			// only a placeholder until ffprobe measures the source.
-			metas := append([]model.TierMeta(nil), metas...)
-			bitrate := active.prepared.videoBitrate
-			if bitrate <= 0 {
-				bitrate = float64(active.plan.EstimatedBandwidth())
-			}
-			bw := int64(bitrate * 1.2)
-			if bw <= 0 {
-				bw = 8_000_000
-			}
-			metas[0] = model.TierMeta{
-				Bandwidth: bw,
-				Width:     active.prepared.videoWidth,
-				Height:    active.prepared.videoHeight,
-			}
-			return m.renderMasterABR(job, metas, job.TargetLanguage), true
-		}
 		bitrate := active.prepared.videoBitrate
 		if bitrate <= 0 {
 			bitrate = float64(active.plan.EstimatedBandwidth())
@@ -1185,13 +1157,7 @@ func (m *Muxer) MasterPlaylist(job *model.MuxJob) ([]byte, bool) {
 		return m.renderMaster(job, bandwidth, active.prepared.videoWidth, active.prepared.videoHeight, job.TargetLanguage), true
 	}
 	if placeholder != nil || (active != nil && active.isError) {
-		// Advertise the complete virtual ladder from the first master request.
-		// The lower tiers remain lazy and do not consume debrid slots until the
-		// player requests one of their namespaced segments.
-		if placeholder != nil && tiers > 1 {
-			return m.renderMasterABR(job, metas, job.TargetLanguage), true
-		}
-		// Small terminal error rendition.
+		// Single variant only: ABR source switching disabled for fluid playback.
 		return m.renderMaster(job, 3_000_000, 0, 0, job.TargetLanguage), true
 	}
 	return nil, false
