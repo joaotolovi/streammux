@@ -1615,7 +1615,10 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// immediately available and segment requests are bridged to the active
 	// generation until the target has enough buffer.
 	if tier != activeTier && lastRequested >= 0 {
-		m.requestTier(job, state, tier, lastRequested+1)
+		// A codec-changing ABR tier must begin at the segment the player is
+		// currently consuming. Starting at the next one leaves the requested
+		// segment missing and immediately triggers a backward fast-seek.
+		m.requestTier(job, state, tier, lastRequested)
 	}
 
 	// Live placeholder phase: synchronized sliding window of both renditions,
@@ -2244,7 +2247,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		lastRequested := state.lastRequested
 		state.mu.Unlock()
 		at := segment
-		if lastRequested >= 0 && lastRequested+1 > at {
+		if tier == 0 && lastRequested >= 0 && lastRequested+1 > at {
 			at = lastRequested + 1
 		}
 		m.requestTier(job, state, tier, at)
