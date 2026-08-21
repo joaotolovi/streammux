@@ -4,7 +4,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestBuildSessionArgsSingleSource(t *testing.T) {
@@ -19,7 +18,6 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		AudioMode:       AudioModeCopy,
 		AudioLanguage:   "pt-BR",
 		AudioTitle:      "Português",
-		Duration:        16 * time.Second,
 	}
 
 	got, err := buildSessionArgs(spec)
@@ -31,9 +29,6 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 	if countArgument(got, "-i") != 1 {
 		t.Fatalf("input count = %d, want 1; args: %#v", countArgument(got, "-i"), got)
 	}
-	if countArgument(got, "-t") != 2 {
-		t.Fatalf("batch duration must apply to both outputs: %#v", got)
-	}
 	for _, want := range [][]string{
 		{"-ss", "12", "-icy", "0", "-i", "https://example.test/media.mkv"},
 		{"-map", "0:v:1"},
@@ -43,10 +38,9 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		{"-metadata:s:a:0", "language=por"},
 		{"-disposition:a:0", "default"},
 		{"-metadata:s:a:0", "title=Português"},
-		{"-hls_flags", "temp_file+split_by_time+discont_start"},
-		{"-t", "16"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start+delete_segments"},
 		{"-hls_segment_filename", "/tmp/session/video/seg_%05d.ts"},
-		{"-hls_list_size", "0"},
+		{"-hls_list_size", "12"},
 		{"-hls_segment_filename", "/tmp/session/audio/seg_%05d.ts"},
 		{"/tmp/session/video/video.m3u8"},
 		{"/tmp/session/audio/audio.m3u8"},
@@ -78,7 +72,7 @@ func TestBuildAudioSessionArgs(t *testing.T) {
 		{"-c:a", "aac"},
 		{"-metadata:s:a:0", "language=eng"},
 		{"-hls_segment_filename", "/tmp/audio-alt/audio/seg_%05d.ts"},
-		{"-hls_list_size", "0"},
+		{"-hls_list_size", "12"},
 		{"-start_number", "7"},
 		{"/tmp/audio-alt/audio/audio.m3u8"},
 	} {
@@ -115,7 +109,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
 		{"-c:a", "aac"},
-		{"-hls_flags", "temp_file+split_by_time+discont_start"},
+		{"-hls_flags", "temp_file+split_by_time+discont_start+delete_segments"},
 		{"/tmp/dual/video/video.m3u8"},
 		{"/tmp/dual/audio/audio.m3u8"},
 	} {
@@ -208,11 +202,11 @@ func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
 	}
 	videoFlags := flagsFor(got, "/tmp/fresh/video/video.m3u8")
 	audioFlags := flagsFor(got, "/tmp/fresh/audio/audio.m3u8")
-	if videoFlags != "independent_segments+temp_file" {
-		t.Fatalf("fresh video flags = %q, want muxer-managed segment retention", videoFlags)
+	if videoFlags != "independent_segments+temp_file+delete_segments" {
+		t.Fatalf("fresh video flags = %q, want bounded segment window", videoFlags)
 	}
-	if audioFlags != "independent_segments+temp_file+split_by_time" {
-		t.Fatalf("audio flags = %q, want muxer-managed split-by-time retention", audioFlags)
+	if audioFlags != "independent_segments+temp_file+split_by_time+delete_segments" {
+		t.Fatalf("audio flags = %q, want bounded split-by-time window", audioFlags)
 	}
 }
 

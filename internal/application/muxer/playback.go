@@ -899,7 +899,6 @@ func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState,
 		UserAgent:       browserUA,
 		AudioOffset:     audioOffset,
 		Transcode:       prepared.transcode,
-		Duration:        m.policy.GenerationDuration,
 	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
@@ -2071,7 +2070,6 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 			StartSegment: segment, StartTime: float64(segment-state.filmBase) * ffmpeg.SegDuration(),
 			OutputDir: dir, AudioMode: prepared.audioMode, AudioLanguage: id,
 			AudioTitle: id, UserAgent: browserUA, AudioOffset: audioOffsetForPrepared(m, prepared),
-			Duration: m.policy.GenerationDuration,
 		})
 		state.mu.Lock()
 		r.starting = false
