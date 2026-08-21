@@ -357,17 +357,22 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		audioInput = 1
 	}
 
-	// Video-only rendition. After a seek (-ss > 0) the video is split by time
-	// as well: with stream copy the first segment would otherwise stretch to
-	// the next keyframe (a whole GOP, ~10s) while audio splits exactly at
-	// hls_time, permanently misaligning the two renditions. split_by_time
-	// keeps both renditions on the same 4s grid; the first post-seek segment
-	// may start mid-GOP (players decode from its first keyframe).
+	// Video-only rendition. Stream copy must cut on keyframes to keep
+	// segments independently decodable (mid-GOP cuts produce non-existing PPS).
+	// Transcode can keep split_by_time because it forces IDRs on the 4s grid.
 	videoFlags := "independent_segments+temp_file"
-	if spec.StartTime > 0 {
-		videoFlags = "temp_file+split_by_time+discont_start"
-	} else if spec.StartSegment > 0 {
-		videoFlags += "+discont_start"
+	if spec.Transcode != nil {
+		if spec.StartTime > 0 {
+			videoFlags = "temp_file+split_by_time+discont_start"
+		} else if spec.StartSegment > 0 {
+			videoFlags += "+discont_start"
+		}
+	} else {
+		if spec.StartTime > 0 {
+			videoFlags = "temp_file+discont_start"
+		} else if spec.StartSegment > 0 {
+			videoFlags += "+discont_start"
+		}
 	}
 	args = append(args,
 		"-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex),

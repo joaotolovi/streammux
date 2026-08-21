@@ -38,7 +38,7 @@ func TestBuildSessionArgsSingleSource(t *testing.T) {
 		{"-metadata:s:a:0", "language=por"},
 		{"-disposition:a:0", "default"},
 		{"-metadata:s:a:0", "title=Português"},
-		{"-hls_flags", "temp_file+split_by_time+discont_start"},
+		{"-hls_flags", "temp_file+discont_start"},
 		{"-hls_segment_filename", "/tmp/session/video/seg_%05d.ts"},
 		{"-hls_list_size", "0"},
 		{"-hls_segment_filename", "/tmp/session/audio/seg_%05d.ts"},
@@ -109,7 +109,7 @@ func TestBuildSessionArgsDualSource(t *testing.T) {
 		{"-map", "1:a:3"},
 		{"-c:v", "copy"},
 		{"-c:a", "aac"},
-		{"-hls_flags", "temp_file+split_by_time+discont_start"},
+		{"-hls_flags", "temp_file+discont_start"},
 		{"/tmp/dual/video/video.m3u8"},
 		{"/tmp/dual/audio/audio.m3u8"},
 	} {
