@@ -1649,7 +1649,9 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		}
 		b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", first))
 		b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+		// Stream-copied video can be cut mid-GOP after a seek. Do not tell HLS
+		// clients that each segment can be decoded in isolation; they must retain
+		// decoder state across the continuous stream.
 		for i := first; i <= last; i++ {
 			if discSet[i] {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")

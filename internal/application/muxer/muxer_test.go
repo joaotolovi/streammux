@@ -298,6 +298,9 @@ func TestRenderMediaPlaylistVodWithDiscontinuity(t *testing.T) {
 	if strings.Count(playlist, "#EXT-X-DISCONTINUITY") != 1 {
 		t.Fatalf("expected exactly one discontinuity: %s", playlist)
 	}
+	if strings.Contains(playlist, "#EXT-X-INDEPENDENT-SEGMENTS") {
+		t.Fatalf("stream-copy VOD must not claim independent segments: %s", playlist)
+	}
 }
 
 func TestRenderMediaPlaylistAfterPlaceholderHandoff(t *testing.T) {
