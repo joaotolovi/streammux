@@ -187,9 +187,10 @@ func containsArguments(args, sequence []string) bool {
 	return false
 }
 
-func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
-	// StartTime 0 = fresh start: the video keeps independent_segments (split
-	// on keyframes); only seeks switch to split_by_time.
+func TestBuildSessionArgsFreshStartKeepsAudioVideoOnSharedGrid(t *testing.T) {
+	// Stream-copy video and audio must share the same segment numbering, even
+	// at a fresh start. The public playlist does not claim copied video chunks
+	// are independently decodable.
 	spec := SessionSpec{
 		VideoURL:        "https://example.test/media.mkv",
 		VideoTrackIndex: 0,
@@ -202,8 +203,8 @@ func TestBuildSessionArgsFreshStartKeepsKeyframeAlignment(t *testing.T) {
 	}
 	videoFlags := flagsFor(got, "/tmp/fresh/video/video.m3u8")
 	audioFlags := flagsFor(got, "/tmp/fresh/audio/audio.m3u8")
-	if videoFlags != "independent_segments+temp_file+delete_segments" {
-		t.Fatalf("fresh video flags = %q, want bounded segment window", videoFlags)
+	if videoFlags != "temp_file+split_by_time+delete_segments" {
+		t.Fatalf("fresh video flags = %q, want shared 4-second grid", videoFlags)
 	}
 	if audioFlags != "independent_segments+temp_file+split_by_time+delete_segments" {
 		t.Fatalf("audio flags = %q, want bounded split_by_time grid", audioFlags)

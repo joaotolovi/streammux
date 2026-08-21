@@ -362,16 +362,14 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		audioInput = 1
 	}
 
-	// Video-only rendition. After a seek (-ss > 0) the video is split by time
-	// as well: with stream copy the first segment would otherwise stretch to
-	// the next keyframe (a whole GOP, ~10s) while audio splits exactly at
-	// hls_time, permanently misaligning the two renditions. split_by_time
-	// keeps both renditions on the same 4s grid; the first post-seek segment
-	// may start mid-GOP (players decode from its first keyframe).
-	videoFlags := "independent_segments+temp_file+delete_segments"
-	if spec.StartTime > 0 {
-		videoFlags = "temp_file+split_by_time+discont_start+delete_segments"
-	} else if spec.StartSegment > 0 {
+	// Video and audio share one public segment number. Both must therefore use
+	// the same 4-second grid, including a fresh start: allowing stream-copy
+	// video to wait for source keyframes makes its segment numbers drift from
+	// the audio rendition and leaves the player waiting for deleted audio.
+	// These copied video segments are intentionally not advertised as
+	// independent in the public playlist.
+	videoFlags := "temp_file+split_by_time+delete_segments"
+	if spec.StartSegment > 0 {
 		videoFlags += "+discont_start"
 	}
 	args = append(args,
