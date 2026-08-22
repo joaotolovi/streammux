@@ -1669,8 +1669,11 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 			interDuration = 10
 		}
 		assetURI := "/mux/" + job.ID + "/interstitial/intro.m3u8"
-		// START-DATE is arbitrary but must be valid ISO8601; use epoch.
-		b.WriteString(fmt.Sprintf("#EXT-X-DATERANGE:ID=\"com.streammux.intro\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"1970-01-01T00:00:00.000Z\",DURATION=%.3f,X-ASSET-URI=\"%s\",X-RESUME-OFFSET=0,X-RESUME-ON-PLAYBACK-ERROR=YES,X-PLAYOUT-LIMIT=1\n", interDuration, assetURI))
+		// Minimal DATERANGE for maximal compatibility: ExoPlayer fails on
+		// X-RESUME-ON-PLAYBACK-ERROR=YES (expects numeric). Keep only required
+		// attributes so non-supporting players ignore it and supporting ones
+		// play the 8s intro before the film.
+		b.WriteString(fmt.Sprintf("#EXT-X-DATERANGE:ID=\"com.streammux.intro\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"1970-01-01T00:00:00.000Z\",DURATION=%.3f,X-ASSET-URI=\"%s\"\n", interDuration, assetURI))
 	}
 
 	if duration > 0 {

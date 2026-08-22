@@ -48,8 +48,8 @@ func TestInterstitialInjection(t *testing.T) {
 	if !strings.Contains(playlist, "#EXT-X-VERSION:9") {
 		t.Fatalf("playlist should be version 9 when interstitial present: %s", playlist)
 	}
-	if !strings.Contains(playlist, "X-RESUME-OFFSET=0") {
-		t.Fatalf("playlist missing resume offset: %s", playlist)
+	if !strings.Contains(playlist, "DURATION=8.000") {
+		t.Fatalf("playlist missing duration: %s", playlist)
 	}
 }
 
