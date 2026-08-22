@@ -77,8 +77,7 @@ type Policy struct {
 	// generation is started.
 	TierSwitchCooldown time.Duration
 	DurationTolerance  float64
-	// PlaceholderMinTime is how long the placeholder must play before the
-	// film takes over, even when the film is ready sooner.
+	// PlaceholderMinTime is the duration of the generated HLS Interstitial.
 	PlaceholderMinTime time.Duration
 	// CacheMaxBytes caps all playback caches managed by this process.
 	CacheMaxBytes int64
@@ -177,7 +176,7 @@ func NewWithVideos(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Mux
 	return m
 }
 
-// SetPlaceholderMinTime overrides the minimum placeholder play time.
+// SetPlaceholderMinTime overrides the generated interstitial duration.
 func (m *Muxer) SetPlaceholderMinTime(d time.Duration) {
 	if d >= 0 {
 		m.policy.PlaceholderMinTime = d

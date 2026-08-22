@@ -217,10 +217,9 @@ func (m *Muxer) stateFor(job *model.MuxJob) (*playbackState, error) {
 	return state, nil
 }
 
-// EnsurePlaylist returns as soon as a playable timeline exists. With a
-// placeholder configured that means the placeholder is live (the film keeps
-// preparing in the background and takes over the timeline when ready).
-// Without one, it blocks until the film (or the error video) is ready.
+// EnsurePlaylist waits until the film (or the terminal error video) is ready.
+// The configured placeholder is used only to generate the optional HLS
+// Interstitial asset; it is never inserted into the primary timeline.
 func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	state, err := m.stateFor(job)
 	if err != nil {
@@ -230,10 +229,6 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 	state.mu.Lock()
 	state.lastAccess = time.Now()
 	if state.active != nil {
-		state.mu.Unlock()
-		return nil
-	}
-	if state.placeholder != nil {
 		state.mu.Unlock()
 		return nil
 	}
@@ -254,12 +249,6 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		}
 	}
 
-	if m.placeholderPath != "" && !state.placeholderStarted && state.startErr == nil {
-		state.placeholderStarted = true
-		state.placeholderWait = make(chan struct{})
-		go m.runPlaceholder(job, state)
-	}
-
 	if !state.starting {
 		state.starting = true
 		state.startWait = make(chan struct{})
@@ -267,46 +256,8 @@ func (m *Muxer) EnsurePlaylist(ctx context.Context, job *model.MuxJob) error {
 		state.lastStart = time.Now()
 		go m.runStartup(job, state)
 	}
-	phWait := state.placeholderWait
 	wait := state.startWait
 	state.mu.Unlock()
-
-	if phWait != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-phWait:
-		}
-		state.mu.Lock()
-		if state.placeholder != nil || state.active != nil {
-			state.mu.Unlock()
-			return nil
-		}
-		// Placeholder failed to start; fall through to waiting for the film
-		// when its startup is still in flight.
-		filmWait := state.startWait
-		starting := state.starting
-		state.mu.Unlock()
-		if starting && filmWait != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-filmWait:
-			}
-		}
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		if state.active != nil {
-			return nil
-		}
-		if state.directURL != "" {
-			return &DirectFallbackError{URL: state.directURL, Err: state.startErr}
-		}
-		if state.startErr != nil {
-			return state.startErr
-		}
-		return fmt.Errorf("playback startup finished without a playable source")
-	}
 
 	select {
 	case <-ctx.Done():
@@ -518,25 +469,7 @@ func (m *Muxer) startPlaceholderSession(ctx context.Context, spec ffmpeg.Placeho
 }
 
 // runStartup walks the composer's source compositions until one launches.
-// With a placeholder playing, the film is numbered from the placeholder's
-// last common segment so the handoff is a single DISCONTINUITY on an
-// otherwise static timeline.
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
-	// If a placeholder is configured, wait for it to be playing before
-	// preparing film sources — otherwise the film can be ready before the
-	// placeholder even starts, and the user never sees the intro.
-	if m.placeholderPath != "" {
-		state.mu.Lock()
-		phWait := state.placeholderWait
-		state.mu.Unlock()
-		if phWait != nil {
-			select {
-			case <-phWait:
-			case <-state.ctx.Done():
-			}
-		}
-	}
-
 	// Process may have returned before addon collection finished. Do not build
 	// a composer over an empty job; wait for the worker that owns preparation.
 	state.mu.Lock()
