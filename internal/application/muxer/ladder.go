@@ -379,6 +379,7 @@ func (m *Muxer) runTierSwitch(job *model.MuxJob, state *playbackState, expected 
 	committed := false
 	if err == nil && !state.closed && state.tierPending == tier && state.active == expected {
 		committed = true
+		stopAlternateAudioRenditionsLocked(state)
 		state.active = winner
 		state.all = append(state.all, winner)
 		state.activeTier = tier

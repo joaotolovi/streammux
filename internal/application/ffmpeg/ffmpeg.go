@@ -260,15 +260,18 @@ func buildAudioSessionArgs(spec AudioSessionSpec) ([]string, error) {
 	if offset < 0 {
 		offset = 0
 	}
-	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y"}
+	args := []string{"-nostdin", "-hide_banner", "-nostats", "-stats_period", "1", "-progress", "pipe:1", "-y", "-readrate", "1", "-readrate_initial_burst", fmtDuration(initialReadBurstSeconds)}
 	if spec.AudioOffset != 0 {
 		args = append(args, "-itsoffset", fmtDuration(spec.AudioOffset.Seconds()))
 	}
 	args = append(args, "-ss", fmtDuration(offset))
-	if ua := strings.TrimSpace(spec.UserAgent); ua != "" {
-		args = append(args, "-user_agent", ua)
+	if strings.Contains(spec.AudioURL, "://") {
+		if ua := strings.TrimSpace(spec.UserAgent); ua != "" {
+			args = append(args, "-user_agent", ua)
+		}
+		args = append(args, "-icy", "0")
 	}
-	args = append(args, "-icy", "0", "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
+	args = append(args, "-i", spec.AudioURL, "-map", fmt.Sprintf("0:a:%d", spec.AudioTrackIndex), "-c:a", string(audioMode))
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args, "-metadata:s:a:0", "language="+language, "-disposition:a:0", "default")
 	}

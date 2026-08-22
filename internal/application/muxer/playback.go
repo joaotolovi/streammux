@@ -130,26 +130,30 @@ type playbackState struct {
 	deliveries []deliverySample
 
 	// audioRenditions are lazy audio-only sessions. The main rendition is
-	// always produced by the active video generation; alternates are created
-	// only after the player requests them.
+	// always produced by the active video generation; at most one alternate is
+	// selected by a media-segment request at a time.
 	audioRenditions map[string]*audioRendition
 	activeAudioID   string
+	audioSelection  uint64
 
 	interstitialReady      bool
 	interstitialGenerating bool
 }
 
 type audioRendition struct {
-	id        string
-	language  string
-	title     string
-	altTarget bool
-	prepared  *preparedPlan
-	dir       string
-	session   *ffmpeg.Session
-	start     int
-	starting  bool
-	wait      chan struct{}
+	id         string
+	language   string
+	title      string
+	altTarget  bool
+	prepared   *preparedPlan
+	dir        string
+	session    *ffmpeg.Session
+	cancel     context.CancelFunc
+	generation *generation
+	attempt    uint64
+	start      int
+	starting   bool
+	wait       chan struct{}
 }
 
 type generation struct {
@@ -891,10 +895,11 @@ type audioRenditionMeta struct {
 	auto     bool
 }
 
-// audioRenditionMedia advertises only the audio produced by the same FFmpeg
-// process as the video. Independent lazy renditions can race video seeks and
-// expose audio before the new video generation is decodable.
+// audioRenditionMedia advertises the configured languages. An advertised
+// rendition is validated lazily when its first media segment is requested.
 func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
+	seen := map[string]bool{}
+	metas := make([]audioRenditionMeta, 0, 4)
 	targetCode := ffmpeg.LanguageCode(targetLanguage)
 	if targetCode == "" {
 		targetCode = "eng"
@@ -903,7 +908,30 @@ func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
 	if targetName == "" {
 		targetName = "Audio"
 	}
-	metas := []audioRenditionMeta{{id: "main", code: targetCode, language: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true}}
+	metas = append(metas,
+		audioRenditionMeta{id: "main", code: targetCode, language: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true},
+		audioRenditionMeta{id: targetCode + "-alt", code: targetCode, language: targetCode + "-x-alt", name: targetName + " (alternativa)", uri: "audio/" + targetCode + "-alt/audio.m3u8"},
+	)
+	seen[targetCode] = true
+	if job != nil {
+		addLanguages := func(stream model.CollectedStream) {
+			for _, raw := range append(append([]string{}, stream.Parsed.Languages...), stream.AddonLanguage, stream.Language) {
+				code, name := knownAudioLanguage(raw)
+				if code == "" || seen[code] || !audioLanguageAllowed(job, code, targetCode) {
+					continue
+				}
+				seen[code] = true
+				metas = append(metas, audioRenditionMeta{id: code, code: code, language: code, name: name, uri: "audio/" + code + "/audio.m3u8", auto: true})
+			}
+		}
+		for _, stream := range job.VideoCandidates {
+			addLanguages(stream)
+		}
+		for _, plan := range job.Plans {
+			addLanguages(plan.Audio)
+			addLanguages(plan.Video)
+		}
+	}
 	lines := make([]string, 0, len(metas))
 	for _, meta := range metas {
 		auto := "NO"
@@ -1092,7 +1120,7 @@ func (m *Muxer) prepareAudioRendition(ctx context.Context, job *model.MuxJob, st
 	activeAudioKey := active.prepared.plan.Audio.SourceKey()
 	appendCandidate := func(stream model.CollectedStream, force bool) {
 		key := stream.SourceKey()
-		if key == "" || seen[key] || (!force && !analyzer.MatchesLanguage(stream, language)) {
+		if key == "" || seen[key] || (!force && !streamMatchesAudioLanguage(stream, language)) {
 			return
 		}
 		seen[key] = true
@@ -1104,6 +1132,9 @@ func (m *Muxer) prepareAudioRendition(ctx context.Context, job *model.MuxJob, st
 	for _, plan := range job.Plans {
 		appendCandidate(plan.Audio, false)
 		appendCandidate(plan.Video, false)
+	}
+	for _, candidate := range job.VideoCandidates {
+		appendCandidate(candidate, false)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		rank := func(s model.CollectedStream) int {
@@ -1142,6 +1173,16 @@ func (m *Muxer) prepareAudioRendition(ctx context.Context, job *model.MuxJob, st
 		}
 	}
 	return nil, fmt.Errorf("no verified %s audio source", language)
+}
+
+func streamMatchesAudioLanguage(stream model.CollectedStream, language string) bool {
+	want := ffmpeg.LanguageCode(language)
+	for _, raw := range append(append([]string{}, stream.Parsed.Languages...), stream.AddonLanguage, stream.Language) {
+		if ffmpeg.LanguageCode(raw) == want && want != "" {
+			return true
+		}
+	}
+	return analyzer.MatchesLanguage(stream, language)
 }
 
 func (m *Muxer) prepareAudioCandidate(ctx context.Context, job *model.MuxJob, active *generation, candidate model.CollectedStream, language string, filmBase int, lenient bool) (*preparedPlan, error) {
@@ -1229,13 +1270,11 @@ func audioOffsetForPrepared(m *Muxer, prepared *preparedPlan) time.Duration {
 
 // AudioPlaylist renders the audio media playlist for the current phase.
 func (m *Muxer) AudioPlaylist(job *model.MuxJob) ([]byte, bool) {
-	m.activateAudioRendition(job, "")
 	return m.renderMediaPlaylist(job, 0)
 }
 
-// AudioPlaylistRendition renders the shared public timeline for an audio
-// rendition. The actual alternate audio session starts only when its segment
-// is requested.
+// AudioPlaylistRendition is deliberately side-effect free. HLS players fetch
+// playlists to inspect tracks, so only a media-segment request selects audio.
 func (m *Muxer) AudioPlaylistRendition(job *model.MuxJob, id string) ([]byte, bool) {
 	if id == "" || id == "main" {
 		return m.AudioPlaylist(job)
@@ -1243,25 +1282,62 @@ func (m *Muxer) AudioPlaylistRendition(job *model.MuxJob, id string) ([]byte, bo
 	if !audioRenditionExists(job, id) {
 		return m.AudioPlaylist(job)
 	}
-	m.activateAudioRendition(job, id)
 	return m.renderMediaPlaylist(job, 0)
 }
 
-func (m *Muxer) activateAudioRendition(job *model.MuxJob, id string) {
+// selectAudioRendition records the rendition the player is actually consuming.
+// It cancels the previous alternate before a new one is prepared so only one
+// extra FFmpeg process can run for a job.
+func (m *Muxer) selectAudioRendition(job *model.MuxJob, id string) uint64 {
 	state := m.lookupState(job.ID)
 	if state == nil {
-		return
+		return 0
 	}
 	state.mu.Lock()
 	if state.activeAudioID == id {
+		selection := state.audioSelection
 		state.mu.Unlock()
-		return
+		return selection
 	}
 	old := state.audioRenditions[state.activeAudioID]
 	state.activeAudioID = id
+	state.audioSelection++
+	selection := state.audioSelection
+	stopAudioRenditionLocked(old)
 	state.mu.Unlock()
-	if old != nil && old.session != nil {
-		old.session.Cancel()
+	return selection
+}
+
+func stopAudioRenditionLocked(r *audioRendition) {
+	if r == nil {
+		return
+	}
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+	r.attempt++
+	if r.session != nil {
+		session, dir := r.session, r.dir
+		session.Cancel()
+		removeAudioRenditionWhenStopped(session, dir)
+		r.session = nil
+	}
+	r.prepared = nil
+	r.generation = nil
+	r.dir = ""
+	if r.starting && r.wait != nil {
+		close(r.wait)
+	}
+	r.starting = false
+	r.wait = nil
+}
+
+func stopAlternateAudioRenditionsLocked(state *playbackState) {
+	for id, r := range state.audioRenditions {
+		if id != "" && id != "main" {
+			stopAudioRenditionLocked(r)
+		}
 	}
 }
 
@@ -1613,18 +1689,11 @@ func (m *Muxer) EnsureSegment(ctx context.Context, job *model.MuxJob, segment, t
 // EnsureAudioSegment is EnsureSegment for the audio rendition (tier-agnostic:
 // audio is shared across tiers).
 func (m *Muxer) EnsureAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
-	if state := m.lookupState(job.ID); state != nil {
-		state.mu.Lock()
-		id := state.activeAudioID
-		if id != "" {
-			state.activeAudioID = ""
-		}
-		old := state.audioRenditions[id]
-		state.mu.Unlock()
-		if old != nil && old.session != nil {
-			old.session.Cancel()
-		}
-	}
+	m.selectAudioRendition(job, "")
+	return m.ensurePrimaryAudioSegment(ctx, job, segment)
+}
+
+func (m *Muxer) ensurePrimaryAudioSegment(ctx context.Context, job *model.MuxJob, segment int) (string, error) {
 	return m.ensureMediaSegment(ctx, job, segment, 0, true)
 }
 
@@ -1640,17 +1709,22 @@ func (m *Muxer) AudioSegmentPathRendition(job *model.MuxJob, id string, segment 
 		return ""
 	}
 	state.mu.Lock()
+	activeGeneration := state.active
 	active := state.activeAudioID == id
 	r := state.audioRenditions[id]
 	state.mu.Unlock()
-	if !active || r == nil {
+	if !active || r == nil || r.generation != activeGeneration {
+		return ""
+	}
+	if !fileExists(generationSegmentPath(activeGeneration, segment)) {
 		return ""
 	}
 	return audioRenditionSegmentPath(r, segment)
 }
 
-// EnsureAudioSegmentRendition lazily starts one audio-only session. Failed or
-// unverified alternatives fall back to the primary rendition.
+// EnsureAudioSegmentRendition selects one alternate audio rendition and keeps
+// its session aligned to the current video generation. A request for another
+// rendition cancels this one; playlist requests do not change selection.
 func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJob, id string, segment int) (string, error) {
 	if id == "" || id == "main" {
 		return m.EnsureAudioSegment(ctx, job, segment)
@@ -1658,33 +1732,41 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 	if !audioRenditionExists(job, id) {
 		return m.EnsureAudioSegment(ctx, job, segment)
 	}
+	selection := m.selectAudioRendition(job, id)
+	// Establish the primary A/V window first. An alternate request can be the
+	// first request after a seek, so it must drive the same video generation
+	// rather than starting an unrelated audio timeline on its own.
+	if _, err := m.ensurePrimaryAudioSegment(ctx, job, segment); err != nil {
+		return "", err
+	}
 	state := m.lookupState(job.ID)
 	if state == nil {
 		return "", fmt.Errorf("playback state not found")
-	}
-	state.mu.Lock()
-	intro := segment < state.filmBase
-	if state.activeAudioID != id {
-		state.mu.Unlock()
-		return m.EnsureAudioSegment(ctx, job, segment)
-	}
-	state.mu.Unlock()
-	if intro {
-		return m.EnsureAudioSegment(ctx, job, segment)
 	}
 	for {
 		if path := m.AudioSegmentPathRendition(job, id, segment); path != "" {
 			return path, nil
 		}
 		state.mu.Lock()
+		active := state.active
+		if state.activeAudioID != id || state.audioSelection != selection {
+			state.mu.Unlock()
+			// The player selected another rendition while this request was in
+			// flight. Serve the already-coordinated primary audio rather than
+			// turning a stale prefetch into an HTTP 502.
+			return m.ensurePrimaryAudioSegment(ctx, job, segment)
+		}
+		if active == nil || active.prepared == nil || active.isError {
+			state.mu.Unlock()
+			return m.ensurePrimaryAudioSegment(ctx, job, segment)
+		}
 		r := state.audioRenditions[id]
 		if r == nil {
 			r = &audioRendition{id: id}
 			state.audioRenditions[id] = r
 		}
-		if state.activeAudioID != id {
-			state.mu.Unlock()
-			return m.EnsureAudioSegment(ctx, job, segment)
+		if r.generation != nil && r.generation != active {
+			stopAudioRenditionLocked(r)
 		}
 		if r.starting {
 			wait := r.wait
@@ -1705,7 +1787,13 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 			case <-session.Done():
 				state.mu.Lock()
 				if r.session == session {
+					dir := r.dir
 					r.session = nil
+					if r.cancel != nil {
+						r.cancel()
+					}
+					r.cancel = nil
+					removeAudioRenditionWhenStopped(session, dir)
 				}
 				state.mu.Unlock()
 				continue
@@ -1715,63 +1803,72 @@ func (m *Muxer) EnsureAudioSegmentRendition(ctx context.Context, job *model.MuxJ
 		}
 		r.starting = true
 		r.wait = make(chan struct{})
-		prepared := r.prepared
+		r.attempt++
+		attempt := r.attempt
+		attemptCtx, attemptCancel := context.WithCancel(state.ctx)
+		r.cancel = attemptCancel
+		expectedGeneration := active
+		wait := r.wait
 		state.mu.Unlock()
 
-		if prepared == nil {
-			var err error
-			prepared, err = m.prepareAudioRendition(ctx, job, state, id)
-			if err != nil {
-				state.mu.Lock()
-				r.starting = false
-				close(r.wait)
-				state.mu.Unlock()
-				return m.EnsureAudioSegment(ctx, job, segment)
-			}
-		}
+		prepared, err := m.prepareAudioRendition(attemptCtx, job, state, id)
 		starter, ok := m.ffmpeg.(interface {
 			StartAudioSession(context.Context, ffmpeg.AudioSessionSpec) (*ffmpeg.Session, error)
 		})
-		if !ok {
-			state.mu.Lock()
-			r.starting = false
-			close(r.wait)
-			state.mu.Unlock()
-			return m.EnsureAudioSegment(ctx, job, segment)
+		if err == nil && !ok {
+			err = fmt.Errorf("ffmpeg engine does not support audio renditions")
 		}
-		dir := filepath.Join(state.cacheDir, "audio-renditions", id)
-		if err := os.MkdirAll(filepath.Join(dir, "audio"), 0755); err != nil {
-			return m.EnsureAudioSegment(ctx, job, segment)
-		}
-		session, err := starter.StartAudioSession(state.ctx, ffmpeg.AudioSessionSpec{
-			AudioURL: prepared.audioURL, AudioTrackIndex: prepared.audioTrackIndex,
-			StartSegment: segment, StartTime: float64(segment) * ffmpeg.SegDuration(),
-			OutputDir: dir, AudioMode: prepared.audioMode, AudioLanguage: id,
-			AudioTitle: id, UserAgent: browserUA, AudioOffset: audioOffsetForPrepared(m, prepared),
-		})
-		state.mu.Lock()
-		r.starting = false
+		dir := filepath.Join(state.cacheDir, "audio-renditions", id, fmt.Sprintf("generation-%06d-%05d", expectedGeneration.id, segment))
 		if err == nil {
-			r.prepared, r.dir, r.session, r.start = prepared, dir, session, segment
+			err = os.MkdirAll(filepath.Join(dir, "audio"), 0755)
 		}
-		close(r.wait)
+		var session *ffmpeg.Session
+		if err == nil {
+			session, err = starter.StartAudioSession(attemptCtx, ffmpeg.AudioSessionSpec{
+				AudioURL: prepared.audioURL, AudioTrackIndex: prepared.audioTrackIndex,
+				StartSegment: segment, StartTime: float64(segment) * ffmpeg.SegDuration(),
+				OutputDir: dir, AudioMode: prepared.audioMode, AudioLanguage: id,
+				AudioTitle: audioRenditionLanguage(job, id), UserAgent: browserUA, AudioOffset: audioOffsetForPrepared(m, prepared),
+			})
+		}
+		state.mu.Lock()
+		current := r.attempt == attempt && r.cancel != nil && state.activeAudioID == id && state.audioSelection == selection && state.active == expectedGeneration
+		if !current {
+			attemptCancel()
+			if session != nil {
+				session.Cancel()
+				removeAudioRenditionWhenStopped(session, dir)
+			}
+			state.mu.Unlock()
+			return m.ensurePrimaryAudioSegment(ctx, job, segment)
+		}
+		r.starting = false
+		r.wait = nil
+		close(wait)
+		if err == nil {
+			r.prepared, r.dir, r.session, r.generation, r.start = prepared, dir, session, expectedGeneration, segment
+		} else {
+			r.cancel = nil
+			attemptCancel()
+		}
 		state.mu.Unlock()
 		if err != nil {
-			return m.EnsureAudioSegment(ctx, job, segment)
+			_ = os.RemoveAll(dir)
+			return m.ensurePrimaryAudioSegment(ctx, job, segment)
 		}
 		deadline := time.NewTimer(m.policy.SegmentTimeout)
 		defer deadline.Stop()
 		for {
-			if path := audioRenditionSegmentPath(r, segment); path != "" {
+			if path := m.AudioSegmentPathRendition(job, id, segment); path != "" {
 				return path, nil
 			}
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
 			case <-deadline.C:
-				return m.EnsureAudioSegment(ctx, job, segment)
+				return m.ensurePrimaryAudioSegment(ctx, job, segment)
 			case <-session.Done():
-				return m.EnsureAudioSegment(ctx, job, segment)
+				return m.ensurePrimaryAudioSegment(ctx, job, segment)
 			case <-time.After(75 * time.Millisecond):
 			}
 		}
@@ -1787,6 +1884,16 @@ func audioRenditionSegmentPath(r *audioRendition, segment int) string {
 		return path
 	}
 	return ""
+}
+
+func removeAudioRenditionWhenStopped(session *ffmpeg.Session, dir string) {
+	if session == nil || dir == "" {
+		return
+	}
+	go func() {
+		<-session.Done()
+		_ = os.RemoveAll(dir)
+	}()
 }
 
 func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segment, tier int, audio bool) (string, error) {
@@ -2061,6 +2168,9 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 				// uses the same source. Tell the player to reset its decoders.
 				state.discontinuities = appendUniqueInt(state.discontinuities, targetSegment)
 			}
+			// An alternate audio process has its own input seek. It must never
+			// continue serving the prior video generation after this cutover.
+			stopAlternateAudioRenditionsLocked(state)
 			state.active = gen
 			state.all = append(state.all, gen)
 			state.lastRecovery = time.Now()
@@ -2168,6 +2278,9 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 	abandoned := state.closed || state.active != expected
 	committed := err == nil && !abandoned
 	if committed {
+		// The replacement video has a new timeline. Selected alternate audio is
+		// recreated lazily at the next requested segment against this generation.
+		stopAlternateAudioRenditionsLocked(state)
 		state.active = winner
 		state.all = append(state.all, winner)
 		// Every replacement FFmpeg process starts a new timestamp sequence,
@@ -2205,6 +2318,7 @@ func (m *Muxer) runRecovery(job *model.MuxJob, state *playbackState, startSegmen
 			if exhausted {
 				if errGen := m.startErrorGeneration(state, startSegment); errGen != nil {
 					state.mu.Lock()
+					stopAlternateAudioRenditionsLocked(state)
 					state.active = errGen
 					state.errorGeneration = errGen
 					state.recoveryErr = nil
@@ -2373,6 +2487,7 @@ func (m *Muxer) reapIdleSessions() {
 				if state.active != nil {
 					active := state.active
 					state.active = nil
+					stopAlternateAudioRenditionsLocked(state)
 					state.mu.Unlock()
 					active.session.Cancel()
 					continue
@@ -2400,6 +2515,7 @@ func (m *Muxer) CleanupJob(job *model.MuxJob) {
 	state.closed = true
 	state.cancel()
 	generations := append([]*generation(nil), state.all...)
+	stopAlternateAudioRenditionsLocked(state)
 	posterDir := state.posterDir
 	state.mu.Unlock()
 	for _, generation := range generations {

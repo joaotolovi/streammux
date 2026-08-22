@@ -343,15 +343,8 @@ func (s *Server) serveSegment(w http.ResponseWriter, r *http.Request, audio bool
 		return
 	}
 
-	// Video requests must pass through EnsureSegment even when the file exists:
-	// it advances the playback cursor that drives retention and ABR decisions.
-	// Audio is tier-agnostic and can remain a direct cache hit.
-	if audio {
-		if cached := s.muxer.AudioSegmentPath(job, segIndex); cached != "" {
-			s.deliverSegment(w, r, job, cached, true)
-			return
-		}
-	}
+	// Every rendition request passes through the muxer, even on a cache hit.
+	// An audio segment is also the signal that selects an advertised language.
 	if err := s.muxer.EnsurePlaylist(r.Context(), job); err != nil {
 		writeError(w, http.StatusBadGateway, "segment source unavailable")
 		return

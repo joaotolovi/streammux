@@ -67,6 +67,7 @@ func TestBuildAudioSessionArgs(t *testing.T) {
 		t.Fatalf("buildAudioSessionArgs() error = %v", err)
 	}
 	for _, want := range [][]string{
+		{"-readrate", "1", "-readrate_initial_burst", "120"},
 		{"-ss", "28", "-icy", "0", "-i", spec.AudioURL},
 		{"-map", "0:a:2"},
 		{"-c:a", "aac"},

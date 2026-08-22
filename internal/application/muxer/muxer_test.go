@@ -685,15 +685,88 @@ func TestMasterPlaylistDeclaresAudioRenditionGroup(t *testing.T) {
 	}
 }
 
-func TestMasterPlaylistAdvertisesOnlyCoordinatedAudio(t *testing.T) {
+func TestMasterPlaylistAdvertisesAlternativeAudioRendition(t *testing.T) {
 	mux := &Muxer{}
 	job := &model.MuxJob{TargetLanguage: "Portuguese (Brazil)"}
 	playlist := string(mux.renderMaster(job, 1_000_000, 0, 0, job.TargetLanguage))
 	if !strings.Contains(playlist, `LANGUAGE="por",URI="audio/audio.m3u8"`) {
 		t.Fatalf("master missing primary Portuguese rendition: %s", playlist)
 	}
-	if strings.Count(playlist, "#EXT-X-MEDIA:TYPE=AUDIO") != 1 || strings.Contains(playlist, "audio/por-alt/") {
-		t.Fatalf("master advertised an independently generated audio rendition: %s", playlist)
+	if !strings.Contains(playlist, `LANGUAGE="por-x-alt",URI="audio/por-alt/audio.m3u8"`) {
+		t.Fatalf("master missing alternative Portuguese rendition: %s", playlist)
+	}
+}
+
+func TestMasterPlaylistAdvertisesPermittedCandidateLanguages(t *testing.T) {
+	job := &model.MuxJob{
+		TargetLanguage: "English",
+		Config:         model.Config{Addons: []model.Addon{{Enabled: true, ShowAllAudioLanguages: true}}},
+		VideoCandidates: []model.CollectedStream{
+			{Parsed: model.ParsedFile{Languages: []string{"Spanish", "Portuguese"}}},
+		},
+	}
+	playlist := string((&Muxer{}).renderMaster(job, 1_000_000, 0, 0, job.TargetLanguage))
+	for _, want := range []string{
+		`LANGUAGE="eng",URI="audio/audio.m3u8"`,
+		`LANGUAGE="spa",URI="audio/spa/audio.m3u8"`,
+		`LANGUAGE="por",URI="audio/por/audio.m3u8"`,
+	} {
+		if !strings.Contains(playlist, want) {
+			t.Fatalf("master missing %q: %s", want, playlist)
+		}
+	}
+}
+
+func TestAudioPlaylistReadsDoNotSelectRendition(t *testing.T) {
+	state := &playbackState{duration: 8, activeAudioID: "eng-alt", audioSelection: 7}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job", TargetLanguage: "English"}
+	if _, ok := mux.AudioPlaylist(job); !ok {
+		t.Fatal("AudioPlaylist() returned false")
+	}
+	if _, ok := mux.AudioPlaylistRendition(job, "eng-alt"); !ok {
+		t.Fatal("AudioPlaylistRendition() returned false")
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.activeAudioID != "eng-alt" || state.audioSelection != 7 {
+		t.Fatalf("playlist read changed selection to %q/%d", state.activeAudioID, state.audioSelection)
+	}
+}
+
+func TestAudioRenditionPathRejectsPreviousGeneration(t *testing.T) {
+	videoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(videoDir, "video"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(videoDir, "video", "seg_00004.ts"), []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	audioDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(audioDir, "audio"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	audioPath := filepath.Join(audioDir, "audio", "seg_00004.ts")
+	if err := os.WriteFile(audioPath, []byte("audio"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	active := &generation{dir: videoDir}
+	stale := &generation{dir: t.TempDir()}
+	state := &playbackState{
+		active:        active,
+		activeAudioID: "spa",
+		audioRenditions: map[string]*audioRendition{
+			"spa": {id: "spa", dir: audioDir, generation: stale},
+		},
+	}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+	if got := mux.AudioSegmentPathRendition(job, "spa", 4); got != "" {
+		t.Fatalf("stale generation audio path = %q", got)
+	}
+	state.audioRenditions["spa"].generation = active
+	if got := mux.AudioSegmentPathRendition(job, "spa", 4); got != audioPath {
+		t.Fatalf("current generation audio path = %q, want %q", got, audioPath)
 	}
 }
 
