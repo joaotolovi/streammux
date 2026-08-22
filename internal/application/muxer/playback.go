@@ -1649,7 +1649,7 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// Use version 9 when interstitial is available so players that support
 	// HLS Interstitials can play the intro; others ignore the DATERANGE.
 	version := 6
-	if interstitialAvailable(state) && active != nil && duration > 0 {
+	if m.placeholderPath != "" && active != nil && duration > 0 {
 		version = 9
 	}
 	b.WriteString("#EXTM3U\n")
@@ -1659,20 +1659,12 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// HLS Interstitial: short intro that auto-plays before the film on
 	// supporting players and is silently ignored otherwise. No error handling
 	// required — absence of the tag just means the film starts immediately.
-	if interstitialAvailable(state) && active != nil && duration > 0 {
-		// Ensure interstitial duration matches what was generated (default 8s).
-		interDuration := m.policy.PlaceholderMinTime.Seconds()
-		if interDuration <= 0 {
-			interDuration = 8
-		}
-		if interDuration > 10 {
-			interDuration = 10
-		}
-		assetURI := "/mux/" + job.ID + "/interstitial/intro.m3u8"
-		// Minimal DATERANGE for maximal compatibility: ExoPlayer fails on
-		// X-RESUME-ON-PLAYBACK-ERROR=YES (expects numeric). Keep only required
-		// attributes so non-supporting players ignore it and supporting ones
-		// play the 8s intro before the film.
+	if m.placeholderPath != "" && active != nil && duration > 0 {
+		// Static 5s sample for testing HLS Interstitial support. Players that
+		// support interstitials will fetch this MP4 before the film; others
+		// ignore the DATERANGE and start the film directly.
+		assetURI := "https://samplelib.com/mp4/sample-5s.mp4"
+		interDuration := 5.0
 		b.WriteString(fmt.Sprintf("#EXT-X-DATERANGE:ID=\"com.streammux.intro\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"1970-01-01T00:00:00.000Z\",DURATION=%.3f,X-ASSET-URI=\"%s\"\n", interDuration, assetURI))
 	}
 

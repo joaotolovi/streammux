@@ -42,13 +42,13 @@ func TestInterstitialInjection(t *testing.T) {
 	if !strings.Contains(playlist, "com.apple.hls.interstitial") {
 		t.Fatalf("playlist missing interstitial DATERANGE: %s", playlist)
 	}
-	if !strings.Contains(playlist, "/mux/job/interstitial/intro.m3u8") {
+	if !strings.Contains(playlist, "https://samplelib.com/mp4/sample-5s.mp4") {
 		t.Fatalf("playlist missing asset URI: %s", playlist)
 	}
 	if !strings.Contains(playlist, "#EXT-X-VERSION:9") {
 		t.Fatalf("playlist should be version 9 when interstitial present: %s", playlist)
 	}
-	if !strings.Contains(playlist, "DURATION=8.000") {
+	if !strings.Contains(playlist, "DURATION=5.000") {
 		t.Fatalf("playlist missing duration: %s", playlist)
 	}
 }
@@ -62,7 +62,7 @@ func TestInterstitialNotInjectedWhenNotReady(t *testing.T) {
 		active:   &generation{dir: dir},
 	}
 	mux := &Muxer{
-		placeholderPath: "placeholder.mp4",
+		placeholderPath: "",
 		policy:          defaultPolicy(),
 		states:          map[string]*playbackState{"job": state},
 	}
@@ -73,7 +73,7 @@ func TestInterstitialNotInjectedWhenNotReady(t *testing.T) {
 	}
 	playlist := string(data)
 	if strings.Contains(playlist, "com.apple.hls.interstitial") {
-		t.Fatalf("playlist should not contain interstitial when not ready: %s", playlist)
+		t.Fatalf("playlist should not contain interstitial when placeholder disabled: %s", playlist)
 	}
 	if strings.Contains(playlist, "#EXT-X-VERSION:9") {
 		t.Fatalf("playlist version should be 6 when no interstitial: %s", playlist)
