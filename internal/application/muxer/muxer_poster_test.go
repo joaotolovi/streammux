@@ -60,14 +60,6 @@ func (f *fakeMediaEngine) DetectAudioOffset(videoURL, audioURL string, tracks []
 	return 0, 0, 0, nil
 }
 
-func (f *fakeMediaEngine) GenerateInterstitial(ctx context.Context, placeholderPath, outputDir string, duration time.Duration) error {
-	_ = os.MkdirAll(outputDir, 0755)
-	_ = os.WriteFile(filepath.Join(outputDir, "intro.m3u8"), []byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\nseg_00000.ts\n#EXTINF:4.0,\nseg_00001.ts\n#EXT-X-ENDLIST\n"), 0644)
-	_ = os.WriteFile(filepath.Join(outputDir, "seg_00000.ts"), []byte("segment"), 0644)
-	_ = os.WriteFile(filepath.Join(outputDir, "seg_00001.ts"), []byte("segment"), 0644)
-	return nil
-}
-
 func waitPlaceholder(t *testing.T, state *playbackState) {
 	t.Helper()
 	select {

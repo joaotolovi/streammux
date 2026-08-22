@@ -84,6 +84,10 @@ type SessionSpec struct {
 	// Duration bounds one on-demand VOD production batch. A zero duration keeps
 	// the FFmpeg session open until its input ends.
 	Duration time.Duration
+	// OpeningOverlayPath is a local ident composited over the source for this
+	// finite session. Its black background is keyed out before compositing.
+	OpeningOverlayPath   string
+	OpeningOverlayHeight int
 }
 
 // AudioSessionSpec describes a lazy audio-only HLS session aligned to the
@@ -314,6 +318,9 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if spec.StartSegment < 0 {
 		return nil, fmt.Errorf("ffmpeg session: start segment must not be negative")
 	}
+	if spec.OpeningOverlayPath != "" && spec.Duration <= 0 {
+		return nil, fmt.Errorf("ffmpeg session: opening overlay requires a duration")
+	}
 
 	audioMode := AudioMode(strings.ToLower(strings.TrimSpace(string(spec.AudioMode))))
 	if audioMode == "" {
@@ -361,6 +368,14 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		}
 		args = append(args, "-icy", "0", "-i", spec.AudioURL)
 	}
+	overlayInput := -1
+	if overlayPath := strings.TrimSpace(spec.OpeningOverlayPath); overlayPath != "" {
+		overlayInput = 1
+		if dualSource {
+			overlayInput = 2
+		}
+		args = append(args, "-i", overlayPath)
+	}
 
 	audioInput := 0
 	if dualSource {
@@ -374,35 +389,60 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if spec.StartSegment > 0 {
 		videoFlags += "+discont_start"
 	}
-	if spec.Transcode != nil {
+	if spec.Transcode != nil || overlayInput >= 0 {
 		// Transcodes force IDRs at the grid, so their segments are independent.
 		videoFlags = "independent_segments+" + videoFlags
 	}
-	args = append(args,
-		"-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex),
-	)
-	if tc := spec.Transcode; tc != nil {
+	videoMap := fmt.Sprintf("0:v:%d", spec.VideoTrackIndex)
+	audioMap := fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex)
+	if overlayInput >= 0 {
+		height := spec.OpeningOverlayHeight
+		if tc := spec.Transcode; tc != nil && tc.Height > 0 {
+			height = tc.Height
+		}
+		filmFilter := fmt.Sprintf("[0:v:%d]setpts=PTS-STARTPTS", spec.VideoTrackIndex)
+		introFilter := fmt.Sprintf("[%d:v:0]setpts=PTS-STARTPTS,format=rgba,colorkey=0x050505:0.08:0.02", overlayInput)
+		if height > 0 {
+			filmFilter += fmt.Sprintf(",scale=-2:%d", height)
+			introFilter += fmt.Sprintf(",scale=-2:%d", height)
+		}
+		args = append(args, "-filter_complex", filmFilter+"[film];"+introFilter+"[intro];[film][intro]overlay=eof_action=pass:shortest=1[v];"+
+			fmt.Sprintf("[%d:a:%d]asetpts=PTS-STARTPTS,volume='if(isnan(t),0.20,if(lt(t,3.7),0.20,0.20+0.80*(t-3.7)/0.3))':eval=frame[film-a];[%d:a:0]asetpts=PTS-STARTPTS[intro-a];[film-a][intro-a]amix=inputs=2:duration=first:dropout_transition=0[a]", audioInput, spec.AudioTrackIndex, overlayInput))
+		videoMap = "[v]"
+		audioMap = "[a]"
+	}
+	args = append(args, "-map", videoMap)
+	if tc := spec.Transcode; tc != nil || overlayInput >= 0 {
 		// Downgrade-ladder transcode: decode once, re-encode to a capped,
 		// decode-friendly H.264 rendition. Keyframes forced on the 4s grid so
 		// HLS segmentation stays aligned without split_by_time.
-		preset := strings.TrimSpace(tc.Preset)
+		preset := "veryfast"
+		if tc != nil {
+			preset = strings.TrimSpace(tc.Preset)
+		}
 		if preset == "" {
 			preset = "veryfast"
 		}
-		bufKbps := tc.MaxRateKbps * 2
 		args = append(args,
 			"-c:v", "libx264",
 			"-preset", preset,
 			"-pix_fmt", "yuv420p",
-			"-vf", fmt.Sprintf("scale=-2:%d", tc.Height),
 			"-crf", "20",
-			"-maxrate", fmt.Sprintf("%dk", tc.MaxRateKbps),
-			"-bufsize", fmt.Sprintf("%dk", bufKbps),
 			"-sc_threshold", "0",
 			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%.0f)", segDuration),
 		)
+		if tc != nil {
+			bufKbps := tc.MaxRateKbps * 2
+			if overlayInput < 0 {
+				args = append(args, "-vf", fmt.Sprintf("scale=-2:%d", tc.Height))
+			}
+			args = append(args, "-maxrate", fmt.Sprintf("%dk", tc.MaxRateKbps), "-bufsize", fmt.Sprintf("%dk", bufKbps))
+		}
 	} else {
 		args = append(args, "-c:v", "copy")
+	}
+	if spec.Duration > 0 {
+		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
 	}
 	args = append(args,
 		"-f", "hls",
@@ -421,9 +461,13 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		audioFlags += "+discont_start"
 	}
 	args = append(args,
-		"-map", fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex),
-		"-c:a", string(audioMode),
+		"-map", audioMap,
 	)
+	if overlayInput >= 0 {
+		args = append(args, "-c:a", "aac")
+	} else {
+		args = append(args, "-c:a", string(audioMode))
+	}
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args,
 			"-metadata:s:a:0", "language="+language,
@@ -432,6 +476,9 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	}
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
+	}
+	if spec.Duration > 0 {
+		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
 	}
 	args = append(args,
 		"-f", "hls",
@@ -804,64 +851,6 @@ func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputD
 // works unchanged.
 func (m *Muxer) StartImagePlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {
 	return m.StartPlaceholderSession(ctx, PlaceholderSpec{VideoPath: path, ImagePath: imagePath, OutputDir: outputDir, Realtime: realtime})
-}
-
-// GenerateInterstitial creates a short VOD HLS asset from the placeholder
-// video for use as an HLS Interstitial. The asset is muxed (video+audio in
-// one playlist) and limited to duration (typically PlaceholderMinTime). It
-// returns quickly and produces a playlist with ENDLIST that players that
-// support interstitials will play before the main content; others ignore it.
-func (m *Muxer) GenerateInterstitial(ctx context.Context, placeholderPath, outputDir string, duration time.Duration) error {
-	if strings.TrimSpace(placeholderPath) == "" {
-		return fmt.Errorf("interstitial: no placeholder provided")
-	}
-	if strings.TrimSpace(outputDir) == "" {
-		return fmt.Errorf("interstitial: output directory is required")
-	}
-	if duration <= 0 {
-		duration = 8 * time.Second
-	}
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("interstitial dir: %w", err)
-	}
-	args := buildInterstitialArgs(placeholderPath, outputDir, duration)
-	sessCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
-	stderr := newTailBuffer(stderrTailSize)
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		if sessCtx.Err() != nil {
-			return fmt.Errorf("interstitial generation timeout: %w; stderr: %s", err, stderr.String())
-		}
-		return fmt.Errorf("interstitial ffmpeg: %w; stderr: %s", err, stderr.String())
-	}
-	// Verify playlist was created.
-	if _, err := os.Stat(filepath.Join(outputDir, "intro.m3u8")); err != nil {
-		return fmt.Errorf("interstitial playlist missing: %w; stderr: %s", err, stderr.String())
-	}
-	return nil
-}
-
-func buildInterstitialArgs(placeholderPath, outputDir string, duration time.Duration) []string {
-	secs := fmtDuration(duration.Seconds())
-	return []string{
-		"-nostdin", "-hide_banner", "-nostats", "-y",
-		"-i", placeholderPath,
-		"-t", secs,
-		"-map", "0:v:0",
-		"-map", "0:a:0?",
-		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
-		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
-		"-force_key_frames", "expr:gte(t,n_forced*4)",
-		"-c:a", "aac", "-b:a", "128k",
-		"-f", "hls",
-		"-hls_time", fmtDuration(segDuration),
-		"-hls_list_size", "0",
-		"-hls_flags", "independent_segments+temp_file",
-		"-hls_segment_filename", filepath.Join(outputDir, "seg_%05d.ts"),
-		filepath.Join(outputDir, "intro.m3u8"),
-	}
 }
 
 // StartPlaceholderSession launches a placeholder with optional poster/card

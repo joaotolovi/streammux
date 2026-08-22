@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -80,13 +79,6 @@ func main() {
 	}
 
 	mux := muxer.NewWithVideos(collector, planner, ff, res, store, baseURL, placeholderPath, errorPath)
-	if seconds := envOr("PLACEHOLDER_MIN_SECONDS", "8"); seconds != "" {
-		if v, err := strconv.Atoi(seconds); err == nil && v >= 0 {
-			mux.SetPlaceholderMinTime(time.Duration(v) * time.Second)
-		} else {
-			log.Fatalf("invalid PLACEHOLDER_MIN_SECONDS %q", seconds)
-		}
-	}
 	store.SetOnDelete(mux.CleanupJob)
 	if assetsDir != "" {
 		defer os.RemoveAll(assetsDir)

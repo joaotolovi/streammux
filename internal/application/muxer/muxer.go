@@ -77,8 +77,6 @@ type Policy struct {
 	// generation is started.
 	TierSwitchCooldown time.Duration
 	DurationTolerance  float64
-	// PlaceholderMinTime is the duration of the generated HLS Interstitial.
-	PlaceholderMinTime time.Duration
 	// CacheMaxBytes caps all playback caches managed by this process.
 	CacheMaxBytes int64
 	// CacheMinFreeBytes keeps space available for the OS and Docker.
@@ -104,7 +102,6 @@ func defaultPolicy() Policy {
 		TierSwitchBuffer:   8 * time.Second,
 		TierSwitchCooldown: 30 * time.Second,
 		DurationTolerance:  0.002,
-		PlaceholderMinTime: 8 * time.Second,
 		CacheMaxBytes:      8 * 1024 * 1024 * 1024,
 		CacheMinFreeBytes:  3 * 1024 * 1024 * 1024,
 		SessionMaxBytes:    2 * 1024 * 1024 * 1024,
@@ -120,8 +117,8 @@ type Muxer struct {
 	baseURL   string
 	policy    Policy
 
-	// placeholderPath plays instantly while sources prepare; errorPath is the
-	// terminal "no source worked" video. Both optional.
+	// placeholderPath is composited over the opening film segment; errorPath is
+	// the terminal "no source worked" video. Both optional.
 	placeholderPath string
 	errorPath       string
 
@@ -174,13 +171,6 @@ func NewWithVideos(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Mux
 	}
 	go m.reapIdleSessions()
 	return m
-}
-
-// SetPlaceholderMinTime overrides the generated interstitial duration.
-func (m *Muxer) SetPlaceholderMinTime(d time.Duration) {
-	if d >= 0 {
-		m.policy.PlaceholderMinTime = d
-	}
 }
 
 // errorSegmentCount returns how many HLS segments the error video spans,
@@ -501,13 +491,6 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 		m.prefetchImagesForContent(state.ctx, contentType, contentID, state.posterPath, state.backgroundPath)
 	}
 	go m.prepareJob(job, state, addons, cfg.Language)
-	// Pre-generate interstitial intro in the background so it is ready by
-	// the time the film playlist is requested. Failure is silent — players
-	// that do not support interstitials just ignore the tag.
-	if m.placeholderPath != "" {
-		go m.ensureInterstitial(job.ID)
-	}
-
 	name, description := streamPresentation(metadata)
 	return &Result{Dubbed: &model.StremioStream{
 		Name:        name,
