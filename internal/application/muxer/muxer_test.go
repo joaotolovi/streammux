@@ -92,6 +92,19 @@ func TestCachedRequestsAdvanceMaximumBeforeSeekClassification(t *testing.T) {
 	}
 }
 
+func TestSeekResetStartsNewRequestWindow(t *testing.T) {
+	state := &playbackState{lastRequested: 753, maxRequested: 857}
+	resetPlaybackTrackingLocked(state)
+	if state.maxRequested != 753 {
+		t.Fatalf("maximum after backward seek = %d, want 753", state.maxRequested)
+	}
+
+	previousMax := (&Muxer{}).recordVideoRequestLocked(state, 860, time.Unix(100, 0))
+	if !isForwardSeek(previousMax, 860, 780, 753) {
+		t.Fatal("request after a backward seek must be classified in the new window")
+	}
+}
+
 func TestForwardSeekStartsOneSegmentBeforeRequested(t *testing.T) {
 	if !isForwardSeek(100, 130, 105, 0) {
 		t.Fatal("fixture must be a forward seek")

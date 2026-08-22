@@ -2154,7 +2154,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 		// real seek jumps beyond it, while cached sequential requests still
 		// advance state.maxRequested for future classifications.
 		prevMax := requestMaxBefore
-		if !placeholderActive {
+		if !placeholderActive && !audio {
 			state.lastRequested = segment
 			if segment > state.maxRequested {
 				state.maxRequested = segment
@@ -2269,6 +2269,7 @@ func (m *Muxer) recordVideoRequestLocked(state *playbackState, segment int, at t
 func resetPlaybackTrackingLocked(state *playbackState) {
 	state.lastSequentialAt = time.Time{}
 	state.playbackEpoch++
+	state.maxRequested = state.lastRequested
 }
 
 func (m *Muxer) mediaSegmentPath(job *model.MuxJob, segment, tier int, audio bool) string {
@@ -2335,9 +2336,6 @@ func (m *Muxer) fastSeek(job *model.MuxJob, state *playbackState, old *generatio
 	// Hold requests at the target; the seeker session is coming.
 	state.lastRequested = targetSegment
 	resetPlaybackTrackingLocked(state)
-	if targetSegment > state.maxRequested {
-		state.maxRequested = targetSegment
-	}
 	state.mu.Unlock()
 	if cancelTier != nil {
 		cancelTier()
