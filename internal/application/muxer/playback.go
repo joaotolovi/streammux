@@ -685,7 +685,7 @@ func (m *Muxer) launchGenerationInternal(job *model.MuxJob, state *playbackState
 	}
 	minSegs := int(math.Ceil(minBuffer.Seconds() / segDur))
 	for produced := 1; produced < minSegs; {
-		highest := highestCompleteSegment(generation.dir)
+		highest := lastCommonSegment(generation)
 		if highest >= 0 && highest-startNumber+1 >= minSegs {
 			break
 		}
@@ -891,12 +891,10 @@ type audioRenditionMeta struct {
 	auto     bool
 }
 
-// audioRenditionMedia advertises the requested language first, its alternative
-// second, then languages inferred from addon metadata. These are optimistic
-// capabilities: only the selected rendition is resolved and validated.
+// audioRenditionMedia advertises only the audio produced by the same FFmpeg
+// process as the video. Independent lazy renditions can race video seeks and
+// expose audio before the new video generation is decodable.
 func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
-	seen := map[string]bool{}
-	metas := make([]audioRenditionMeta, 0, 4)
 	targetCode := ffmpeg.LanguageCode(targetLanguage)
 	if targetCode == "" {
 		targetCode = "eng"
@@ -905,25 +903,7 @@ func audioRenditionMedia(job *model.MuxJob, targetLanguage string) []string {
 	if targetName == "" {
 		targetName = "Audio"
 	}
-	metas = append(metas,
-		audioRenditionMeta{id: "main", code: targetCode, language: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true},
-		audioRenditionMeta{id: targetCode + "-alt", code: targetCode, language: targetCode + "-x-alt", name: targetName + " (alternativa)", uri: "audio/" + targetCode + "-alt/audio.m3u8"},
-	)
-	seen[targetCode] = true
-	if job != nil {
-		for _, plan := range job.Plans {
-			for _, stream := range []model.CollectedStream{plan.Audio, plan.Video} {
-				for _, raw := range append(append([]string{}, stream.Parsed.Languages...), stream.AddonLanguage, stream.Language) {
-					code, name := knownAudioLanguage(raw)
-					if code == "" || seen[code] || !audioLanguageAllowed(job, code, targetCode) {
-						continue
-					}
-					seen[code] = true
-					metas = append(metas, audioRenditionMeta{id: code, code: code, language: code, name: name, uri: "audio/" + code + "/audio.m3u8", auto: true})
-				}
-			}
-		}
-	}
+	metas := []audioRenditionMeta{{id: "main", code: targetCode, language: targetCode, name: targetName, uri: "audio/audio.m3u8", defaultY: true, auto: true}}
 	lines := make([]string, 0, len(metas))
 	for _, meta := range metas {
 		auto := "NO"
@@ -1357,7 +1337,9 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		}
 		b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", first))
 		b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+		// Stream-copy cuts are not guaranteed to begin on a keyframe. Do not
+		// advertise independent segments or players may seek directly into an
+		// undecodable GOP while audio continues.
 		for i := first; i <= last; i++ {
 			if discSet[i] {
 				b.WriteString("#EXT-X-DISCONTINUITY\n")
@@ -1384,7 +1366,6 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 		// Error-only timeline: placeholder prefix (if any) + error video.
 		b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 		b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 		for i := 0; i < errStart; i++ {
 			b.WriteString(fmt.Sprintf("#EXTINF:%.6f,\n", segDur))
 			b.WriteString(tierSegmentURI(tier, i))
@@ -1578,6 +1559,11 @@ func (m *Muxer) segmentPathTier(job *model.MuxJob, segment int, audio bool, tier
 		var path string
 		if audio {
 			path = generationAudioSegmentPath(all[i], segment)
+			// Audio can be written ahead of video. Serve it only after the same
+			// generation has completed the matching video segment.
+			if !fileExists(generationSegmentPath(all[i], segment)) {
+				continue
+			}
 		} else {
 			path = generationSegmentPath(all[i], segment)
 		}
@@ -1831,6 +1817,12 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 			at = lastRequested + 1
 		}
 		m.requestTier(job, state, tier, at)
+	} else {
+		// Some players request audio first after seeking. It must participate in
+		// the same generation switch instead of waiting on the old encoder.
+		state.mu.Lock()
+		requestMaxBefore = state.maxRequested
+		state.mu.Unlock()
 	}
 
 	if path := m.mediaSegmentPath(job, segment, tier, audio); path != "" {
@@ -1908,7 +1900,7 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				m.ensureRecovery(job, state, segment, "no active session")
 			}
 		} else if !active.isError {
-			highest := highestCompleteSegment(active.dir)
+			highest := lastCommonSegment(active)
 			lowest := lowestCompleteSegment(active.dir)
 			select {
 			case <-active.session.Done():
@@ -1919,15 +1911,12 @@ func (m *Muxer) ensureMediaSegment(ctx context.Context, job *model.MuxJob, segme
 				// The muxer retains a short rewind window behind the player. A
 				// request before that window is a real backward seek and must
 				// relaunch at the requested position.
-				if !audio && (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
+				if (segment < active.startSegment || (lowest >= 0 && segment < lowest) || isForwardSeek(prevMax, segment, highest, active.startSegment)) && !recovering {
 					target := segment
 					forward := isForwardSeek(prevMax, segment, highest, active.startSegment)
-					if forward && target > 0 {
-						// HLS fetches can arrive out of order around a seek. Include one
-						// segment before the first forward request so its predecessor is
-						// ready instead of triggering an immediate second seek.
-						target--
-					}
+					// The first stream-copied segment contains the source keyframe
+					// preroll. Give it the requested number so direct seek playback
+					// never starts from the following mid-GOP segment.
 					log.Printf("mux: segment %d outside active window [%d,%d] (previous max %d, forward=%t); seeking from %d", segment, lowest, highest, prevMax, forward, target)
 					m.fastSeek(job, state, active, target)
 				}

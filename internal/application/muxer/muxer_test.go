@@ -105,17 +105,14 @@ func TestSeekResetStartsNewRequestWindow(t *testing.T) {
 	}
 }
 
-func TestForwardSeekStartsOneSegmentBeforeRequested(t *testing.T) {
+func TestForwardSeekStartsAtRequestedSegment(t *testing.T) {
 	if !isForwardSeek(100, 130, 105, 0) {
 		t.Fatal("fixture must be a forward seek")
 	}
 	requested := 130
 	target := requested
-	if isForwardSeek(100, requested, 105, 0) && target > 0 {
-		target--
-	}
-	if target != 129 {
-		t.Fatalf("forward seek target = %d, want 129", target)
+	if target != 130 {
+		t.Fatalf("forward seek target = %d, want 130", target)
 	}
 }
 
@@ -688,15 +685,40 @@ func TestMasterPlaylistDeclaresAudioRenditionGroup(t *testing.T) {
 	}
 }
 
-func TestMasterPlaylistSeparatesSameLanguageAlternativeForExoPlayer(t *testing.T) {
+func TestMasterPlaylistAdvertisesOnlyCoordinatedAudio(t *testing.T) {
 	mux := &Muxer{}
 	job := &model.MuxJob{TargetLanguage: "Portuguese (Brazil)"}
 	playlist := string(mux.renderMaster(job, 1_000_000, 0, 0, job.TargetLanguage))
 	if !strings.Contains(playlist, `LANGUAGE="por",URI="audio/audio.m3u8"`) {
 		t.Fatalf("master missing primary Portuguese rendition: %s", playlist)
 	}
-	if !strings.Contains(playlist, `LANGUAGE="por-x-alt",URI="audio/por-alt/audio.m3u8"`) {
-		t.Fatalf("master missing distinct alternative language tag: %s", playlist)
+	if strings.Count(playlist, "#EXT-X-MEDIA:TYPE=AUDIO") != 1 || strings.Contains(playlist, "audio/por-alt/") {
+		t.Fatalf("master advertised an independently generated audio rendition: %s", playlist)
+	}
+}
+
+func TestAudioSegmentPathWaitsForMatchingVideo(t *testing.T) {
+	dir := t.TempDir()
+	for _, media := range []string{"video", "audio"} {
+		if err := os.MkdirAll(filepath.Join(dir, media), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	audioPath := filepath.Join(dir, "audio", "seg_00007.ts")
+	if err := os.WriteFile(audioPath, []byte("audio"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state := &playbackState{duration: 60, all: []*generation{{dir: dir}}}
+	mux := &Muxer{states: map[string]*playbackState{"job": state}}
+	job := &model.MuxJob{ID: "job"}
+	if got := mux.AudioSegmentPath(job, 7); got != "" {
+		t.Fatalf("audio was exposed before video: %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "video", "seg_00007.ts"), []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if got := mux.AudioSegmentPath(job, 7); got != audioPath {
+		t.Fatalf("coordinated audio path = %q, want %q", got, audioPath)
 	}
 }
 
