@@ -37,6 +37,14 @@ func interstitialAvailable(state *playbackState) bool {
 	return fileExists(interstitialPlaylistPath(state))
 }
 
+func (m *Muxer) interstitialAssetURI(jobID string) string {
+	path := "/mux/" + jobID + "/interstitial/intro.m3u8"
+	if m.baseURL == "" {
+		return ""
+	}
+	return m.baseURL + path
+}
+
 func (m *Muxer) ensureInterstitial(jobID string) {
 	state := m.lookupState(jobID)
 	if state == nil || m.placeholderPath == "" {

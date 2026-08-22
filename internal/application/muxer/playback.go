@@ -1646,11 +1646,18 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	}
 
 	var b strings.Builder
-	// Use version 9 when interstitial is available so players that support
+	// Interstitials require HLS version 10. Players that do not implement
+	// them ignore the DATERANGE and continue with the primary presentation.
+	//
+	// Do not advertise an interstitial before its HLS asset is available:
+	// compliant players may otherwise treat a missing asset as a playback error.
+	//
+	// Use version 10 when interstitial is available so players that support
 	// HLS Interstitials can play the intro; others ignore the DATERANGE.
 	version := 6
-	if m.placeholderPath != "" && active != nil && duration > 0 {
-		version = 9
+	interstitial := interstitialAvailable(state) && active != nil && duration > 0 && m.baseURL != ""
+	if interstitial {
+		version = 10
 	}
 	b.WriteString("#EXTM3U\n")
 	b.WriteString(fmt.Sprintf("#EXT-X-VERSION:%d\n", version))
@@ -1659,13 +1666,19 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	// HLS Interstitial: short intro that auto-plays before the film on
 	// supporting players and is silently ignored otherwise. No error handling
 	// required — absence of the tag just means the film starts immediately.
-	if m.placeholderPath != "" && active != nil && duration > 0 {
-		// Static 5s sample for testing HLS Interstitial support. Players that
-		// support interstitials will fetch this MP4 before the film; others
-		// ignore the DATERANGE and start the film directly.
-		assetURI := "https://samplelib.com/mp4/sample-5s.mp4"
-		interDuration := 5.0
-		b.WriteString(fmt.Sprintf("#EXT-X-DATERANGE:ID=\"com.streammux.intro\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"1970-01-01T00:00:00.000Z\",DURATION=%.3f,X-ASSET-URI=\"%s\"\n", interDuration, assetURI))
+	if interstitial {
+		interDuration := m.policy.PlaceholderMinTime.Seconds()
+		if interDuration <= 0 {
+			interDuration = 8
+		}
+		if interDuration > 10 {
+			interDuration = 10
+		}
+		assetURI := m.interstitialAssetURI(job.ID)
+		// A PRE cue is a preroll. The PDT establishes the VOD timeline's wall
+		// clock anchor so START-DATE is meaningful to interstitial clients.
+		b.WriteString("#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z\n")
+		b.WriteString(fmt.Sprintf("#EXT-X-DATERANGE:ID=\"com.streammux.intro\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"1970-01-01T00:00:00.000Z\",CUE=\"PRE\",DURATION=%.3f,X-ASSET-URI=\"%s\",X-RESUME-OFFSET=0\n", interDuration, assetURI))
 	}
 
 	if duration > 0 {

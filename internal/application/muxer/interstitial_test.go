@@ -30,6 +30,7 @@ func TestInterstitialInjection(t *testing.T) {
 	}
 	mux := &Muxer{
 		placeholderPath: "placeholder.mp4",
+		baseURL:         "https://streammux.example",
 		policy:          defaultPolicy(),
 		states:          map[string]*playbackState{"job": state},
 	}
@@ -42,14 +43,24 @@ func TestInterstitialInjection(t *testing.T) {
 	if !strings.Contains(playlist, "com.apple.hls.interstitial") {
 		t.Fatalf("playlist missing interstitial DATERANGE: %s", playlist)
 	}
-	if !strings.Contains(playlist, "https://samplelib.com/mp4/sample-5s.mp4") {
+	if !strings.Contains(playlist, "https://streammux.example/mux/job/interstitial/intro.m3u8") {
 		t.Fatalf("playlist missing asset URI: %s", playlist)
 	}
-	if !strings.Contains(playlist, "#EXT-X-VERSION:9") {
-		t.Fatalf("playlist should be version 9 when interstitial present: %s", playlist)
+	if !strings.Contains(playlist, "#EXT-X-VERSION:10") {
+		t.Fatalf("playlist should be version 10 when interstitial present: %s", playlist)
 	}
-	if !strings.Contains(playlist, "DURATION=5.000") {
-		t.Fatalf("playlist missing duration: %s", playlist)
+	for _, want := range []string{
+		"#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z",
+		`CUE="PRE"`,
+		"DURATION=8.000",
+		"X-RESUME-OFFSET=0",
+	} {
+		if !strings.Contains(playlist, want) {
+			t.Fatalf("playlist missing %q: %s", want, playlist)
+		}
+	}
+	if strings.Contains(playlist, "samplelib.com") {
+		t.Fatalf("playlist should use our HLS asset, not a static MP4: %s", playlist)
 	}
 }
 
@@ -75,7 +86,7 @@ func TestInterstitialNotInjectedWhenNotReady(t *testing.T) {
 	if strings.Contains(playlist, "com.apple.hls.interstitial") {
 		t.Fatalf("playlist should not contain interstitial when placeholder disabled: %s", playlist)
 	}
-	if strings.Contains(playlist, "#EXT-X-VERSION:9") {
+	if strings.Contains(playlist, "#EXT-X-VERSION:10") {
 		t.Fatalf("playlist version should be 6 when no interstitial: %s", playlist)
 	}
 }
