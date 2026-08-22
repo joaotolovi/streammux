@@ -136,6 +136,9 @@ type playbackState struct {
 	// only after the player requests them.
 	audioRenditions map[string]*audioRendition
 	activeAudioID   string
+
+	interstitialReady      bool
+	interstitialGenerating bool
 }
 
 type audioRendition struct {
@@ -702,6 +705,11 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		close(wait)
 	}
 	log.Printf("mux: startup selected video#%d audio#%d %s (%s) at segment %d", winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, winner.plan.Video.Parsed.Resolution, base)
+	// Ensure interstitial asset is ready shortly after startup. If it is not
+	// yet generated, the next playlist request will trigger it.
+	if m.placeholderPath != "" {
+		go m.ensureInterstitial(job.ID)
+	}
 	go m.monitorGeneration(job, state, winner)
 }
 
@@ -1615,6 +1623,12 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	}
 
 	_ = retired
+	// Lazily ensure interstitial asset exists once the film is known. It is
+	// generated in the background and does not block playlist rendering;
+	// absence simply means no DATERANGE is emitted on this request.
+	if active != nil && m.placeholderPath != "" && !interstitialAvailable(state) {
+		m.ensureInterstitial(job.ID)
+	}
 	// Live placeholder phase: synchronized sliding window of both renditions,
 	// capped at the frozen handoff point once the film is being launched.
 	if placeholder != nil && active == nil {
@@ -1632,9 +1646,32 @@ func (m *Muxer) renderMediaPlaylist(job *model.MuxJob, tier int) ([]byte, bool) 
 	}
 
 	var b strings.Builder
+	// Use version 9 when interstitial is available so players that support
+	// HLS Interstitials can play the intro; others ignore the DATERANGE.
+	version := 6
+	if interstitialAvailable(state) && active != nil && duration > 0 {
+		version = 9
+	}
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:6\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-VERSION:%d\n", version))
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(segDur))))
+
+	// HLS Interstitial: short intro that auto-plays before the film on
+	// supporting players and is silently ignored otherwise. No error handling
+	// required — absence of the tag just means the film starts immediately.
+	if interstitialAvailable(state) && active != nil && duration > 0 {
+		// Ensure interstitial duration matches what was generated (default 8s).
+		interDuration := m.policy.PlaceholderMinTime.Seconds()
+		if interDuration <= 0 {
+			interDuration = 8
+		}
+		if interDuration > 10 {
+			interDuration = 10
+		}
+		assetURI := "/mux/" + job.ID + "/interstitial/intro.m3u8"
+		// START-DATE is arbitrary but must be valid ISO8601; use epoch.
+		b.WriteString(fmt.Sprintf("#EXT-X-DATERANGE:ID=\"com.streammux.intro\",CLASS=\"com.apple.hls.interstitial\",START-DATE=\"1970-01-01T00:00:00.000Z\",DURATION=%.3f,X-ASSET-URI=\"%s\",X-RESUME-OFFSET=0,X-RESUME-ON-PLAYBACK-ERROR=YES,X-PLAYOUT-LIMIT=1\n", interDuration, assetURI))
+	}
 
 	if duration > 0 {
 		// Film timeline (possibly truncated by the error tail).

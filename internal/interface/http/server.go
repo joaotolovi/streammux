@@ -69,6 +69,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{rendition}/audio.m3u8", s.handleHLSAudioRenditionPlaylist)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{rendition}/{segment}", s.handleHLSAudioRenditionSegment)
 	s.mux.HandleFunc("GET /mux/{jobId}/audio/{segment}", s.handleHLSAudioSegment)
+	s.mux.HandleFunc("GET /mux/{jobId}/interstitial/{path...}", s.handleInterstitial)
 
 	// API
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
@@ -391,6 +392,37 @@ func (s *Server) deliverSegment(w http.ResponseWriter, r *http.Request, job *mod
 	cw := &countingWriter{ResponseWriter: w}
 	http.ServeFile(cw, r, path)
 	go s.muxer.ObserveDelivery(job, cw.bytes, time.Since(start))
+}
+
+func (s *Server) handleInterstitial(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobId")
+	path := r.PathValue("path")
+	if jobID == "" {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	if _, ok := s.store.Get(jobID); !ok {
+		writeError(w, http.StatusNotFound, "mux job not found")
+		return
+	}
+	file := filepath.Base(path)
+	if file == "" || file == "." || file == "/" {
+		writeError(w, http.StatusNotFound, "interstitial not found")
+		return
+	}
+	fullPath := s.muxer.InterstitialFilePath(jobID, file)
+	if fullPath == "" {
+		writeError(w, http.StatusNotFound, "interstitial not found")
+		return
+	}
+	if strings.HasSuffix(file, ".m3u8") {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, fullPath)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, fullPath)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

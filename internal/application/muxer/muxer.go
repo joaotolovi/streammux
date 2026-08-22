@@ -502,6 +502,12 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 		m.prefetchImagesForContent(state.ctx, contentType, contentID, state.posterPath, state.backgroundPath)
 	}
 	go m.prepareJob(job, state, addons, cfg.Language)
+	// Pre-generate interstitial intro in the background so it is ready by
+	// the time the film playlist is requested. Failure is silent — players
+	// that do not support interstitials just ignore the tag.
+	if m.placeholderPath != "" {
+		go m.ensureInterstitial(job.ID)
+	}
 
 	name, description := streamPresentation(metadata)
 	return &Result{Dubbed: &model.StremioStream{

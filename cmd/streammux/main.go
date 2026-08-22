@@ -60,13 +60,10 @@ func main() {
 	// Placeholder plays instantly while film sources prepare; the error video
 	// is the terminal "no source worked" fallback. Embedded defaults, env
 	// overrides for custom files.
-	disableIntro, err := strconv.ParseBool(envOr("DISABLE_INTRO", "false"))
-	if err != nil {
-		log.Fatalf("invalid DISABLE_INTRO %q", os.Getenv("DISABLE_INTRO"))
-	}
 	placeholderPath := envOr("PLACEHOLDER_VIDEO", "")
 	assetsDir := ""
-	if !disableIntro && placeholderPath == "" {
+	if placeholderPath == "" {
+		var err error
 		placeholderPath, assetsDir, err = assets.PlaceholderPath()
 		if err != nil {
 			log.Fatalf("placeholder assets: %v", err)

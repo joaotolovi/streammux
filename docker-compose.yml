@@ -10,7 +10,6 @@ services:
       - SECRET_KEY=${SECRET_KEY:-change-me-to-a-long-random-string}
       - DATABASE_URI=sqlite:///data/streammux.db
       - BASE_URL=${BASE_URL:-http://localhost:3001}
-      - DISABLE_INTRO=${DISABLE_INTRO:-false}
     volumes:
       - streammux-data:/data
 

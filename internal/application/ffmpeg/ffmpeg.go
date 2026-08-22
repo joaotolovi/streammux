@@ -806,6 +806,64 @@ func (m *Muxer) StartImagePlaceholderSession(ctx context.Context, path, imagePat
 	return m.StartPlaceholderSession(ctx, PlaceholderSpec{VideoPath: path, ImagePath: imagePath, OutputDir: outputDir, Realtime: realtime})
 }
 
+// GenerateInterstitial creates a short VOD HLS asset from the placeholder
+// video for use as an HLS Interstitial. The asset is muxed (video+audio in
+// one playlist) and limited to duration (typically PlaceholderMinTime). It
+// returns quickly and produces a playlist with ENDLIST that players that
+// support interstitials will play before the main content; others ignore it.
+func (m *Muxer) GenerateInterstitial(ctx context.Context, placeholderPath, outputDir string, duration time.Duration) error {
+	if strings.TrimSpace(placeholderPath) == "" {
+		return fmt.Errorf("interstitial: no placeholder provided")
+	}
+	if strings.TrimSpace(outputDir) == "" {
+		return fmt.Errorf("interstitial: output directory is required")
+	}
+	if duration <= 0 {
+		duration = 8 * time.Second
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("interstitial dir: %w", err)
+	}
+	args := buildInterstitialArgs(placeholderPath, outputDir, duration)
+	sessCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
+	stderr := newTailBuffer(stderrTailSize)
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		if sessCtx.Err() != nil {
+			return fmt.Errorf("interstitial generation timeout: %w; stderr: %s", err, stderr.String())
+		}
+		return fmt.Errorf("interstitial ffmpeg: %w; stderr: %s", err, stderr.String())
+	}
+	// Verify playlist was created.
+	if _, err := os.Stat(filepath.Join(outputDir, "intro.m3u8")); err != nil {
+		return fmt.Errorf("interstitial playlist missing: %w; stderr: %s", err, stderr.String())
+	}
+	return nil
+}
+
+func buildInterstitialArgs(placeholderPath, outputDir string, duration time.Duration) []string {
+	secs := fmtDuration(duration.Seconds())
+	return []string{
+		"-nostdin", "-hide_banner", "-nostats", "-y",
+		"-i", placeholderPath,
+		"-t", secs,
+		"-map", "0:v:0",
+		"-map", "0:a:0?",
+		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23",
+		"-g", "96", "-keyint_min", "96", "-sc_threshold", "0",
+		"-force_key_frames", "expr:gte(t,n_forced*4)",
+		"-c:a", "aac", "-b:a", "128k",
+		"-f", "hls",
+		"-hls_time", fmtDuration(segDuration),
+		"-hls_list_size", "0",
+		"-hls_flags", "independent_segments+temp_file",
+		"-hls_segment_filename", filepath.Join(outputDir, "seg_%05d.ts"),
+		filepath.Join(outputDir, "intro.m3u8"),
+	}
+}
+
 // StartPlaceholderSession launches a placeholder with optional poster/card
 // composition and an explicit public segment start.
 func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpec) (*Session, error) {
