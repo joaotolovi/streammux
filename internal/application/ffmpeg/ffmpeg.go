@@ -81,13 +81,6 @@ type SessionSpec struct {
 	// Transcode, when non-nil, re-encodes the video (see TranscodeSpec)
 	// instead of stream-copying it.
 	Transcode *TranscodeSpec
-	// Duration bounds one on-demand VOD production batch. A zero duration keeps
-	// the FFmpeg session open until its input ends.
-	Duration time.Duration
-	// OpeningOverlayPath is a local ident composited over the source for this
-	// finite session. Its black background is keyed out before compositing.
-	OpeningOverlayPath   string
-	OpeningOverlayHeight int
 }
 
 // AudioSessionSpec describes a lazy audio-only HLS session aligned to the
@@ -104,22 +97,6 @@ type AudioSessionSpec struct {
 	UserAgent       string
 	AudioOffset     time.Duration
 	Duration        time.Duration
-}
-
-// PlaceholderSpec describes a local placeholder HLS session. StartSegment is
-// useful when a replacement joins an already-public timeline; CardPath is
-// watched by drawtext with reload=1 so metadata can change without restarting
-// the session.
-type PlaceholderSpec struct {
-	VideoPath      string
-	ImagePath      string // current transparent Cinemeta logo
-	BackgroundPath string // Cinemeta poster behind the opening video
-	CardPath       string
-	MetadataPath   string
-	DetailsPath    string
-	OutputDir      string
-	Realtime       bool
-	StartSegment   int
 }
 
 // Session is a single continuous FFmpeg run that produces HLS segments.
@@ -318,9 +295,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if spec.StartSegment < 0 {
 		return nil, fmt.Errorf("ffmpeg session: start segment must not be negative")
 	}
-	if spec.OpeningOverlayPath != "" && spec.Duration <= 0 {
-		return nil, fmt.Errorf("ffmpeg session: opening overlay requires a duration")
-	}
 
 	audioMode := AudioMode(strings.ToLower(strings.TrimSpace(string(spec.AudioMode))))
 	if audioMode == "" {
@@ -345,10 +319,13 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		"-readrate_initial_burst", fmtDuration(initialReadBurstSeconds),
 		"-ss", fmtDuration(offset),
 	}
-	if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
-		args = append(args, "-user_agent", userAgent)
+	if strings.Contains(spec.VideoURL, "://") {
+		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
+			args = append(args, "-user_agent", userAgent)
+		}
+		args = append(args, "-icy", "0")
 	}
-	args = append(args, "-icy", "0", "-i", spec.VideoURL)
+	args = append(args, "-i", spec.VideoURL)
 
 	dualSource := strings.TrimSpace(spec.AudioURL) != "" && spec.AudioURL != spec.VideoURL
 	if dualSource {
@@ -363,20 +340,14 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 			"-readrate_initial_burst", fmtDuration(initialReadBurstSeconds),
 			"-ss", fmtDuration(offset),
 		)
-		if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
-			args = append(args, "-user_agent", userAgent)
+		if strings.Contains(spec.AudioURL, "://") {
+			if userAgent := strings.TrimSpace(spec.UserAgent); userAgent != "" {
+				args = append(args, "-user_agent", userAgent)
+			}
+			args = append(args, "-icy", "0")
 		}
-		args = append(args, "-icy", "0", "-i", spec.AudioURL)
+		args = append(args, "-i", spec.AudioURL)
 	}
-	overlayInput := -1
-	if overlayPath := strings.TrimSpace(spec.OpeningOverlayPath); overlayPath != "" {
-		overlayInput = 1
-		if dualSource {
-			overlayInput = 2
-		}
-		args = append(args, "-i", overlayPath)
-	}
-
 	audioInput := 0
 	if dualSource {
 		audioInput = 1
@@ -389,37 +360,16 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	if spec.StartSegment > 0 {
 		videoFlags += "+discont_start"
 	}
-	if spec.Transcode != nil || overlayInput >= 0 {
+	if spec.Transcode != nil {
 		// Transcodes force IDRs at the grid, so their segments are independent.
 		videoFlags = "independent_segments+" + videoFlags
 	}
-	videoMap := fmt.Sprintf("0:v:%d", spec.VideoTrackIndex)
-	audioMap := fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex)
-	if overlayInput >= 0 {
-		height := spec.OpeningOverlayHeight
-		if tc := spec.Transcode; tc != nil && tc.Height > 0 {
-			height = tc.Height
-		}
-		filmFilter := fmt.Sprintf("[0:v:%d]setpts=PTS-STARTPTS", spec.VideoTrackIndex)
-		introFilter := fmt.Sprintf("[%d:v:0]setpts=PTS-STARTPTS,format=rgba,colorkey=0x050505:0.08:0.02", overlayInput)
-		if height > 0 {
-			filmFilter += fmt.Sprintf(",scale=-2:%d", height)
-			introFilter += fmt.Sprintf(",scale=-2:%d", height)
-		}
-		args = append(args, "-filter_complex", filmFilter+"[film];"+introFilter+"[intro];[film][intro]overlay=eof_action=pass:shortest=1[v];"+
-			fmt.Sprintf("[%d:a:%d]asetpts=PTS-STARTPTS,volume='if(isnan(t),0.20,if(lt(t,3.7),0.20,0.20+0.80*(t-3.7)/0.3))':eval=frame[film-a];[%d:a:0]asetpts=PTS-STARTPTS[intro-a];[film-a][intro-a]amix=inputs=2:duration=first:dropout_transition=0[a]", audioInput, spec.AudioTrackIndex, overlayInput))
-		videoMap = "[v]"
-		audioMap = "[a]"
-	}
-	args = append(args, "-map", videoMap)
-	if tc := spec.Transcode; tc != nil || overlayInput >= 0 {
+	args = append(args, "-map", fmt.Sprintf("0:v:%d", spec.VideoTrackIndex))
+	if tc := spec.Transcode; tc != nil {
 		// Downgrade-ladder transcode: decode once, re-encode to a capped,
 		// decode-friendly H.264 rendition. Keyframes forced on the 4s grid so
 		// HLS segmentation stays aligned without split_by_time.
-		preset := "veryfast"
-		if tc != nil {
-			preset = strings.TrimSpace(tc.Preset)
-		}
+		preset := strings.TrimSpace(tc.Preset)
 		if preset == "" {
 			preset = "veryfast"
 		}
@@ -431,18 +381,10 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 			"-sc_threshold", "0",
 			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%.0f)", segDuration),
 		)
-		if tc != nil {
-			bufKbps := tc.MaxRateKbps * 2
-			if overlayInput < 0 {
-				args = append(args, "-vf", fmt.Sprintf("scale=-2:%d", tc.Height))
-			}
-			args = append(args, "-maxrate", fmt.Sprintf("%dk", tc.MaxRateKbps), "-bufsize", fmt.Sprintf("%dk", bufKbps))
-		}
+		bufKbps := tc.MaxRateKbps * 2
+		args = append(args, "-vf", fmt.Sprintf("scale=-2:%d", tc.Height), "-maxrate", fmt.Sprintf("%dk", tc.MaxRateKbps), "-bufsize", fmt.Sprintf("%dk", bufKbps))
 	} else {
 		args = append(args, "-c:v", "copy")
-	}
-	if spec.Duration > 0 {
-		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
 	}
 	args = append(args,
 		"-f", "hls",
@@ -461,13 +403,9 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 		audioFlags += "+discont_start"
 	}
 	args = append(args,
-		"-map", audioMap,
+		"-map", fmt.Sprintf("%d:a:%d", audioInput, spec.AudioTrackIndex),
 	)
-	if overlayInput >= 0 {
-		args = append(args, "-c:a", "aac")
-	} else {
-		args = append(args, "-c:a", string(audioMode))
-	}
+	args = append(args, "-c:a", string(audioMode))
 	if language := normalizeLanguage(spec.AudioLanguage); language != "" {
 		args = append(args,
 			"-metadata:s:a:0", "language="+language,
@@ -476,9 +414,6 @@ func buildSessionArgs(spec SessionSpec) ([]string, error) {
 	}
 	if title := strings.TrimSpace(spec.AudioTitle); title != "" {
 		args = append(args, "-metadata:s:a:0", "title="+title)
-	}
-	if spec.Duration > 0 {
-		args = append(args, "-t", fmtDuration(spec.Duration.Seconds()))
 	}
 	args = append(args,
 		"-f", "hls",
@@ -834,91 +769,4 @@ func escapeFilterPath(path string) string {
 	path = strings.ReplaceAll(path, `\`, `\\`)
 	path = strings.ReplaceAll(path, `'`, `\'`)
 	return strings.ReplaceAll(path, ":", `\:`)
-}
-
-// StartSinglePlaceholderSession launches a local video as a live-window HLS
-// session. realtime=true paces the placeholder at 1x keeping the timeline
-// open (film handoff); false encodes the terminal error video as fast as
-// possible with a natural ENDLIST.
-func (m *Muxer) StartSinglePlaceholderSession(ctx context.Context, path, outputDir string, realtime bool) (*Session, error) {
-	return m.StartPlaceholderSession(ctx, PlaceholderSpec{VideoPath: path, OutputDir: outputDir, Realtime: realtime})
-}
-
-// StartImagePlaceholderSession launches the local placeholder video composed
-// with a static poster image. The poster slides in from the right after a
-// short delay while the opening video remains fixed. The
-// output is identical to a regular placeholder session, so the film handoff
-// works unchanged.
-func (m *Muxer) StartImagePlaceholderSession(ctx context.Context, path, imagePath, outputDir string, realtime bool) (*Session, error) {
-	return m.StartPlaceholderSession(ctx, PlaceholderSpec{VideoPath: path, ImagePath: imagePath, OutputDir: outputDir, Realtime: realtime})
-}
-
-// StartPlaceholderSession launches a placeholder with optional poster/card
-// composition and an explicit public segment start.
-func (m *Muxer) StartPlaceholderSession(ctx context.Context, spec PlaceholderSpec) (*Session, error) {
-	if strings.TrimSpace(spec.VideoPath) == "" {
-		return nil, fmt.Errorf("placeholder session: no video provided")
-	}
-	if strings.TrimSpace(spec.OutputDir) == "" {
-		return nil, fmt.Errorf("placeholder session: output directory is required")
-	}
-	if spec.StartSegment < 0 {
-		return nil, fmt.Errorf("placeholder session: invalid start segment")
-	}
-	if err := os.MkdirAll(filepath.Join(spec.OutputDir, "video"), 0755); err != nil {
-		return nil, fmt.Errorf("placeholder session: video dir: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(spec.OutputDir, "audio"), 0755); err != nil {
-		return nil, fmt.Errorf("placeholder session: audio dir: %w", err)
-	}
-	var args []string
-	if spec.ImagePath != "" {
-		args = buildImagePlaceholderArgsWithBackground(spec.VideoPath, spec.ImagePath, spec.BackgroundPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath)
-	} else {
-		args = buildPlaceholderArgsWithCards(spec.VideoPath, spec.OutputDir, spec.Realtime, spec.StartSegment, spec.CardPath, spec.MetadataPath, spec.DetailsPath, "")
-	}
-
-	sessCtx, cancel := context.WithCancel(ctx)
-	cmd := exec.CommandContext(sessCtx, m.binaryPath, args...)
-	stderr := newTailBuffer(stderrTailSize)
-	cmd.Stderr = stderr
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("placeholder progress pipe: %w", err)
-	}
-
-	s := &Session{
-		cancel:     cancel,
-		done:       make(chan struct{}),
-		progress:   make(chan ProgressSample, 1),
-		startN:     spec.StartSegment,
-		stderrTail: stderr,
-	}
-
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return nil, fmt.Errorf("placeholder start: %w", err)
-	}
-
-	go func() {
-		parseErr := parseProgress(stdout, s.progress, time.Now)
-		if parseErr != nil {
-			_, _ = io.Copy(io.Discard, stdout)
-		}
-		waitErr := cmd.Wait()
-		if waitErr != nil {
-			if ctxErr := sessCtx.Err(); ctxErr != nil {
-				waitErr = ctxErr
-			}
-			s.setErr(ffmpegRunError(waitErr, stderr.String()))
-		} else if parseErr != nil {
-			s.setErr(ffmpegRunError(fmt.Errorf("read progress: %w", parseErr), stderr.String()))
-		}
-		cancel()
-		close(s.progress)
-		close(s.done)
-	}()
-	return s, nil
 }

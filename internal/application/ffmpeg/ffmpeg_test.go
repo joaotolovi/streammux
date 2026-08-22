@@ -4,7 +4,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestBuildSessionArgsSingleSource(t *testing.T) {
@@ -130,30 +129,6 @@ func TestBuildSessionArgsRejectsInvalidAudioMode(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("buildSessionArgs() error = nil, want invalid audio mode error")
-	}
-}
-
-func TestBuildSessionArgsOpeningOverlay(t *testing.T) {
-	got, err := buildSessionArgs(SessionSpec{
-		VideoURL:             "https://video.test/movie.mkv",
-		VideoTrackIndex:      0,
-		AudioTrackIndex:      0,
-		OutputDir:            "/tmp/opening",
-		OpeningOverlayPath:   "/assets/intro.mp4",
-		OpeningOverlayHeight: 1080,
-		Duration:             4 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("buildSessionArgs() error = %v", err)
-	}
-	if countArgument(got, "-i") != 2 {
-		t.Fatalf("input count = %d, want film plus intro; args: %#v", countArgument(got, "-i"), got)
-	}
-	joined := strings.Join(got, " ")
-	for _, want := range []string{"colorkey=0x050505:0.08:0.02", "amix=inputs=2", "-map [v]", "-map [a]", "-t 4", "-c:v libx264", "-c:a aac"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("overlay args missing %q: %s", want, joined)
-		}
 	}
 }
 

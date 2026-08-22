@@ -35,17 +35,7 @@ type playbackPlanner interface {
 type mediaEngine interface {
 	Probe(context.Context, string) (*ffmpeg.ProbeResult, error)
 	StartSession(context.Context, ffmpeg.SessionSpec) (*ffmpeg.Session, error)
-	StartSinglePlaceholderSession(context.Context, string, string, bool) (*ffmpeg.Session, error)        // bool: realtime pacing
-	StartImagePlaceholderSession(context.Context, string, string, string, bool) (*ffmpeg.Session, error) // (video, posterImage, outputDir, realtime)
 	DetectAudioOffset(string, string, []ffmpeg.AudioTrack, int, float64) (time.Duration, int, float64, error)
-}
-
-// dynamicPlaceholderEngine is optional so existing lightweight media fakes and
-// alternate engines can keep using the original placeholder methods. The
-// FFmpeg implementation supports cards and non-zero segment starts, which are
-// required for an atomic late-poster replacement.
-type dynamicPlaceholderEngine interface {
-	StartPlaceholderSession(context.Context, ffmpeg.PlaceholderSpec) (*ffmpeg.Session, error)
 }
 
 // Policy groups the small number of operational deadlines used during startup
@@ -117,10 +107,8 @@ type Muxer struct {
 	baseURL   string
 	policy    Policy
 
-	// placeholderPath is composited over the opening film segment; errorPath is
-	// the terminal "no source worked" video. Both optional.
-	placeholderPath string
-	errorPath       string
+	// errorPath is the terminal "no source worked" video.
+	errorPath string
 
 	httpClient *http.Client
 
@@ -146,28 +134,27 @@ type Result struct {
 }
 
 func New(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL string) *Muxer {
-	return NewWithVideos(col, pl, ff, res, store, baseURL, "", "")
+	return NewWithErrorVideo(col, pl, ff, res, store, baseURL, "")
 }
 
-// NewWithVideos configures optional local placeholder and error videos.
-func NewWithVideos(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, placeholderPath, errorPath string) *Muxer {
+// NewWithErrorVideo configures an optional local terminal error video.
+func NewWithErrorVideo(col *collector.Collector, pl *planner.Planner, ff *ffmpeg.Muxer, res *resolver.Resolver, store ports.MuxStore, baseURL, errorPath string) *Muxer {
 	m := &Muxer{
-		collector:       col,
-		planner:         pl,
-		ffmpeg:          ff,
-		resolver:        res,
-		store:           store,
-		baseURL:         strings.TrimSuffix(baseURL, "/"),
-		policy:          defaultPolicy(),
-		placeholderPath: placeholderPath,
-		errorPath:       errorPath,
-		httpClient:      &http.Client{Timeout: 15 * time.Second},
-		states:          make(map[string]*playbackState),
-		resolved:        make(map[string]resolvedEntry),
-		resolveFlights:  make(map[string]*resolveFlight),
-		probes:          make(map[string]probeEntry),
-		probeFlights:    make(map[string]*probeFlight),
-		offsets:         make(map[string]time.Duration),
+		collector:      col,
+		planner:        pl,
+		ffmpeg:         ff,
+		resolver:       res,
+		store:          store,
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		policy:         defaultPolicy(),
+		errorPath:      errorPath,
+		httpClient:     &http.Client{Timeout: 15 * time.Second},
+		states:         make(map[string]*playbackState),
+		resolved:       make(map[string]resolvedEntry),
+		resolveFlights: make(map[string]*resolveFlight),
+		probes:         make(map[string]probeEntry),
+		probeFlights:   make(map[string]*probeFlight),
+		offsets:        make(map[string]time.Duration),
 	}
 	go m.reapIdleSessions()
 	return m
@@ -432,18 +419,8 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 		return &Result{}, fmt.Errorf("store returned empty job id")
 	}
 
-	posterDir, err := os.MkdirTemp("", "streammux-poster-"+jobID+"-*")
-	if err == nil {
-		job.CacheDir = posterDir
-	} else {
-		log.Printf("mux: cannot create poster cache: %v", err)
-	}
-
 	state, err := m.stateFor(job)
 	if err != nil {
-		if posterDir != "" {
-			_ = os.RemoveAll(posterDir)
-		}
 		return &Result{}, err
 	}
 
@@ -461,35 +438,10 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 
 	state.mu.Lock()
 	state.metadata = metadata
-	state.backgroundPath = filepath.Join(state.cacheDir, "placeholder-background.jpg")
-	state.cardPath = filepath.Join(state.cacheDir, "placeholder-card.txt")
-	state.metadataCardPath = filepath.Join(state.cacheDir, "placeholder-metadata.txt")
-	state.detailsCardPath = filepath.Join(state.cacheDir, "placeholder-details.txt")
 	state.preparationWait = make(chan struct{})
 	state.tierMetas = append([]model.TierMeta(nil), job.TierMetas...)
 	state.mu.Unlock()
-	job.Title = contentDisplayTitle(metadata)
-	if err := writePlaceholderCard(state.cardPath, renderPlaceholderCard(metadata, nil, cfg.Language)); err != nil {
-		log.Printf("mux: cannot initialize placeholder card: %v", err)
-	}
-	if err := writePlaceholderCard(state.metadataCardPath, renderPlaceholderMetadata(metadata)); err != nil {
-		log.Printf("mux: cannot initialize placeholder metadata: %v", err)
-	}
-	if err := writePlaceholderCard(state.detailsCardPath, renderPlaceholderDetails(metadata, nil, cfg.Language)); err != nil {
-		log.Printf("mux: cannot initialize placeholder details: %v", err)
-	}
-
-	if metadata.LogoURL != "" && state.posterPath != "" {
-		m.prefetchPosterURL(state.ctx, metadata.LogoURL, state.posterPath)
-	}
-	if metadata.BackgroundURL != "" && state.backgroundPath != "" {
-		m.prefetchPosterURL(state.ctx, metadata.BackgroundURL, state.backgroundPath)
-	}
-	if metadata.LogoURL == "" || metadata.BackgroundURL == "" {
-		// If the short synchronous metadata budget expired, make one best-effort
-		// background attempt so the poster can still arrive during playback.
-		m.prefetchImagesForContent(state.ctx, contentType, contentID, state.posterPath, state.backgroundPath)
-	}
+	job.Title = displayTitle(metadata)
 	go m.prepareJob(job, state, addons, cfg.Language)
 	name, description := streamPresentation(metadata)
 	return &Result{Dubbed: &model.StremioStream{
@@ -504,7 +456,7 @@ func (m *Muxer) Process(ctx context.Context, cfg *model.Config, contentType, con
 
 func streamPresentation(metadata contentMetadata) (string, string) {
 	name := "StreamMux MultiAudio"
-	if title := contentDisplayTitle(metadata); title != "StreamMux MultiAudio" {
+	if title := displayTitle(metadata); title != "" {
 		name = fmt.Sprintf("%s • StreamMux MultiAudio", title)
 	}
 
@@ -521,6 +473,13 @@ func streamPresentation(metadata contentMetadata) (string, string) {
 	}
 	lines = append(lines, "Áudio no seu idioma • qualidade máxima • remux automático")
 	return name, strings.Join(lines, "\n")
+}
+
+func displayTitle(metadata contentMetadata) string {
+	if metadata.Title != "" {
+		return metadata.Title
+	}
+	return metadata.SeriesTitle
 }
 
 // prepareJob is deliberately tied to state.ctx. The HTTP request is allowed
@@ -551,11 +510,6 @@ func (m *Muxer) prepareJob(job *model.MuxJob, state *playbackState, addons []mod
 	wait := state.preparationWait
 	state.mu.Unlock()
 
-	if len(plans) > 0 {
-		_ = writePlaceholderCard(state.cardPath, renderPlaceholderCard(state.metadata, plans, language))
-		_ = writePlaceholderCard(state.metadataCardPath, renderPlaceholderMetadata(state.metadata))
-		_ = writePlaceholderCard(state.detailsCardPath, renderPlaceholderDetails(state.metadata, plans, language))
-	}
 	if wait != nil {
 		close(wait)
 	}

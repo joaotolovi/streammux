@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -123,17 +122,6 @@ func TestProcessReturnsBeforeAddonPreparationAndUsesCinemetaIdentity(t *testing.
 		case <-preparationWait:
 		case <-time.After(time.Second):
 			t.Fatal("addon preparation did not finish")
-		}
-		card, readErr := os.ReadFile(state.cardPath)
-		if readErr != nil {
-			t.Fatalf("read placeholder card: %v", readErr)
-		}
-		details, detailsErr := os.ReadFile(state.detailsCardPath)
-		if detailsErr != nil {
-			t.Fatalf("read placeholder details: %v", detailsErr)
-		}
-		if !strings.Contains(string(card), "1080p") || !strings.Contains(string(card), "HDR") || !strings.Contains(string(details), "idiomas") {
-			t.Fatalf("card did not receive source metadata: %q", card)
 		}
 		mux.CleanupJob(job)
 	} else {

@@ -56,18 +56,6 @@ func main() {
 	ff := ffmpeg.New(envOr("FFMPEG_PATH", "ffmpeg"))
 	res := resolver.New()
 
-	// Placeholder plays instantly while film sources prepare; the error video
-	// is the terminal "no source worked" fallback. Embedded defaults, env
-	// overrides for custom files.
-	placeholderPath := envOr("PLACEHOLDER_VIDEO", "")
-	assetsDir := ""
-	if placeholderPath == "" {
-		var err error
-		placeholderPath, assetsDir, err = assets.PlaceholderPath()
-		if err != nil {
-			log.Fatalf("placeholder assets: %v", err)
-		}
-	}
 	errorPath := envOr("ERROR_VIDEO", "")
 	errorAssetsDir := ""
 	if errorPath == "" {
@@ -78,11 +66,8 @@ func main() {
 		}
 	}
 
-	mux := muxer.NewWithVideos(collector, planner, ff, res, store, baseURL, placeholderPath, errorPath)
+	mux := muxer.NewWithErrorVideo(collector, planner, ff, res, store, baseURL, errorPath)
 	store.SetOnDelete(mux.CleanupJob)
-	if assetsDir != "" {
-		defer os.RemoveAll(assetsDir)
-	}
 	if errorAssetsDir != "" {
 		defer os.RemoveAll(errorAssetsDir)
 	}

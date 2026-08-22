@@ -1231,7 +1231,7 @@ func TestStartErrorGenerationWithRealFFmpeg(t *testing.T) {
 		t.Skipf("error asset: %v", err)
 	}
 	ff := ffmpeg.New("ffmpeg")
-	mux := NewWithVideos(collector.New(), planner.New(), ff, resolver.New(), nil, "http://x.test", "", errPath)
+	mux := NewWithErrorVideo(collector.New(), planner.New(), ff, resolver.New(), nil, "http://x.test", errPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1250,52 +1250,6 @@ func TestStartErrorGenerationWithRealFFmpeg(t *testing.T) {
 		t.Fatal("first error video segment missing")
 	}
 	t.Logf("error generation started at segment %d in %s", gen.startSegment, elapsed)
-}
-
-func TestStartErrorGenerationAfterPlaceholderWithRealFFmpeg(t *testing.T) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not available")
-	}
-	phPath, _, err := assets.PlaceholderPath()
-	if err != nil {
-		t.Skipf("placeholder asset: %v", err)
-	}
-	errPath, _, err := assets.ErrorPath()
-	if err != nil {
-		t.Skipf("error asset: %v", err)
-	}
-	ff := ffmpeg.New("ffmpeg")
-	mux := NewWithVideos(collector.New(), planner.New(), ff, resolver.New(), nil, "http://x.test", phPath, errPath)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	state := &playbackState{ctx: ctx, cancel: cancel, cacheDir: t.TempDir()}
-
-	// Roda o placeholder ao vivo por alguns segundos, como no servidor.
-	phDir := filepath.Join(state.cacheDir, "generation-000001")
-	phSession, err := ff.StartSinglePlaceholderSession(ctx, phPath, phDir, true)
-	if err != nil {
-		t.Fatalf("placeholder session: %v", err)
-	}
-	state.placeholder = &generation{dir: phDir, session: phSession, startSegment: 0, startedAt: time.Now(), isLocal: true}
-
-	deadline := time.After(8 * time.Second)
-	for !fileExists(filepath.Join(phDir, "video", "seg_00001.ts")) {
-		select {
-		case <-deadline:
-			t.Fatal("placeholder did not produce segments")
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
-
-	gen := mux.startErrorGeneration(state, -1)
-	if gen == nil {
-		t.Fatal("startErrorGeneration() returned nil after live placeholder")
-	}
-	if !fileExists(generationSegmentPath(gen, gen.startSegment)) {
-		t.Fatalf("first error segment %d missing", gen.startSegment)
-	}
-	t.Logf("error generation started at segment %d", gen.startSegment)
 }
 
 func TestComposerSameSourceInBothQueuesIsSingle(t *testing.T) {

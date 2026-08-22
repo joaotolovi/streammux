@@ -312,159 +312,6 @@ func lastPlaylistSegment(path string) int {
 	return last
 }
 
-// runPlaceholder starts the local intro so the player gets immediate playback
-// while the film is prepared in the background.
-func (m *Muxer) runPlaceholder(job *model.MuxJob, state *playbackState) {
-	state.mu.Lock()
-	state.nextGeneration++
-	generationID := state.nextGeneration
-	state.mu.Unlock()
-
-	dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-
-	// Wait briefly for the expected poster so the opening never changes
-	// composition after playback has already started.
-	posterPath := state.posterPath
-	state.mu.Lock()
-	posterExpected := state.metadata.LogoURL != ""
-	backgroundExpected := state.metadata.BackgroundURL != ""
-	cachedBackgroundPath := state.backgroundPath
-	state.mu.Unlock()
-	if (posterExpected && posterPath != "" && !fileExists(posterPath)) || (backgroundExpected && cachedBackgroundPath != "" && !fileExists(cachedBackgroundPath)) {
-		deadline := time.NewTimer(4 * time.Second)
-		ticker := time.NewTicker(50 * time.Millisecond)
-	waitPoster:
-		for (posterExpected && !fileExists(posterPath)) || (backgroundExpected && !fileExists(cachedBackgroundPath)) {
-			select {
-			case <-state.ctx.Done():
-				break waitPoster
-			case <-deadline.C:
-				log.Printf("mux: poster not ready before placeholder deadline")
-				break waitPoster
-			case <-ticker.C:
-			}
-		}
-		ticker.Stop()
-		deadline.Stop()
-	}
-	usePoster := posterPath != "" && fileExists(posterPath) && job.ContentType != "" && job.ContentID != ""
-	backgroundPath := ""
-	if cachedBackgroundPath != "" && fileExists(cachedBackgroundPath) {
-		backgroundPath = cachedBackgroundPath
-	}
-
-	var session *ffmpeg.Session
-	var err error
-	if usePoster {
-		log.Printf("mux: starting opening video with poster %s", posterPath)
-		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-			VideoPath: m.placeholderPath, ImagePath: posterPath, BackgroundPath: backgroundPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
-			OutputDir: dir, Realtime: true,
-		})
-		if err != nil {
-			log.Printf("mux: composed opening failed, falling back to plain opening: %v", err)
-			_ = os.RemoveAll(dir)
-			dir = filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-			usePoster = false
-		}
-	}
-	if !usePoster {
-		log.Printf("mux: starting opening video without poster")
-		session, err = m.startPlaceholderSession(state.ctx, ffmpeg.PlaceholderSpec{
-			VideoPath: m.placeholderPath, CardPath: state.cardPath, MetadataPath: state.metadataCardPath, DetailsPath: state.detailsCardPath,
-			OutputDir: dir, Realtime: true,
-		})
-	}
-
-	fail := func(format string, args ...any) {
-		_ = os.RemoveAll(dir)
-		state.mu.Lock()
-		state.placeholderStarted = false
-		wait := state.placeholderWait
-		state.placeholderWait = nil
-		state.mu.Unlock()
-		if wait != nil {
-			close(wait)
-		}
-		log.Printf("mux: placeholder: "+format, args...)
-	}
-
-	if err != nil {
-		fail("failed to start any placeholder session: %v", err)
-		return
-	}
-
-	gen := &generation{
-		id:           generationID,
-		dir:          dir,
-		session:      session,
-		startSegment: 0,
-		startedAt:    time.Now(),
-		isLocal:      true,
-	}
-
-	segmentPath := generationSegmentPath(gen, 0)
-	audioSegPath := generationAudioSegmentPath(gen, 0)
-	masterPath := generationVideoPlaylistPath(gen)
-	audioPlPath := generationAudioPlaylistPath(gen)
-	ticker := time.NewTicker(75 * time.Millisecond)
-	defer ticker.Stop()
-	deadline := time.After(10 * time.Second)
-	for {
-		if fileExists(segmentPath) && fileExists(audioSegPath) && fileExists(masterPath) && fileExists(audioPlPath) {
-			break
-		}
-		select {
-		case <-session.Done():
-			fail("ended before first segment: %v", session.Err())
-			return
-		case <-deadline:
-			session.Cancel()
-			fail("timed out before first segment")
-			return
-		case <-ticker.C:
-		}
-	}
-	state.mu.Lock()
-	if state.active != nil || state.closed {
-		gen.session.Cancel()
-		wait := state.placeholderWait
-		state.placeholderStarted = false
-		state.mu.Unlock()
-		_ = os.RemoveAll(dir)
-		if wait != nil {
-			close(wait)
-		}
-		return
-	}
-	state.placeholder = gen
-	state.all = append(state.all, gen)
-	wait := state.placeholderWait
-	state.mu.Unlock()
-	if wait != nil {
-		close(wait)
-	}
-	log.Printf("mux: placeholder playing")
-
-}
-
-func (m *Muxer) startPlaceholderSession(ctx context.Context, spec ffmpeg.PlaceholderSpec) (*ffmpeg.Session, error) {
-	if engine, ok := m.ffmpeg.(dynamicPlaceholderEngine); ok {
-		return engine.StartPlaceholderSession(ctx, spec)
-	}
-	if spec.StartSegment != 0 || spec.CardPath != "" {
-		// The legacy methods do not expose a card or a non-zero start. They are
-		// still valid for old test engines and initial playback.
-		if spec.StartSegment != 0 {
-			return nil, fmt.Errorf("placeholder engine does not support non-zero segment starts")
-		}
-	}
-	if spec.ImagePath != "" {
-		return m.ffmpeg.StartImagePlaceholderSession(ctx, spec.VideoPath, spec.ImagePath, spec.OutputDir, spec.Realtime)
-	}
-	return m.ffmpeg.StartSinglePlaceholderSession(ctx, spec.VideoPath, spec.OutputDir, spec.Realtime)
-}
-
 // runStartup walks the composer's source compositions until one launches.
 func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	// Process may have returned before addon collection finished. Do not build
@@ -499,7 +346,6 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	comp := m.composerFor(job, state)
 
 	var winner *generation
-	var intro *generation
 	var lastErr error
 	for {
 		state.mu.Lock()
@@ -525,30 +371,10 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 			continue
 		}
 
-		var opening *generation
-		if m.placeholderPath != "" {
-			var openingErr error
-			opening, openingErr = m.launchOpeningOverlay(job, state, candidate.ordinal, prepared)
-			if openingErr != nil {
-				log.Printf("mux: opening overlay unavailable; starting film normally: %v", openingErr)
-			}
-		}
-		startSegment := 0
-		startTime := 0.0
-		if opening != nil {
-			startSegment = 1
-			startTime = ffmpeg.SegDuration()
-			log.Printf("mux: opening overlay ready at segment 0")
-		}
-		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, startSegment, startTime, m.policy.MinHandoffBuffer)
+		gen, err := m.launchGeneration(job, state, candidate.ordinal, prepared, 0, 0, 0, m.policy.MinHandoffBuffer)
 		if err == nil {
 			winner = gen
-			intro = opening
 			break
-		}
-		if opening != nil {
-			opening.session.Cancel()
-			_ = os.RemoveAll(opening.dir)
 		}
 		lastErr = err
 		log.Printf("mux: composition %d launch failed: %v", candidate.ordinal, err)
@@ -561,10 +387,6 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	}
 
 	if winner == nil {
-		if intro != nil {
-			intro.session.Cancel()
-			_ = os.RemoveAll(intro.dir)
-		}
 		m.startupFailed(job, state, lastErr)
 		return
 	}
@@ -577,27 +399,15 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 		state.startWait = nil
 		state.mu.Unlock()
 		winner.session.Cancel()
-		if intro != nil {
-			intro.session.Cancel()
-			_ = os.RemoveAll(intro.dir)
-		}
 		if wait != nil {
 			close(wait)
 		}
 		return
 	}
-	state.retiredPlaceholder = intro
-	state.filmBase = 0
-	if intro != nil {
-		state.filmBase = 1
-	}
 	state.active = winner
 	state.activeTier = 0
 	state.tier0Prepared = winner.prepared
 	state.tierBudgets = tierTargets(streamBandwidth(winner.plan.Video))
-	if intro != nil {
-		state.all = append(state.all, intro)
-	}
 	state.all = append(state.all, winner)
 	state.starting = false
 	state.startErr = nil
@@ -608,13 +418,6 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	state.maxRequested = -1
 	state.lastSequentialAt = time.Time{}
 	state.playbackEpoch++
-	if state.filmBase > 0 {
-		state.discontinuities = append(state.discontinuities, state.filmBase)
-	}
-	if state.resumeStart > state.filmBase {
-		state.discontinuities = append(state.discontinuities, state.resumeStart)
-	}
-	base := state.filmBase
 	wait := state.startWait
 	state.mu.Unlock()
 
@@ -623,7 +426,7 @@ func (m *Muxer) runStartup(job *model.MuxJob, state *playbackState) {
 	if wait != nil {
 		close(wait)
 	}
-	log.Printf("mux: startup selected video#%d audio#%d %s (%s) at segment %d", winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, winner.plan.Video.Parsed.Resolution, base)
+	log.Printf("mux: startup selected video#%d audio#%d %s (%s)", winner.prepared.videoIdx, winner.prepared.audioIdx, winner.plan.Kind, winner.plan.Video.Parsed.Resolution)
 	go m.monitorGeneration(job, state, winner)
 }
 
@@ -677,8 +480,7 @@ func (m *Muxer) startupFailed(job *model.MuxJob, state *playbackState, cause err
 
 // startErrorGeneration launches the local error video. The error video is
 // short VOD content, so it always numbers from segment 0 — start_number > its
-// content length would produce no segments at all. The placeholder (if any)
-// is retired and the public timeline resets with a DISCONTINUITY.
+// content length would produce no segments at all.
 func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generation {
 	if m.errorPath == "" {
 		return nil
@@ -687,7 +489,6 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 	state.mu.Lock()
 	state.nextGeneration++
 	generationID := state.nextGeneration
-	ph := state.placeholder
 	state.mu.Unlock()
 	start := 0
 	_ = atSeg // accepted for API symmetry; the error video resets the timeline
@@ -695,7 +496,13 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 	var gen *generation
 	for attempt := 0; attempt < 2; attempt++ {
 		dir := filepath.Join(state.cacheDir, fmt.Sprintf("generation-%06d", generationID))
-		session, err := m.ffmpeg.StartSinglePlaceholderSession(state.ctx, m.errorPath, dir, false)
+		if err := os.MkdirAll(filepath.Join(dir, "video"), 0755); err != nil {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "audio"), 0755); err != nil {
+			return nil
+		}
+		session, err := m.ffmpeg.StartSession(state.ctx, ffmpeg.SessionSpec{VideoURL: m.errorPath, AudioURL: m.errorPath, OutputDir: dir, AudioMode: ffmpeg.AudioModeAAC})
 		if err != nil {
 			log.Printf("mux: error video start (attempt %d): %v", attempt+1, err)
 			_ = os.RemoveAll(dir)
@@ -750,16 +557,6 @@ func (m *Muxer) startErrorGeneration(state *playbackState, atSeg int) *generatio
 		return nil
 	}
 
-	// Keep the intro serving while the error video is being prepared. Closing
-	// this generation only after its first segment prevents a playlist gap and
-	// client reconnect, which would restart the intro from zero.
-	if ph != nil {
-		ph.session.Cancel()
-		state.mu.Lock()
-		state.placeholder = nil
-		state.retiredPlaceholder = ph
-		state.mu.Unlock()
-	}
 	state.mu.Lock()
 	state.all = append(state.all, gen)
 	state.errorStart = start
@@ -781,21 +578,10 @@ func (m *Muxer) launchGeneration(job *model.MuxJob, state *playbackState, planIn
 // context. Tier switches use it to cancel a pending generation when the player
 // changes its mind; ordinary startup, recovery and seeks use state.ctx.
 func (m *Muxer) launchGenerationContext(job *model.MuxJob, state *playbackState, parent context.Context, planIndex int, prepared *preparedPlan, tier, startNumber int, startTime float64, minBuffer time.Duration) (*generation, error) {
-	return m.launchGenerationWithOverlay(job, state, parent, planIndex, prepared, tier, startNumber, startTime, minBuffer, "")
+	return m.launchGenerationInternal(job, state, parent, planIndex, prepared, tier, startNumber, startTime, minBuffer)
 }
 
-func (m *Muxer) launchOpeningOverlay(job *model.MuxJob, state *playbackState, planIndex int, prepared *preparedPlan) (*generation, error) {
-	return m.launchGenerationWithOverlay(job, state, state.ctx, planIndex, prepared, 0, 0, 0, 0, m.placeholderPath)
-}
-
-func overlayDuration(path string) time.Duration {
-	if path == "" {
-		return 0
-	}
-	return time.Duration(ffmpeg.SegDuration() * float64(time.Second))
-}
-
-func (m *Muxer) launchGenerationWithOverlay(job *model.MuxJob, state *playbackState, parent context.Context, planIndex int, prepared *preparedPlan, tier, startNumber int, startTime float64, minBuffer time.Duration, overlayPath string) (*generation, error) {
+func (m *Muxer) launchGenerationInternal(job *model.MuxJob, state *playbackState, parent context.Context, planIndex int, prepared *preparedPlan, tier, startNumber int, startTime float64, minBuffer time.Duration) (*generation, error) {
 	// Seeks do a remote input seek on a large file (MKV cues, byte-range
 	// request to the debrid), which can take much longer than a fresh start
 	// before the first segment appears.
@@ -829,22 +615,19 @@ func (m *Muxer) launchGenerationWithOverlay(job *model.MuxJob, state *playbackSt
 	// handoff is committed; attemptCtx above still cancels an in-flight
 	// generation before its first segment is ready.
 	session, err := m.ffmpeg.StartSession(state.ctx, ffmpeg.SessionSpec{
-		VideoURL:             prepared.videoURL,
-		AudioURL:             prepared.audioURL,
-		VideoTrackIndex:      prepared.videoTrackIndex,
-		AudioTrackIndex:      prepared.audioTrackIndex,
-		StartSegment:         startNumber,
-		StartTime:            startTime,
-		OutputDir:            dir,
-		AudioMode:            prepared.audioMode,
-		AudioLanguage:        job.TargetLanguage,
-		AudioTitle:           job.TargetLanguage,
-		UserAgent:            browserUA,
-		AudioOffset:          audioOffset,
-		Transcode:            prepared.transcode,
-		Duration:             overlayDuration(overlayPath),
-		OpeningOverlayPath:   overlayPath,
-		OpeningOverlayHeight: prepared.videoHeight,
+		VideoURL:        prepared.videoURL,
+		AudioURL:        prepared.audioURL,
+		VideoTrackIndex: prepared.videoTrackIndex,
+		AudioTrackIndex: prepared.audioTrackIndex,
+		StartSegment:    startNumber,
+		StartTime:       startTime,
+		OutputDir:       dir,
+		AudioMode:       prepared.audioMode,
+		AudioLanguage:   job.TargetLanguage,
+		AudioTitle:      job.TargetLanguage,
+		UserAgent:       browserUA,
+		AudioOffset:     audioOffset,
+		Transcode:       prepared.transcode,
 	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
